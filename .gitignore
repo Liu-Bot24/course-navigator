@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.venv/
+node_modules/
+dist/
+frontend/dist/
+backend/__pycache__/
+backend/**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.course-navigator/
+data/
+downloads/
+.worktrees/
