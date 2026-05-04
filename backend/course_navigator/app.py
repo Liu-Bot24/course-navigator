@@ -1,0 +1,1133 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
+from urllib.parse import unquote, urlparse
+from uuid import uuid4
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from .ai import _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
+from .config import ModelProfileConfig, Settings, load_settings
+from .library import CourseLibrary
+from .models import (
+    CourseItem,
+    CourseItemUpdate,
+    DownloadRequest,
+    DownloadResponse,
+    ExtractRequest,
+    ModelListRequest,
+    ModelListResponse,
+    ModelSettingsResponse,
+    ModelSettingsUpdate,
+    ModelProfileResponse,
+    StudyJobStatus,
+    StudyMaterial,
+    StudyRequest,
+    TranscriptSegment,
+)
+from .ytdlp import YtDlpError, YtDlpRunner, is_subtitle_unavailable_error
+
+
+def create_app(
+    data_dir: Path | None = None,
+    runner: YtDlpRunner | None = None,
+    settings: Settings | None = None,
+    env_path: Path | None = Path(".env"),
+) -> FastAPI:
+    active_settings = settings or load_settings()
+    settings_state = {"value": active_settings}
+    active_data_dir = data_dir or active_settings.data_dir
+    library = CourseLibrary(active_data_dir)
+    ytdlp_runner = runner or YtDlpRunner()
+    jobs: dict[str, StudyJobStatus] = {}
+    jobs_lock = Lock()
+    deleted_items: set[str] = set()
+    deleted_items_lock = Lock()
+    study_executor = ThreadPoolExecutor(max_workers=2)
+    download_executor = ThreadPoolExecutor(max_workers=1)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        yield
+        study_executor.shutdown(wait=False, cancel_futures=True)
+        download_executor.shutdown(wait=False, cancel_futures=True)
+
+    app = FastAPI(title="Course Navigator", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/api/health")
+    def health() -> dict[str, bool | str]:
+        return {"ok": True, "name": "Course Navigator"}
+
+    @app.get("/api/items")
+    def list_items() -> list[CourseItem]:
+        return [_normalize_item_for_response(item) for item in library.list_items()]
+
+    @app.get("/api/items/{item_id}")
+    def get_item(item_id: str) -> CourseItem:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        return _normalize_item_for_response(item)
+
+    @app.post("/api/preview")
+    def preview(request: ExtractRequest) -> CourseItem:
+        try:
+            metadata = ytdlp_runner.fetch_metadata(request)
+        except (ValueError, YtDlpError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        item_id = _safe_item_id(metadata.id)
+        existing = library.get(item_id)
+        title = _display_title(metadata, str(request.url), existing)
+        collection_title = _display_collection_title(metadata, str(request.url), existing)
+        course_index = _display_course_index(metadata, existing)
+        if course_index is None:
+            course_index = _next_course_index(library.list_items(), collection_title, item_id)
+        sort_order = existing.sort_order if existing and existing.sort_order is not None else course_index or _default_sort_order(metadata)
+        item = CourseItem(
+            id=item_id,
+            source_url=str(request.url),
+            title=title,
+            custom_title=existing.custom_title if existing else False,
+            collection_title=collection_title,
+            course_index=course_index,
+            sort_order=sort_order,
+            duration=_best_duration(
+                metadata.duration,
+                existing.duration if existing else None,
+                _duration_from_transcript(existing.transcript if existing else []),
+            ),
+            created_at=existing.created_at if existing else datetime.now(timezone.utc).isoformat(),
+            transcript=existing.transcript if existing else [],
+            transcript_source=existing.transcript_source if existing else None,
+            metadata=metadata,
+            study=existing.study if existing else None,
+            local_video_path=existing.local_video_path if existing else None,
+        )
+        with deleted_items_lock:
+            deleted_items.discard(item.id)
+        library.save(item)
+        return item
+
+    @app.post("/api/extract")
+    def extract(request: ExtractRequest) -> CourseItem:
+        try:
+            metadata = ytdlp_runner.fetch_metadata(request)
+            item_id = _safe_item_id(metadata.id)
+            transcript_dir = active_data_dir / "subtitles" / item_id
+            transcript, transcript_source = _extract_transcript_with_source(
+                ytdlp_runner,
+                request,
+                transcript_dir,
+                item_id,
+                metadata,
+            )
+        except (ValueError, YtDlpError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        existing = library.get(item_id)
+        keep_existing_study = bool(existing and _same_transcript(existing.transcript, transcript))
+        title = _display_title(metadata, str(request.url), existing)
+        collection_title = _display_collection_title(metadata, str(request.url), existing)
+        course_index = _display_course_index(metadata, existing)
+        if course_index is None:
+            course_index = _next_course_index(library.list_items(), collection_title, item_id)
+        sort_order = existing.sort_order if existing and existing.sort_order is not None else course_index or _default_sort_order(metadata)
+        item = CourseItem(
+            id=item_id,
+            source_url=str(request.url),
+            title=title,
+            custom_title=existing.custom_title if existing else False,
+            collection_title=collection_title,
+            course_index=course_index,
+            sort_order=sort_order,
+            duration=_best_duration(metadata.duration, existing.duration if existing else None, _duration_from_transcript(transcript)),
+            created_at=existing.created_at if existing else datetime.now(timezone.utc).isoformat(),
+            transcript=transcript,
+            transcript_source=transcript_source,
+            metadata=metadata,
+            study=existing.study if keep_existing_study else None,
+            local_video_path=existing.local_video_path if existing else None,
+        )
+        with deleted_items_lock:
+            deleted_items.discard(item.id)
+        library.save(item)
+        return item
+
+    @app.patch("/api/items/{item_id}")
+    def update_item_title(item_id: str, request: CourseItemUpdate) -> CourseItem:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        updates: dict[str, object] = {}
+        fields = request.model_fields_set
+        if "title" in fields and request.title is not None:
+            title = request.title.strip()
+            if not title:
+                raise HTTPException(status_code=400, detail="Course title is required")
+            updates["title"] = title
+            updates["custom_title"] = True
+            if "translated_title" not in fields and item.study:
+                updates["study"] = item.study.model_copy(update={"translated_title": None})
+        if "translated_title" in fields:
+            translated_title = request.translated_title.strip() if request.translated_title else ""
+            if item.study:
+                updates["study"] = item.study.model_copy(update={"translated_title": translated_title or None})
+            elif translated_title:
+                updates["study"] = StudyMaterial(
+                    one_line=f"{item.title} 已更新标题译文。",
+                    translated_title=translated_title,
+                    time_map=[],
+                    outline=[],
+                    detailed_notes="",
+                    high_fidelity_text="",
+                    translated_transcript=[],
+                    prerequisites=[],
+                    thought_prompts=[],
+                    review_suggestions=[],
+                )
+        if "collection_title" in fields:
+            collection_title = request.collection_title.strip() if request.collection_title else ""
+            updates["collection_title"] = collection_title
+        if "course_index" in fields:
+            updates["course_index"] = request.course_index
+        if "sort_order" in fields:
+            updates["sort_order"] = request.sort_order
+        if not updates:
+            raise HTTPException(status_code=400, detail="No course updates provided")
+        item = item.model_copy(update=updates)
+        library.save(item)
+        return _normalize_item_for_response(item)
+
+    @app.delete("/api/items/{item_id}")
+    def delete_item(item_id: str) -> dict[str, bool]:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        with deleted_items_lock:
+            deleted_items.add(item_id)
+        _delete_course_artifacts(active_data_dir, item)
+        deleted = library.delete(item_id)
+        return {"deleted": deleted}
+
+    @app.delete("/api/items/{item_id}/local-video")
+    def delete_local_video(item_id: str) -> CourseItem:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        _delete_local_video(active_data_dir, item)
+        item.local_video_path = None
+        library.save(item)
+        return item
+
+    @app.post("/api/items/{item_id}/study")
+    def generate_study(item_id: str, request: StudyRequest | None = None) -> StudyMaterial:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        output_language = request.output_language if request else "zh-CN"
+        section = request.section if request else "all"
+        if section == "all":
+            study = generate_study_material(
+                title=item.title,
+                transcript=item.transcript,
+                provider=settings_state["value"].provider_set,
+                output_language=output_language,
+                detail_level=settings_state["value"].study_detail_level,
+                existing_translation=item.study.translated_transcript if item.study else None,
+                existing_context_summary=item.study.context_summary if item.study else None,
+                existing_translated_title=item.study.translated_title if item.study else None,
+                source_language=item.metadata.language if item.metadata else None,
+            )
+        else:
+            study = regenerate_study_section(
+                title=item.title,
+                transcript=item.transcript,
+                existing_study=item.study,
+                provider=settings_state["value"].provider_set,
+                output_language=output_language,
+                section=section,
+                detail_level=settings_state["value"].study_detail_level,
+                source_language=item.metadata.language if item.metadata else None,
+            )
+        item.study = study
+        library.save(item)
+        return study
+
+    @app.post("/api/items/{item_id}/study-jobs")
+    def create_study_job(item_id: str, request: StudyRequest | None = None) -> StudyJobStatus:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        job_id = uuid4().hex
+        job = StudyJobStatus(
+            job_id=job_id,
+            item_id=item_id,
+            status="queued",
+            progress=0,
+            phase="queued",
+            message="已加入后台生成队列",
+        )
+        with jobs_lock:
+            jobs[job_id] = job
+        output_language = request.output_language if request else "zh-CN"
+        section = request.section if request else "all"
+        study_executor.submit(_run_study_job, job_id, item_id, output_language, section)
+        return job
+
+    @app.post("/api/items/{item_id}/translation-jobs")
+    def create_translation_job(item_id: str, request: StudyRequest | None = None) -> StudyJobStatus:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        if not item.transcript:
+            raise HTTPException(status_code=400, detail="请先提取字幕，再翻译字幕")
+        job_id = uuid4().hex
+        job = StudyJobStatus(
+            job_id=job_id,
+            item_id=item_id,
+            status="queued",
+            progress=0,
+            phase="queued",
+            message="已加入字幕翻译队列",
+        )
+        with jobs_lock:
+            jobs[job_id] = job
+        output_language = request.output_language if request else "zh-CN"
+        study_executor.submit(_run_translation_job, job_id, item_id, output_language)
+        return job
+
+    @app.post("/api/items/{item_id}/download-jobs")
+    def create_download_job(item_id: str, request: DownloadRequest) -> StudyJobStatus:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        job_id = uuid4().hex
+        job = StudyJobStatus(
+            job_id=job_id,
+            item_id=item_id,
+            status="queued",
+            progress=0,
+            phase="queued",
+            message="已加入视频缓存队列",
+        )
+        with jobs_lock:
+            jobs[job_id] = job
+        download_executor.submit(_run_download_job, job_id, item_id, request)
+        return job
+
+    @app.get("/api/jobs/{job_id}")
+    def get_study_job(job_id: str) -> StudyJobStatus:
+        with jobs_lock:
+            job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Study job not found")
+        return job
+
+    @app.get("/api/settings/model")
+    def get_model_settings() -> ModelSettingsResponse:
+        return _model_settings_response(settings_state["value"])
+
+    @app.put("/api/settings/model")
+    def update_model_settings(request: ModelSettingsUpdate) -> ModelSettingsResponse:
+        current = settings_state["value"]
+        current_by_id = {profile.id: profile for profile in current.effective_model_profiles}
+        profiles: list[ModelProfileConfig] = []
+        for profile in request.profiles:
+            profile_id = profile.id.strip()
+            name = profile.name.strip() or profile.model.strip() or profile_id
+            base_url = profile.base_url.strip()
+            model = profile.model.strip()
+            api_key = profile.api_key.strip() if profile.api_key else current_by_id.get(profile_id, ModelProfileConfig(id="", name="", base_url="", model="")).api_key
+            if not profile_id or not base_url or not model:
+                raise HTTPException(status_code=400, detail="Profile id, Base URL, and model are required")
+            profiles.append(
+                ModelProfileConfig(
+                    id=profile_id,
+                    name=name,
+                    provider_type=profile.provider_type,
+                    base_url=base_url,
+                    model=model,
+                    context_window=profile.context_window,
+                    max_tokens=profile.max_tokens,
+                    api_key=api_key,
+                )
+            )
+        if not profiles:
+            raise HTTPException(status_code=400, detail="At least one model profile is required")
+        profile_ids = {profile.id for profile in profiles}
+        translation_model_id = request.translation_model_id.strip()
+        learning_model_id = request.learning_model_id.strip()
+        global_model_id = request.global_model_id.strip()
+        role_ids = {translation_model_id, learning_model_id, global_model_id}
+        if not role_ids <= profile_ids:
+            raise HTTPException(status_code=400, detail="Every model slot must reference an existing profile")
+        default_profile = next((profile for profile in profiles if profile.id == learning_model_id), profiles[0])
+        next_settings = current.model_copy(
+            update={
+                "llm_base_url": default_profile.base_url,
+                "llm_model": default_profile.model,
+                "llm_api_key": default_profile.api_key,
+                "model_profiles": profiles,
+                "translation_model_id": translation_model_id,
+                "learning_model_id": learning_model_id,
+                "global_model_id": global_model_id,
+                "study_detail_level": request.study_detail_level,
+                "task_parameters": request.task_parameters,
+            }
+        )
+        settings_state["value"] = next_settings
+        if env_path:
+            _write_model_env(env_path, next_settings)
+        return _model_settings_response(next_settings)
+
+    @app.post("/api/settings/models")
+    def list_available_models(request: ModelListRequest) -> ModelListResponse:
+        base_url = _normalize_model_base_url(request.base_url)
+        if not base_url:
+            raise HTTPException(status_code=400, detail="Base URL is required")
+        api_key = request.api_key
+        if not api_key and request.profile_id:
+            profile = next(
+                (
+                    candidate
+                    for candidate in settings_state["value"].effective_model_profiles
+                    if candidate.id == request.profile_id
+                ),
+                None,
+            )
+            api_key = profile.api_key if profile else None
+        try:
+            if request.provider_type == "anthropic":
+                headers = {"anthropic-version": "2023-06-01"}
+                if api_key:
+                    headers["x-api-key"] = api_key
+                response = httpx.get(
+                    _anthropic_endpoint_url(base_url, "models"),
+                    headers=headers,
+                    timeout=30,
+                )
+            else:
+                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                response = httpx.get(
+                    f"{base_url}/models",
+                    headers=headers,
+                    timeout=30,
+                )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Unable to fetch models: {exc}") from exc
+        return ModelListResponse(models=_extract_model_ids(payload))
+
+    @app.post("/api/items/{item_id}/download")
+    def download_video(item_id: str, request: DownloadRequest) -> DownloadResponse:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        try:
+            video_path = ytdlp_runner.download_video(
+                request,
+                active_data_dir / "downloads",
+                item_id,
+            )
+        except (ValueError, YtDlpError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        item.local_video_path = video_path
+        library.save(item)
+        return DownloadResponse(path=str(video_path))
+
+    @app.get("/api/items/{item_id}/video")
+    def serve_video(item_id: str) -> FileResponse:
+        item = library.get(item_id)
+        if not item or not item.local_video_path:
+            raise HTTPException(status_code=404, detail="Local video not found")
+        video_path = Path(item.local_video_path).resolve()
+        downloads_dir = (active_data_dir / "downloads").resolve()
+        if not video_path.exists() or downloads_dir not in video_path.parents:
+            raise HTTPException(status_code=404, detail="Local video not found")
+        return FileResponse(video_path)
+
+    def _set_job(job_id: str, **updates: object) -> StudyJobStatus | None:
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if not job:
+                return None
+            next_job = job.model_copy(update=updates)
+            jobs[job_id] = next_job
+            return next_job
+
+    def _run_study_job(job_id: str, item_id: str, output_language: str, section: str) -> None:
+        _set_job(
+            job_id,
+            status="running",
+            progress=1,
+            phase="preparing",
+            message="正在启动后台学习材料生成" if section == "all" else "正在启动局部重新生成",
+        )
+
+        def update_progress(phase: str, progress: int, message: str) -> None:
+            _set_job(
+                job_id,
+                status="running",
+                progress=progress,
+                phase=phase,
+                message=message,
+            )
+
+        def save_partial_translation(segments) -> None:
+            with deleted_items_lock:
+                if item_id in deleted_items:
+                    return
+            item = library.get(item_id)
+            if not item:
+                return
+            existing = item.study
+            item.study = StudyMaterial(
+                one_line=existing.one_line if existing else f"{item.title} 正在翻译字幕...",
+                time_map=existing.time_map if existing else [],
+                outline=existing.outline if existing else [],
+                detailed_notes=existing.detailed_notes if existing else "",
+                high_fidelity_text=existing.high_fidelity_text if existing else "",
+                translated_title=existing.translated_title if existing else None,
+                context_summary=existing.context_summary if existing else None,
+                translated_transcript=segments,
+                prerequisites=existing.prerequisites if existing else [],
+                thought_prompts=existing.thought_prompts if existing else [],
+                review_suggestions=existing.review_suggestions if existing else [],
+            )
+            library.save(item)
+
+        try:
+            item = library.get(item_id)
+            if not item:
+                raise ValueError("Course item not found")
+            if section == "all":
+                existing_translation = item.study.translated_transcript if item.study else None
+                existing_context_summary = item.study.context_summary if item.study else None
+                existing_translated_title = item.study.translated_title if item.study else None
+                study = generate_study_material(
+                    title=item.title,
+                    transcript=item.transcript,
+                    provider=settings_state["value"].provider_set,
+                    output_language=output_language,  # type: ignore[arg-type]
+                    detail_level=settings_state["value"].study_detail_level,
+                    progress=update_progress,
+                    partial_translation=save_partial_translation,
+                    existing_translation=existing_translation,
+                    existing_context_summary=existing_context_summary,
+                    existing_translated_title=existing_translated_title,
+                    source_language=item.metadata.language if item.metadata else None,
+                )
+            else:
+                study = regenerate_study_section(
+                    title=item.title,
+                    transcript=item.transcript,
+                    existing_study=item.study,
+                    provider=settings_state["value"].provider_set,
+                    output_language=output_language,  # type: ignore[arg-type]
+                    section=section,  # type: ignore[arg-type]
+                    detail_level=settings_state["value"].study_detail_level,
+                    progress=update_progress,
+                    source_language=item.metadata.language if item.metadata else None,
+                )
+            with deleted_items_lock:
+                if item_id in deleted_items:
+                    raise ValueError("Course item was deleted")
+            item.study = study
+            library.save(item)
+        except Exception as exc:
+            _set_job(
+                job_id,
+                status="failed",
+                progress=100,
+                phase="failed",
+                message="学习材料生成失败",
+                error=str(exc),
+            )
+            return
+        _set_job(
+            job_id,
+            status="succeeded",
+            progress=100,
+            phase="complete",
+            message="学习材料已生成" if section == "all" else "学习材料局部已更新",
+        )
+
+    def _run_translation_job(job_id: str, item_id: str, output_language: str) -> None:
+        _set_job(
+            job_id,
+            status="running",
+            progress=1,
+            phase="preparing",
+            message="正在启动字幕翻译",
+        )
+
+        def update_progress(phase: str, progress: int, message: str) -> None:
+            _set_job(
+                job_id,
+                status="running",
+                progress=progress,
+                phase=phase,
+                message=message,
+            )
+
+        translated_title_state: dict[str, str | None] = {"value": None}
+        context_summary_state: dict[str, str | None] = {"value": None}
+
+        def save_translated_title(title: str | None) -> None:
+            if not title:
+                return
+            translated_title_state["value"] = title
+            item = library.get(item_id)
+            if not item:
+                return
+            item.study = _study_with_translation(
+                item,
+                item.study.translated_transcript if item.study else [],
+                title,
+                context_summary_state["value"],
+            )
+            library.save(item)
+
+        def save_context_summary(summary: str) -> None:
+            if not summary:
+                return
+            context_summary_state["value"] = summary
+            item = library.get(item_id)
+            if not item:
+                return
+            item.study = _study_with_translation(
+                item,
+                item.study.translated_transcript if item.study else [],
+                translated_title_state["value"],
+                summary,
+            )
+            library.save(item)
+
+        def save_partial_translation(segments) -> None:
+            with deleted_items_lock:
+                if item_id in deleted_items:
+                    return
+            item = library.get(item_id)
+            if not item:
+                return
+            item.study = _study_with_translation(
+                item,
+                segments,
+                translated_title_state["value"],
+                context_summary_state["value"],
+            )
+            library.save(item)
+
+        try:
+            item = library.get(item_id)
+            if not item:
+                raise ValueError("Course item not found")
+            translated_title_state["value"] = item.study.translated_title if item.study else None
+            context_summary_state["value"] = item.study.context_summary if item.study else None
+            translated = translate_transcript_material(
+                title=item.title,
+                transcript=item.transcript,
+                provider=settings_state["value"].provider_set,
+                output_language=output_language,  # type: ignore[arg-type]
+                progress=update_progress,
+                partial_translation=save_partial_translation,
+                title_translation=save_translated_title,
+                context_summary_created=save_context_summary,
+                source_language=item.metadata.language if item.metadata else None,
+            )
+            with deleted_items_lock:
+                if item_id in deleted_items:
+                    raise ValueError("Course item was deleted")
+            item = library.get(item_id)
+            if not item:
+                raise ValueError("Course item not found")
+            item.study = _study_with_translation(
+                item,
+                translated,
+                translated_title_state["value"],
+                context_summary_state["value"],
+            )
+            library.save(item)
+        except Exception as exc:
+            _set_job(
+                job_id,
+                status="failed",
+                progress=100,
+                phase="failed",
+                message="字幕翻译失败",
+                error=str(exc),
+            )
+            return
+        _set_job(
+            job_id,
+            status="succeeded",
+            progress=100,
+            phase="complete",
+            message="字幕译文已生成",
+        )
+
+    def _run_download_job(job_id: str, item_id: str, request: DownloadRequest) -> None:
+        _set_job(
+            job_id,
+            status="running",
+            progress=1,
+            phase="preparing",
+            message="正在准备缓存视频",
+        )
+
+        def update_progress(progress: int, message: str) -> None:
+            _set_job(
+                job_id,
+                status="running",
+                progress=max(1, min(99, progress)),
+                phase="download",
+                message=message,
+            )
+
+        try:
+            item = library.get(item_id)
+            if not item:
+                raise ValueError("Course item not found")
+            video_path = ytdlp_runner.download_video(
+                request,
+                active_data_dir / "downloads",
+                item_id,
+                progress=update_progress,
+            )
+            with deleted_items_lock:
+                if item_id in deleted_items:
+                    raise ValueError("Course item was deleted")
+            item = library.get(item_id)
+            if not item:
+                raise ValueError("Course item not found")
+            item.local_video_path = video_path
+            library.save(item)
+        except Exception as exc:
+            _set_job(
+                job_id,
+                status="failed",
+                progress=100,
+                phase="failed",
+                message="视频缓存失败",
+                error=str(exc),
+            )
+            return
+        _set_job(
+            job_id,
+            status="succeeded",
+            progress=100,
+            phase="complete",
+            message="视频缓存完成",
+        )
+
+    return app
+
+
+def _safe_item_id(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "_-" else "-" for ch in value) or "course"
+
+
+def _same_transcript(left: list[TranscriptSegment], right: list[TranscriptSegment]) -> bool:
+    if len(left) != len(right):
+        return False
+    return all(
+        abs(first.start - second.start) <= 0.001
+        and abs(first.end - second.end) <= 0.001
+        and first.text == second.text
+        for first, second in zip(left, right)
+    )
+
+
+def _extract_transcript_with_source(
+    runner: YtDlpRunner,
+    request: ExtractRequest,
+    transcript_dir: Path,
+    item_id: str,
+    metadata,
+) -> tuple[list[TranscriptSegment], str | None]:
+    if request.subtitle_source == "asr":
+        return _extract_asr_transcript(runner, request, transcript_dir, item_id), "asr"
+
+    try:
+        transcript = runner.extract_subtitles(request, transcript_dir, metadata)
+        return transcript, "subtitles" if transcript else None
+    except YtDlpError as exc:
+        if not is_subtitle_unavailable_error(exc):
+            raise
+
+    try:
+        transcript = _extract_asr_transcript(runner, request, transcript_dir, item_id)
+    except YtDlpError:
+        return [], None
+    return transcript, "asr" if transcript else None
+
+
+def _extract_asr_transcript(
+    runner: YtDlpRunner,
+    request: ExtractRequest,
+    transcript_dir: Path,
+    item_id: str,
+) -> list[TranscriptSegment]:
+    extractor = getattr(runner, "extract_asr", None)
+    if not callable(extractor):
+        if request.subtitle_source == "asr":
+            raise YtDlpError("当前提取器不支持本地 ASR")
+        return []
+    return extractor(request, transcript_dir, item_id)
+
+
+def _normalize_item_for_response(item: CourseItem) -> CourseItem:
+    return _with_course_defaults(
+        _with_complete_translation_for_response(_with_display_title_fallback(_with_duration_fallback(item)))
+    )
+
+
+def _with_duration_fallback(item: CourseItem) -> CourseItem:
+    duration = _best_duration(item.duration, item.metadata.duration if item.metadata else None, _duration_from_transcript(item.transcript))
+    if duration == item.duration:
+        return item
+    return item.model_copy(update={"duration": duration})
+
+
+def _with_display_title_fallback(item: CourseItem) -> CourseItem:
+    if item.custom_title:
+        return item
+    title = _title_from_supported_lesson_url(item.source_url)
+    if not title or title == item.title:
+        return item
+    return item.model_copy(update={"title": title})
+
+
+def _with_complete_translation_for_response(item: CourseItem) -> CourseItem:
+    if not item.study or not item.study.translated_transcript:
+        return item
+    if _translated_transcript_complete(item.transcript, item.study.translated_transcript):
+        return item
+    study = item.study.model_copy(update={"translated_transcript": []})
+    return item.model_copy(update={"study": study})
+
+
+def _translated_transcript_complete(
+    source: list[TranscriptSegment],
+    translated: list[TranscriptSegment],
+) -> bool:
+    if not source or len(source) != len(translated):
+        return False
+    for source_segment, translated_segment in zip(source, translated):
+        if abs(source_segment.start - translated_segment.start) > 0.4:
+            return False
+        if not translated_segment.text.strip():
+            return False
+        source_text = re.sub(r"\s+", " ", source_segment.text).strip().lower()
+        translated_text = re.sub(r"\s+", " ", translated_segment.text).strip().lower()
+        if source_text and source_text == translated_text and len(source_text) > 12:
+            return False
+    return True
+
+
+def _display_title(metadata: VideoMetadata, source_url: str, existing: CourseItem | None) -> str:
+    if existing and existing.custom_title:
+        return existing.title
+    return _title_from_supported_lesson_url(source_url) or metadata.title
+
+
+def _with_course_defaults(item: CourseItem) -> CourseItem:
+    updates: dict[str, object] = {}
+    if item.collection_title is None:
+        collection_title = _collection_title_from_supported_url(item.source_url)
+        if collection_title:
+            updates["collection_title"] = collection_title
+    if item.course_index is None and item.metadata and item.metadata.playlist_index:
+        updates["course_index"] = float(item.metadata.playlist_index)
+    if item.sort_order is None:
+        updates["sort_order"] = _default_sort_order(item.metadata)
+    return item.model_copy(update=updates) if updates else item
+
+
+def _display_collection_title(metadata: VideoMetadata, source_url: str, existing: CourseItem | None) -> str | None:
+    if existing and existing.collection_title is not None:
+        return existing.collection_title
+    return _collection_title_from_supported_url(source_url) or _collection_title_from_metadata(metadata)
+
+
+def _display_course_index(metadata: VideoMetadata, existing: CourseItem | None) -> float | None:
+    if existing and existing.course_index is not None:
+        return existing.course_index
+    return float(metadata.playlist_index) if metadata.playlist_index else None
+
+
+def _next_course_index(items: list[CourseItem], collection_title: str | None, item_id: str) -> float:
+    collection_key = (collection_title or "").strip().casefold()
+    indices = [
+        item.course_index
+        for item in items
+        if item.id != item_id
+        and item.course_index is not None
+        and ((item.collection_title or "").strip().casefold() == collection_key)
+    ]
+    return float(max(indices, default=0) + 1)
+
+
+def _default_sort_order(metadata: VideoMetadata | None) -> float | None:
+    if metadata and metadata.playlist_index:
+        return float(metadata.playlist_index)
+    return None
+
+
+def _title_from_supported_lesson_url(source_url: str) -> str | None:
+    parsed = urlparse(source_url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "learn.deeplearning.ai":
+        return None
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if "lesson" not in parts:
+        return None
+    lesson_index = parts.index("lesson")
+    if len(parts) <= lesson_index + 2:
+        return None
+    slug = parts[-1].strip()
+    lesson_id = parts[lesson_index + 1].strip()
+    if not slug or slug == lesson_id or not re.search(r"[A-Za-z]", slug):
+        return None
+    return _sentence_title_from_slug(slug)
+
+
+def _collection_title_from_supported_url(source_url: str) -> str | None:
+    parsed = urlparse(source_url)
+    hostname = (parsed.hostname or "").lower()
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if hostname == "learn.deeplearning.ai" and "courses" in parts:
+        course_index = parts.index("courses")
+        if len(parts) > course_index + 1:
+            return _title_from_course_slug(parts[course_index + 1])
+    return None
+
+
+def _collection_title_from_metadata(metadata: VideoMetadata) -> str | None:
+    return metadata.playlist_title.strip() if metadata.playlist_title else None
+
+
+def _title_from_course_slug(slug: str) -> str:
+    title = _sentence_title_from_slug(slug)
+    return " ".join(
+        word if word.isupper() else word.capitalize()
+        for word in title.split()
+    )
+
+
+def _sentence_title_from_slug(slug: str) -> str:
+    acronyms = {
+        "agi": "AGI",
+        "ai": "AI",
+        "api": "API",
+        "asr": "ASR",
+        "gpt": "GPT",
+        "llm": "LLM",
+        "ml": "ML",
+        "rag": "RAG",
+        "url": "URL",
+    }
+    words = re.split(r"[-_\s]+", slug)
+    normalized_words = [acronyms.get(word.lower(), word.lower()) for word in words if word]
+    title = " ".join(normalized_words).strip()
+    if not title:
+        return slug
+    return f"{title[0].upper()}{title[1:]}"
+
+
+def _best_duration(*values: float | None) -> float | None:
+    for value in values:
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _duration_from_transcript(transcript: list[TranscriptSegment]) -> float | None:
+    if not transcript:
+        return None
+    end = max((segment.end for segment in transcript), default=0)
+    return end if end > 0 else None
+
+
+def _study_with_translation(
+    item: CourseItem,
+    segments,
+    translated_title: str | None = None,
+    context_summary: str | None = None,
+) -> StudyMaterial:
+    existing = item.study
+    return StudyMaterial(
+        one_line=existing.one_line if existing else f"{item.title} 已生成字幕译文。",
+        translated_title=translated_title or (existing.translated_title if existing else None),
+        context_summary=context_summary or (existing.context_summary if existing else None),
+        time_map=existing.time_map if existing else [],
+        outline=existing.outline if existing else [],
+        detailed_notes=existing.detailed_notes if existing else "",
+        high_fidelity_text=existing.high_fidelity_text if existing else "",
+        translated_transcript=segments,
+        prerequisites=existing.prerequisites if existing else [],
+        thought_prompts=existing.thought_prompts if existing else [],
+        review_suggestions=existing.review_suggestions if existing else [],
+    )
+
+
+def _delete_course_artifacts(data_dir: Path, item: CourseItem) -> None:
+    _delete_local_video(data_dir, item)
+    subtitle_dir = (data_dir / "subtitles" / item.id).resolve()
+    subtitles_root = (data_dir / "subtitles").resolve()
+    if subtitle_dir.exists() and subtitles_root in subtitle_dir.parents:
+        shutil.rmtree(subtitle_dir)
+
+
+def _delete_local_video(data_dir: Path, item: CourseItem) -> None:
+    if not item.local_video_path:
+        return
+    video_path = Path(item.local_video_path).expanduser().resolve()
+    downloads_dir = (data_dir / "downloads").resolve()
+    if video_path.exists() and downloads_dir in video_path.parents:
+        video_path.unlink()
+
+
+def _model_settings_response(settings: Settings) -> ModelSettingsResponse:
+    profiles = settings.effective_model_profiles
+    return ModelSettingsResponse(
+        profiles=[
+            ModelProfileResponse(
+                id=profile.id,
+                name=profile.name,
+                provider_type=profile.provider_type,
+                base_url=profile.base_url,
+                model=profile.model,
+                context_window=profile.context_window,
+                max_tokens=profile.max_tokens,
+                has_api_key=bool(profile.api_key),
+                api_key_preview=_preview_key(profile.api_key),
+            )
+            for profile in profiles
+        ],
+        translation_model_id=_role_id_or_first(settings.translation_model_id, profiles),
+        learning_model_id=_role_id_or_first(settings.learning_model_id, profiles),
+        global_model_id=_role_id_or_first(settings.global_model_id, profiles),
+        study_detail_level=settings.study_detail_level,
+        task_parameters=settings.task_parameters,
+    )
+
+
+def _preview_key(api_key: str | None) -> str | None:
+    if not api_key:
+        return None
+    if len(api_key) <= 10:
+        return "已配置"
+    return f"{api_key[:4]}...{api_key[-4:]}"
+
+
+def _write_model_env(path: Path, settings: Settings) -> None:
+    profiles = settings.effective_model_profiles
+    profile_payload = [
+        {
+            "id": profile.id,
+            "name": profile.name,
+            "provider_type": profile.provider_type,
+            "base_url": profile.base_url,
+            "model": profile.model,
+            "context_window": profile.context_window,
+            "max_tokens": profile.max_tokens,
+            "api_key": profile.api_key or "",
+        }
+        for profile in profiles
+    ]
+    task_parameters_payload = {
+        key: value.model_dump(exclude_none=True)
+        for key, value in settings.task_parameters.items()
+        if value.temperature is not None or value.max_tokens is not None
+    }
+    updates = {
+        "COURSE_NAVIGATOR_DATA_DIR": str(settings.data_dir),
+        "COURSE_NAVIGATOR_LLM_BASE_URL": settings.llm_base_url or "",
+        "COURSE_NAVIGATOR_LLM_API_KEY": settings.llm_api_key or "",
+        "COURSE_NAVIGATOR_LLM_MODEL": settings.llm_model or "",
+        "COURSE_NAVIGATOR_MODEL_PROFILES": json.dumps(profile_payload, ensure_ascii=False),
+        "COURSE_NAVIGATOR_TRANSLATION_MODEL_ID": settings.translation_model_id,
+        "COURSE_NAVIGATOR_LEARNING_MODEL_ID": settings.learning_model_id,
+        "COURSE_NAVIGATOR_GLOBAL_MODEL_ID": settings.global_model_id,
+        "COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL": settings.study_detail_level,
+        "COURSE_NAVIGATOR_TASK_PARAMETERS": json.dumps(task_parameters_payload, ensure_ascii=False),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    seen: set[str] = set()
+    next_lines: list[str] = []
+    for line in existing_lines:
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            next_lines.append(f"{key}={_quote_env_value(updates[key])}")
+            seen.add(key)
+        else:
+            next_lines.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            next_lines.append(f"{key}={_quote_env_value(value)}")
+    path.write_text("\n".join(next_lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _quote_env_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
+def _extract_model_ids(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    raw_models = payload.get("data") or payload.get("models") or []
+    if not isinstance(raw_models, list):
+        return []
+    models: list[str] = []
+    for item in raw_models:
+        if isinstance(item, str):
+            models.append(item)
+        elif isinstance(item, dict):
+            candidate = item.get("id") or item.get("name")
+            if isinstance(candidate, str) and candidate.strip():
+                models.append(candidate.strip())
+    return sorted(dict.fromkeys(models), key=str.lower)
+
+
+def _normalize_model_base_url(value: str) -> str:
+    base_url = value.strip().rstrip("/")
+    for suffix in ("/chat/completions", "/responses", "/messages"):
+        if base_url.endswith(suffix):
+            base_url = base_url[: -len(suffix)].rstrip("/")
+            break
+    return base_url
+
+
+def _role_id_or_first(role_id: str, profiles: list[ModelProfileConfig]) -> str:
+    if any(profile.id == role_id for profile in profiles):
+        return role_id
+    return profiles[0].id if profiles else role_id
+
+
+app = create_app()

@@ -1,0 +1,1 @@
+"""Course Navigator backend package."""

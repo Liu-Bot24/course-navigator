@@ -4,6 +4,9 @@
 node_modules/
 dist/
 frontend/dist/
+output/
+.playwright-cli/
+*.tsbuildinfo
 backend/__pycache__/
 backend/**/__pycache__/
 .pytest_cache/

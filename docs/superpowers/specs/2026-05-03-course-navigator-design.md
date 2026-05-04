@@ -53,8 +53,8 @@ The AI result is a layered reading system:
 - L0 One-line judgment: what the lesson is about and whether it is worth watching now.
 - L1 Time map: large timestamp ranges that show what each block covers.
 - L2 Structured outline: collapsible chapters, concepts, arguments, examples, and advice.
-- L3 Detailed notes: preserves explanation flow, examples, terminology, and causal links.
-- L4 High-fidelity text lesson: a detailed text reconstruction that avoids over-compression and preserves sequence, conditions, examples, exceptions, and explanation detail.
+- L3 Interpretation: explains the course flow, examples, terminology, and causal links.
+- L4 Detailed text lesson: a high-fidelity text reconstruction that avoids over-compression and preserves sequence, conditions, examples, exceptions, and explanation detail.
 
 L1 is optimized for quick scanning. L4 is optimized for replacing full video viewing when necessary.
 
@@ -103,7 +103,7 @@ The app is a dense, calm research workspace:
 - top bar: URL input, extraction mode, status, settings.
 - left column: source/task list and large-block time map.
 - center column: player and transcript.
-- right column: AI learning views with tabs for Guide, Outline, Detailed, and High Fidelity.
+- right column: AI learning views with tabs for Guide, Outline, Interpretation, and Detailed.
 
 The UI should feel like an editor or study cockpit, not a marketing page. Priorities are alignment, scan speed, compact hierarchy, readable typography, and reliable timestamp navigation.
 
@@ -119,4 +119,3 @@ The UI should feel like an editor or study cockpit, not a marketing page. Priori
 
 - Public or cookie-enabled YouTube URL: `https://www.youtube.com/watch?v=JPcx9qHzzgk&t=13s`
 - Login-gated DeepLearning.AI URL: kept as a realistic manual-login scenario.
-
