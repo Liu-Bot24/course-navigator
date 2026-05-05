@@ -15,6 +15,10 @@ class FakeRunner:
             id="abc123",
             title="Sample Lesson",
             duration=42,
+            uploader="Sample Teacher",
+            channel="Sample Channel",
+            creator="Sample Creator",
+            description="A course summary mentioning D-tail terminology.",
             webpage_url=str(request.url),
             extractor="youtube",
             stream_url="https://cdn.example.com/sample.m3u8",
@@ -325,6 +329,10 @@ def test_preview_route_preserves_existing_transcript_and_cache(tmp_path):
 
 def test_extract_route_saves_item_when_subtitles_are_unavailable(tmp_path):
     class NoSubtitleRunner(FakeRunner):
+        def fetch_metadata(self, request):
+            metadata = super().fetch_metadata(request)
+            return metadata.model_copy(update={"subtitles": [], "automatic_captions": []})
+
         def extract_subtitles(self, request, target_dir: Path, metadata=None):
             raise YtDlpError("yt-dlp did not produce a subtitle file")
 
@@ -344,6 +352,10 @@ def test_extract_route_saves_item_when_subtitles_are_unavailable(tmp_path):
 
 def test_extract_route_falls_back_to_asr_when_subtitles_are_unavailable(tmp_path):
     class AsrFallbackRunner(FakeRunner):
+        def fetch_metadata(self, request):
+            metadata = super().fetch_metadata(request)
+            return metadata.model_copy(update={"subtitles": [], "automatic_captions": []})
+
         def extract_subtitles(self, request, target_dir: Path, metadata=None):
             raise YtDlpError("yt-dlp did not produce a subtitle file")
 
@@ -361,6 +373,25 @@ def test_extract_route_falls_back_to_asr_when_subtitles_are_unavailable(tmp_path
     payload = response.json()
     assert payload["transcript_source"] == "asr"
     assert payload["transcript"][0]["text"] == "ASR transcript line."
+
+
+def test_extract_route_does_not_fall_back_to_asr_when_source_subtitles_are_advertised(tmp_path):
+    class AdvertisedSubtitleRunner(FakeRunner):
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise YtDlpError("yt-dlp did not produce a subtitle file")
+
+        def extract_asr(self, request, target_dir: Path, item_id: str):
+            raise AssertionError("ASR fallback should not run when source subtitles are advertised")
+
+    client = make_client(tmp_path, runner=AdvertisedSubtitleRunner())
+
+    response = client.post(
+        "/api/extract",
+        json={"url": "https://www.bilibili.com/video/BVabc/", "mode": "normal"},
+    )
+
+    assert response.status_code == 400
+    assert "站方字幕存在" in response.json()["detail"]
 
 
 def test_extract_route_can_force_asr_source(tmp_path):
@@ -533,6 +564,189 @@ def test_incomplete_cached_translation_is_hidden_from_response(tmp_path, monkeyp
     assert item_response.json()["study"]["translated_transcript"] == []
 
 
+def test_transcript_update_saves_corrected_source_and_clears_cached_translation(tmp_path, monkeypatch):
+    def fake_translate(**kwargs):
+        return [
+            TranscriptSegment(start=segment.start, end=segment.end, text=f"译文 {segment.text}")
+            for segment in kwargs["transcript"]
+        ]
+
+    monkeypatch.setattr("course_navigator.app.translate_transcript_material", fake_translate)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    response = client.post("/api/items/abc123/translation-jobs", json={"output_language": "zh-CN"})
+    job_id = response.json()["job_id"]
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    updated = client.put(
+        "/api/items/abc123/transcript",
+        json={
+            "transcript": [
+                {"start": 0, "end": 4, "text": "Opening idea corrected."},
+                {"start": 4, "end": 8, "text": "Important detail."},
+            ]
+        },
+    )
+
+    assert updated.status_code == 200
+    payload = updated.json()
+    assert payload["transcript"][0]["text"] == "Opening idea corrected."
+    assert payload["study"]["translated_transcript"] == []
+
+
+def test_asr_correction_job_uses_selected_profile_and_exposes_suggestions(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_suggest(**kwargs):
+        captured["provider_model"] = kwargs["provider"].model
+        captured["search_enabled"] = kwargs["search_config"].enabled
+        captured["transcript"] = kwargs["transcript"]
+        captured["context"] = kwargs["context"]
+        captured["output_language"] = kwargs["output_language"]
+        return [
+            {
+                "segment_index": 1,
+                "original_text": "Important detail.",
+                "corrected_text": "Important D-tail.",
+                "confidence": 0.91,
+                "reason": "课程上下文里该术语是 D-tail。",
+                "evidence": "模型根据相邻字幕判断。",
+                "source": "model",
+            }
+        ]
+
+    monkeypatch.setattr("course_navigator.app.suggest_asr_corrections", fake_suggest)
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            model_profiles=[
+                {
+                    "id": "translation",
+                    "name": "Translation",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "fast-model",
+                    "api_key": "sk-fast",
+                },
+                {
+                    "id": "asr",
+                    "name": "ASR",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "careful-asr-model",
+                    "api_key": "sk-asr",
+                },
+            ],
+            translation_model_id="translation",
+            learning_model_id="translation",
+            global_model_id="translation",
+            asr_model_id="asr",
+        ),
+    )
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/items/abc123/asr-correction-jobs",
+        json={
+            "user_context": "OpenClaw 常被误转为 open cloud；Claude 常被误转为 Cloud。",
+            "output_language": "zh-CN",
+            "search": {"enabled": False},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["started_at"]
+    assert response.json()["updated_at"]
+    job_id = response.json()["job_id"]
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+    result = client.get(f"/api/asr-correction-jobs/{job_id}/result")
+
+    assert payload["status"] == "succeeded"
+    assert captured["provider_model"] == "careful-asr-model"
+    assert captured["search_enabled"] is False
+    assert captured["output_language"] == "zh-CN"
+    assert captured["transcript"][1].text == "Important detail."
+    assert captured["context"]["title"] == "Sample Lesson"
+    assert captured["context"]["metadata_title"] == "Sample Lesson"
+    assert captured["context"]["uploader"] == "Sample Teacher"
+    assert captured["context"]["channel"] == "Sample Channel"
+    assert captured["context"]["creator"] == "Sample Creator"
+    assert captured["context"]["description"] == "A course summary mentioning D-tail terminology."
+    assert captured["context"]["user_context"] == "OpenClaw 常被误转为 open cloud；Claude 常被误转为 Cloud。"
+    assert captured["context"]["extractor"] == "youtube"
+    assert captured["context"]["webpage_url"] == "https://www.youtube.com/watch?v=abc123"
+    assert result.status_code == 200
+    assert result.json()["suggestions"][0]["corrected_text"] == "Important D-tail."
+    assert result.json()["suggestions"][0]["confidence"] == 0.91
+
+
+def test_asr_correction_job_uses_saved_search_credentials(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_suggest(**kwargs):
+        captured["search_config"] = kwargs["search_config"]
+        return []
+
+    monkeypatch.setattr("course_navigator.app.suggest_asr_corrections", fake_suggest)
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            model_profiles=[
+                {
+                    "id": "asr",
+                    "name": "ASR",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "careful-asr-model",
+                    "api_key": "sk-asr",
+                }
+            ],
+            translation_model_id="asr",
+            learning_model_id="asr",
+            global_model_id="asr",
+            asr_model_id="asr",
+            asr_search={
+                "provider": "firecrawl",
+                "result_limit": 7,
+                "firecrawl": {"base_url": "http://firecrawl.local:43123", "api_key": "fc-secret"},
+            },
+        ),
+    )
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/items/abc123/asr-correction-jobs",
+        json={"search": {"enabled": True, "provider": "firecrawl", "result_limit": 7}},
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+    assert payload["status"] == "succeeded"
+    assert captured["search_config"].base_url == "http://firecrawl.local:43123"
+    assert captured["search_config"].api_key == "fc-secret"
+
+
 def test_model_settings_can_be_read_and_updated(tmp_path):
     env_path = tmp_path / ".env"
     client = make_client(
@@ -580,10 +794,12 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
             "translation_model_id": "fast",
             "learning_model_id": "long",
             "global_model_id": "long",
+            "asr_model_id": "long",
             "study_detail_level": "detailed",
             "task_parameters": {
                 "semantic_segmentation": {"temperature": 0.24, "max_tokens": 9000},
                 "high_fidelity": {"temperature": 0.42, "max_tokens": 16000},
+                "asr_correction": {"temperature": 0.12, "max_tokens": 12000},
             },
         },
     )
@@ -593,9 +809,11 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
     assert payload["translation_model_id"] == "fast"
     assert payload["learning_model_id"] == "long"
     assert payload["global_model_id"] == "long"
+    assert payload["asr_model_id"] == "long"
     assert payload["study_detail_level"] == "detailed"
     assert payload["task_parameters"]["semantic_segmentation"] == {"temperature": 0.24, "max_tokens": 9000}
     assert payload["task_parameters"]["high_fidelity"] == {"temperature": 0.42, "max_tokens": 16000}
+    assert payload["task_parameters"]["asr_correction"] == {"temperature": 0.12, "max_tokens": 12000}
     assert payload["profiles"][1]["provider_type"] == "anthropic"
     assert payload["profiles"][1]["context_window"] == 1000000
     assert payload["profiles"][1]["max_tokens"] == 32000
@@ -604,8 +822,55 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
     written = env_path.read_text(encoding="utf-8")
     assert "COURSE_NAVIGATOR_MODEL_PROFILES" in written
     assert "COURSE_NAVIGATOR_TRANSLATION_MODEL_ID" in written
+    assert "COURSE_NAVIGATOR_ASR_MODEL_ID" in written
     assert "COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL" in written
     assert "COURSE_NAVIGATOR_TASK_PARAMETERS" in written
+
+
+def test_asr_search_settings_can_be_read_and_updated_without_exposing_keys(tmp_path):
+    env_path = tmp_path / ".env"
+    client = make_client(
+        tmp_path,
+        env_path=env_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            asr_search={
+                "enabled": True,
+                "provider": "tavily",
+                "result_limit": 6,
+                "tavily": {"base_url": "https://api.tavily.com", "api_key": "tvly-secret-value"},
+            },
+        ),
+    )
+
+    initial = client.get("/api/settings/asr-search")
+
+    assert initial.status_code == 200
+    payload = initial.json()
+    assert payload["enabled"] is True
+    assert payload["provider"] == "tavily"
+    assert payload["result_limit"] == 6
+    assert payload["tavily"]["has_api_key"] is True
+    assert payload["tavily"]["api_key_preview"] != "tvly-secret-value"
+    assert "api_key" not in payload["tavily"]
+
+    updated = client.put(
+        "/api/settings/asr-search",
+        json={
+            "enabled": True,
+            "provider": "firecrawl",
+            "result_limit": 4,
+            "firecrawl": {"base_url": "http://127.0.0.1:43123", "api_key": "fc-secret-value"},
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["provider"] == "firecrawl"
+    assert updated.json()["firecrawl"]["base_url"] == "http://127.0.0.1:43123"
+    assert updated.json()["firecrawl"]["has_api_key"] is True
+    written = env_path.read_text(encoding="utf-8")
+    assert "COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER=\"firecrawl\"" in written
+    assert "COURSE_NAVIGATOR_FIRECRAWL_BASE_URL=\"http://127.0.0.1:43123\"" in written
 
 
 def test_model_list_endpoint_uses_saved_profile_key(tmp_path, monkeypatch):

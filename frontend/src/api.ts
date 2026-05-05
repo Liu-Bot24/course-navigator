@@ -1,4 +1,8 @@
 import type {
+  AsrCorrectionResult,
+  AsrCorrectionSearchConfig,
+  AsrSearchSettings,
+  AsrSearchSettingsInput,
   CourseItem,
   ExtractMode,
   ModelSettings,
@@ -9,6 +13,7 @@ import type {
   StudyJobStatus,
   StudyMaterial,
   TranscriptSource,
+  TranscriptSegment,
 } from "./types";
 
 export function apiPath(path: string): string {
@@ -77,6 +82,44 @@ export async function startTranslationJob(itemId: string, outputLanguage: Output
 
 export async function getStudyJob(jobId: string): Promise<StudyJobStatus> {
   return requestJson<StudyJobStatus>(`/jobs/${jobId}`);
+}
+
+export async function saveTranscript(itemId: string, transcript: TranscriptSegment[]): Promise<CourseItem> {
+  return requestJson<CourseItem>(`/items/${itemId}/transcript`, {
+    method: "PUT",
+    body: JSON.stringify({ transcript }),
+  });
+}
+
+export async function startAsrCorrectionJob(
+  itemId: string,
+  input: {
+    output_language?: OutputLanguage;
+    transcript?: TranscriptSegment[];
+    model_id?: string;
+    user_context?: string;
+    search: AsrCorrectionSearchConfig;
+  },
+): Promise<StudyJobStatus> {
+  return requestJson<StudyJobStatus>(`/items/${itemId}/asr-correction-jobs`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function getAsrCorrectionResult(jobId: string): Promise<AsrCorrectionResult> {
+  return requestJson<AsrCorrectionResult>(`/asr-correction-jobs/${jobId}/result`);
+}
+
+export async function getAsrSearchSettings(): Promise<AsrSearchSettings> {
+  return requestJson<AsrSearchSettings>("/settings/asr-search");
+}
+
+export async function saveAsrSearchSettings(input: AsrSearchSettingsInput): Promise<AsrSearchSettings> {
+  return requestJson<AsrSearchSettings>("/settings/asr-search", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
 }
 
 export async function deleteCourse(itemId: string): Promise<{ deleted: boolean }> {

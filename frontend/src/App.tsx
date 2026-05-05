@@ -1,32 +1,46 @@
 import {
+  ArrowLeft,
   ArrowDown,
   ArrowUp,
   BookOpen,
   Captions,
   Check,
+  CheckCheck,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Copy,
   Download,
   FileText,
   FolderPlus,
+  GitCompare,
   Languages,
   Loader2,
   Maximize2,
   Minimize2,
   Pencil,
   Play,
+  Save,
   Settings as SettingsIcon,
+  Sparkles,
   Trash2,
   X,
 } from "lucide-react";
-import type { CSSProperties, MutableRefObject, PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type {
+  CSSProperties,
+  MouseEvent as ReactMouseEvent,
+  MutableRefObject,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+} from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   deleteCourse,
   deleteLocalVideo,
   extractCourse,
+  getAsrCorrectionResult,
+  getAsrSearchSettings,
   getModelSettings,
   getStudyJob,
   itemVideoPath,
@@ -34,12 +48,32 @@ import {
   listAvailableModels,
   previewCourse,
   saveModelSettings,
+  saveAsrSearchSettings,
+  saveTranscript,
+  startAsrCorrectionJob,
   startDownloadJob,
   startStudyJob,
   startTranslationJob,
   updateCourseItem,
 } from "./api";
+import {
+  applyAsrSuggestion,
+  asrEditorHighlightRanges,
+  asrSuggestionContext,
+  type AsrEditorHighlightRange,
+  editorTextToTranscript,
+  filterAsrSuggestionsByConfidence,
+  previewTextToEditorText,
+  reconcilePreviewEditedSuggestions,
+  sortAsrReviewSuggestions,
+  transcriptToEditorText,
+} from "./asrWorkbench";
 import type {
+  AsrCorrectionSearchConfig,
+  AsrCorrectionSuggestion,
+  AsrSearchProvider,
+  AsrSearchSettings,
+  AsrSearchSettingsInput,
   CourseItem,
   ExtractMode,
   ModelProfile,
@@ -67,6 +101,7 @@ type TextDisplayMode = "source" | "target" | "bilingual";
 type CaptionDisplayMode = TextDisplayMode | "hidden";
 type CaptionPlacement = "overlay" | "panel";
 type LayoutDragKind = "left" | "right" | "player";
+type AsrSuggestionDirection = -1 | 1;
 type ModelProfileDraft = Omit<ModelProfile, "context_window" | "max_tokens"> & {
   api_key: string;
   context_window: string;
@@ -94,8 +129,22 @@ type SettingsDraft = {
   translation_model_id: string;
   learning_model_id: string;
   global_model_id: string;
+  asr_model_id: string;
   study_detail_level: StudyDetailLevel;
   task_parameters: Record<TaskParameterKey, TaskParameterDraft>;
+};
+type AsrSearchDraft = {
+  enabled: boolean;
+  provider: AsrSearchProvider;
+  api_key: string;
+  api_key_preview: string | null;
+  base_url: string;
+  result_limit: string;
+};
+type AsrSuggestionHover = {
+  suggestionId: string;
+  left: number;
+  top: number;
 };
 type ModelRoleKey = "translation_model_id" | "learning_model_id" | "global_model_id";
 type YouTubePlayer = {
@@ -153,7 +202,9 @@ const COPY = {
     displayMode: "显示模式",
     modelSettings: "模型设置",
     modelSettingsTitle: "模型配置",
+    asrModelSettingsTitle: "ASR 模型档案",
     modelProfileLibrary: "模型档案",
+    asrModelProfileLibrary: "ASR 模型档案",
     addModelProfile: "新增档案",
     addCollection: "新建专辑",
     activeModelProfile: "正在编辑",
@@ -175,6 +226,7 @@ const COPY = {
     taskStrategyHelp: "按任务分别覆盖 Temperature 和最大输出。错误设置可能导致输出变短、JSON 解析失败、成本上升或结果不稳定。",
     titleTranslationTask: "标题翻译",
     subtitleTranslationTask: "字幕翻译",
+    asrCorrectionTask: "ASR 校正",
     semanticSegmentationTask: "语义分块",
     guideTask: "导览",
     outlineTask: "大纲",
@@ -192,11 +244,13 @@ const COPY = {
     noModelCandidates: "没有可用模型",
     modelApiKey: "API Key",
     modelApiKeyHint: "留空则保留当前 Key",
+    apiKeyOptionalHint: "未配置，可留空",
     modelConfigured: "已配置",
     modelNotConfigured: "未配置",
     closeSettings: "关闭设置",
     saveSettings: "保存档案",
     settingsSaved: "档案已保存",
+    saveAsrSettings: "保存 ASR 档案",
     modelRolesSaving: "正在保存模型选择",
     modelRolesSaved: "模型选择已保存",
     modelRolesSaveFailed: "模型选择保存失败",
@@ -218,6 +272,75 @@ const COPY = {
     local: "本地",
     cache: "缓存",
     transcript: "字幕列表",
+    asrCorrection: "ASR 校正",
+    openAsrCorrection: "打开 ASR 校正工作台",
+    asrWorkbenchTitle: "ASR 校正工作台",
+    asrWorkbenchSubtitle: "校正原字幕，保存后会刷新视频工作台的字幕。",
+    backToWorkspace: "返回工作台",
+    sourceTranscriptEditor: "原字幕编辑区",
+    saveTranscript: "保存字幕",
+    transcriptSaved: "字幕已保存",
+    runAsrCorrection: "生成校正建议",
+    asrModel: "ASR 校正模型",
+    asrModelHelp: "选择用于校正字幕的模型档案。",
+    asrUserContext: "附加参考信息",
+    asrUserContextHelp: "写入你已经确认的术语、人名、产品名和常见误识别，模型会把它作为高优先级参考。",
+    asrUserContextPlaceholder: "",
+    noModelProfiles: "还没有模型档案",
+    configureModelProfiles: "管理 ASR 模型档案",
+    asrCorrectionApiUnavailable: "ASR 校正接口暂不可用。请重启后端服务后再生成建议。",
+    asrProgressTitle: "ASR 校正进行中",
+    asrProgressElapsed: "已用时",
+    asrProgressUpdated: "最近更新",
+    asrProgressStale: "后端状态已经超过 30 秒没有更新，可能是模型接口长时间无响应。",
+    asrPhaseQueued: "排队中",
+    asrPhasePreparing: "准备请求",
+    asrPhaseCandidate: "提取可疑术语",
+    asrPhaseSearch: "搜索证据",
+    asrPhaseReview: "生成建议",
+    asrPhaseModelRequest: "发送模型请求",
+    asrPhaseModelWait: "等待模型响应",
+    asrPhaseModelParse: "解析模型返回",
+    asrPhaseFinalizing: "整理结果",
+    asrPhaseComplete: "完成",
+    asrPhaseFailed: "失败",
+    searchCalibration: "搜索校验",
+    searchCalibrationOn: "开启搜索",
+    searchCalibrationOff: "关闭搜索",
+    searchProvider: "搜索服务",
+    searchApiKey: "搜索 API Key",
+    firecrawlBaseUrl: "Firecrawl 地址",
+    searchResultLimit: "结果数",
+    correctionSuggestions: "修改建议",
+    noCorrectionSuggestions: "还没有修改建议。",
+    asrBeforeTranscript: "修改前",
+    asrAfterTranscript: "修改后预览",
+    expandSuggestions: "展开",
+    collapseSuggestions: "收起",
+    previousSuggestion: "上一个",
+    nextSuggestion: "下一个",
+    rerunAsrCorrection: "再次校正",
+    saveAcceptedChanges: "接受后自动保存字幕",
+    sortSuggestionsByConfidence: "按置信度从高到低排序",
+    acceptConfidencePrefix: "一键接受置信度",
+    acceptConfidenceSuffix: "% 以上的修改建议",
+    acceptConfidenceAction: "接受高置信度建议",
+    modelCalibration: "模型校验",
+    suggestionDetail: "理由 / 证据",
+    originalSpanNotFound: "原文未精确命中",
+    candidateSpan: "候选片段",
+    acceptChange: "接受",
+    rejectChange: "拒绝",
+    acceptAllChanges: "全部接受",
+    originalText: "原文",
+    correctedText: "建议",
+    confidence: "置信度",
+    evidence: "证据",
+    reason: "理由",
+    pendingChanges: "待处理",
+    acceptedChanges: "已接受",
+    rejectedChanges: "已拒绝",
+    noAsrTranscript: "请先提取字幕后再进入 ASR 校正。",
     noVideo: "还没有加载视频",
     notEmbeddable: "这个来源暂时不能嵌入播放，但字幕导航仍可使用。",
     bilibiliEmbedUnavailable: "bilibili站外播放不提供字幕时间轴功能，建议缓存后观看。",
@@ -313,7 +436,9 @@ const COPY = {
     displayMode: "Display mode",
     modelSettings: "Model settings",
     modelSettingsTitle: "Model settings",
+    asrModelSettingsTitle: "ASR model profiles",
     modelProfileLibrary: "Model profiles",
+    asrModelProfileLibrary: "ASR model profiles",
     addModelProfile: "Add profile",
     addCollection: "New collection",
     activeModelProfile: "Editing",
@@ -335,6 +460,7 @@ const COPY = {
     taskStrategyHelp: "Override temperature and max output per task. Bad values can shorten output, break JSON, raise cost, or reduce stability.",
     titleTranslationTask: "Title translation",
     subtitleTranslationTask: "Subtitle translation",
+    asrCorrectionTask: "ASR correction",
     semanticSegmentationTask: "Semantic segmentation",
     guideTask: "Guide",
     outlineTask: "Outline",
@@ -352,11 +478,13 @@ const COPY = {
     noModelCandidates: "No models found",
     modelApiKey: "API Key",
     modelApiKeyHint: "Leave blank to keep current key",
+    apiKeyOptionalHint: "Not configured, optional",
     modelConfigured: "Configured",
     modelNotConfigured: "Not configured",
     closeSettings: "Close settings",
     saveSettings: "Save profile",
     settingsSaved: "Profile saved",
+    saveAsrSettings: "Save ASR profile",
     modelRolesSaving: "Saving model selection",
     modelRolesSaved: "Model selection saved",
     modelRolesSaveFailed: "Failed to save model selection",
@@ -378,6 +506,75 @@ const COPY = {
     local: "Local",
     cache: "Cache",
     transcript: "Subtitle list",
+    asrCorrection: "ASR correction",
+    openAsrCorrection: "Open ASR correction workbench",
+    asrWorkbenchTitle: "ASR correction workbench",
+    asrWorkbenchSubtitle: "Correct source subtitles; saving refreshes captions in the video workspace.",
+    backToWorkspace: "Back to workspace",
+    sourceTranscriptEditor: "Source transcript editor",
+    saveTranscript: "Save transcript",
+    transcriptSaved: "Transcript saved",
+    runAsrCorrection: "Generate suggestions",
+    asrModel: "ASR correction model",
+    asrModelHelp: "Choose the model profile used for subtitle correction.",
+    asrUserContext: "Additional reference info",
+    asrUserContextHelp: "Add confirmed terms, names, products, and recurring ASR mistakes. The model treats this as high-priority context.",
+    asrUserContextPlaceholder: "",
+    noModelProfiles: "No model profiles yet",
+    configureModelProfiles: "Manage ASR model profiles",
+    asrCorrectionApiUnavailable: "The ASR correction API is not available. Restart the backend service and try again.",
+    asrProgressTitle: "ASR correction running",
+    asrProgressElapsed: "Elapsed",
+    asrProgressUpdated: "Last update",
+    asrProgressStale: "The backend status has not updated for over 30 seconds. The model API may be taking too long to respond.",
+    asrPhaseQueued: "Queued",
+    asrPhasePreparing: "Preparing request",
+    asrPhaseCandidate: "Finding suspicious terms",
+    asrPhaseSearch: "Searching evidence",
+    asrPhaseReview: "Generating suggestions",
+    asrPhaseModelRequest: "Sending model request",
+    asrPhaseModelWait: "Waiting for model",
+    asrPhaseModelParse: "Parsing model response",
+    asrPhaseFinalizing: "Finalizing results",
+    asrPhaseComplete: "Complete",
+    asrPhaseFailed: "Failed",
+    searchCalibration: "Search validation",
+    searchCalibrationOn: "Search on",
+    searchCalibrationOff: "Search off",
+    searchProvider: "Search service",
+    searchApiKey: "Search API key",
+    firecrawlBaseUrl: "Firecrawl URL",
+    searchResultLimit: "Results",
+    correctionSuggestions: "Change suggestions",
+    noCorrectionSuggestions: "No suggestions yet.",
+    asrBeforeTranscript: "Before",
+    asrAfterTranscript: "After preview",
+    expandSuggestions: "Expand",
+    collapseSuggestions: "Collapse",
+    previousSuggestion: "Previous",
+    nextSuggestion: "Next",
+    rerunAsrCorrection: "Run again",
+    saveAcceptedChanges: "Auto-save subtitles after accept",
+    sortSuggestionsByConfidence: "Sort by confidence, high to low",
+    acceptConfidencePrefix: "Accept suggestions at",
+    acceptConfidenceSuffix: "% confidence or higher",
+    acceptConfidenceAction: "Accept high-confidence suggestions",
+    modelCalibration: "Model validation",
+    suggestionDetail: "Reason / evidence",
+    originalSpanNotFound: "Original span not found",
+    candidateSpan: "Candidate span",
+    acceptChange: "Accept",
+    rejectChange: "Reject",
+    acceptAllChanges: "Accept all",
+    originalText: "Original",
+    correctedText: "Suggested",
+    confidence: "Confidence",
+    evidence: "Evidence",
+    reason: "Reason",
+    pendingChanges: "Pending",
+    acceptedChanges: "Accepted",
+    rejectedChanges: "Rejected",
+    noAsrTranscript: "Extract subtitles before opening ASR correction.",
     noVideo: "No video loaded",
     notEmbeddable: "This source is not embeddable yet. Transcript navigation still works.",
     bilibiliEmbedUnavailable: "Bilibili off-site playback does not provide subtitle timeline control. Cache the video for the best experience.",
@@ -460,14 +657,21 @@ const MAX_LEFT_WIDTH = 420;
 const MIN_RIGHT_WIDTH = 360;
 const MAX_RIGHT_WIDTH = 880;
 const MIN_MAIN_WIDTH = 420;
+const MIN_ASR_REVIEW_WIDTH = 340;
+const MAX_ASR_REVIEW_WIDTH = 760;
+const MIN_ASR_EDITOR_WIDTH = 520;
 const MIN_PLAYER_HEIGHT_OVERLAY = 390;
 const MIN_PLAYER_HEIGHT_PANEL = 500;
 const MANUAL_COLLECTIONS_STORAGE_KEY = "course-navigator-manual-collections";
 const COLLAPSED_COLLECTIONS_STORAGE_KEY = "course-navigator-collapsed-collections";
 const TIME_MAP_AUTO_OPEN_STORAGE_KEY = "course-navigator-time-map-auto-open";
+const SELECTED_COURSE_STORAGE_KEY = "course-navigator-last-selected-course";
+const ASR_SAVE_ACCEPTED_CHANGES_STORAGE_KEY = "course-navigator-asr-save-accepted-changes";
+const ASR_SORT_BY_CONFIDENCE_STORAGE_KEY = "course-navigator-asr-sort-by-confidence";
 const TASK_PARAMETER_KEYS: TaskParameterKey[] = [
   "title_translation",
   "subtitle_translation",
+  "asr_correction",
   "semantic_segmentation",
   "guide",
   "outline",
@@ -481,6 +685,7 @@ const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
   translation_model_id: "",
   learning_model_id: "",
   global_model_id: "",
+  asr_model_id: "",
   study_detail_level: "faithful",
   task_parameters: emptyTaskParameterDrafts(),
 };
@@ -499,6 +704,7 @@ export function App() {
   const [fullscreenRequestId, setFullscreenRequestId] = useState(0);
   const [items, setItems] = useState<CourseItem[]>([]);
   const [selected, setSelected] = useState<CourseItem | null>(null);
+  const [view, setView] = useState<"workspace" | "asr">("workspace");
   const [forcedBilibiliEmbedIds, setForcedBilibiliEmbedIds] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<AiTab>("guide");
   const [sourceMode, setSourceMode] = useState<SourceMode>("embed");
@@ -508,6 +714,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState<StudyJobStatus | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [asrSettingsOpen, setAsrSettingsOpen] = useState(false);
   const [modelSettings, setModelSettings] = useState<ModelSettings | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(EMPTY_SETTINGS_DRAFT);
   const [settingsBusy, setSettingsBusy] = useState(false);
@@ -544,7 +751,7 @@ export function App() {
     listItems()
       .then((loaded) => {
         setItems(loaded);
-        selectCourse(loaded[0] ?? null);
+        selectCourse(initialSelectedCourse(loaded));
       })
       .catch((err: unknown) => setError(errorMessage(err, copy.unknownError)));
   }, []);
@@ -608,6 +815,9 @@ export function App() {
     setSelected(item);
     if (item?.source_url) {
       setUrl(item.source_url);
+    }
+    if (item && !isPreviewItem(item)) {
+      saveSelectedCourseId(item.id);
     }
   }
 
@@ -792,7 +1002,7 @@ export function App() {
       const loaded = await listItems();
       setItems(loaded);
       if (selected?.id === item.id) {
-        selectCourse(loaded[0] ?? null);
+        selectCourse(initialSelectedCourse(loaded));
       }
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
@@ -1111,6 +1321,7 @@ export function App() {
         translation_model_id: settingsDraft.translation_model_id,
         learning_model_id: settingsDraft.learning_model_id,
         global_model_id: settingsDraft.global_model_id,
+        asr_model_id: settingsDraft.asr_model_id,
         study_detail_level: "faithful",
         task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
       });
@@ -1137,6 +1348,7 @@ export function App() {
             translation_model_id: settingsDraft.translation_model_id,
             learning_model_id: settingsDraft.learning_model_id,
             global_model_id: settingsDraft.global_model_id,
+            asr_model_id: settingsDraft.asr_model_id,
             study_detail_level: "faithful",
             task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
           };
@@ -1147,6 +1359,7 @@ export function App() {
         translation_model_id: next.translation_model_id,
         learning_model_id: next.learning_model_id,
         global_model_id: next.global_model_id,
+        asr_model_id: next.asr_model_id,
         study_detail_level: "faithful",
         task_parameters: taskParametersToDraft(next.task_parameters),
       }));
@@ -1157,6 +1370,42 @@ export function App() {
     } finally {
       setRoleSettingsBusy(false);
     }
+  }
+
+  async function handleSaveAsrModelRole(profileId: string) {
+    if (!profileId) return;
+    const previousRoleId = settingsDraft.asr_model_id;
+    setSettingsDraft((current) => ({ ...current, asr_model_id: profileId }));
+    setRoleSettingsBusy(true);
+    setRoleSettingsMessage(copy.modelRolesSaving);
+    try {
+      const source: ModelSettingsInput = modelSettings
+        ? modelSettingsToInput(modelSettings)
+        : {
+            profiles: settingsDraft.profiles.map(modelProfileDraftToInput),
+            translation_model_id: settingsDraft.translation_model_id,
+            learning_model_id: settingsDraft.learning_model_id,
+            global_model_id: settingsDraft.global_model_id,
+            asr_model_id: settingsDraft.asr_model_id,
+            study_detail_level: "faithful",
+            task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
+          };
+      const next = await saveModelSettings({ ...source, asr_model_id: profileId });
+      setModelSettings(next);
+      setSettingsDraft(draftFromModelSettings(next, settingsDraft.active_profile_id));
+      setRoleSettingsMessage(copy.modelRolesSaved);
+    } catch (err) {
+      setSettingsDraft((current) => ({ ...current, asr_model_id: previousRoleId }));
+      setRoleSettingsMessage(`${copy.modelRolesSaveFailed}: ${errorMessage(err, copy.unknownError)}`);
+    } finally {
+      setRoleSettingsBusy(false);
+    }
+  }
+
+  async function handleSaveWorkbenchTranscript(itemId: string, transcript: TranscriptSegment[]): Promise<CourseItem> {
+    const next = await saveTranscript(itemId, transcript);
+    upsertCourseItem(next);
+    return next;
   }
 
   function handleAddModelProfile() {
@@ -1180,10 +1429,82 @@ export function App() {
         translation_model_id: current.translation_model_id || id,
         learning_model_id: current.learning_model_id || id,
         global_model_id: current.global_model_id || id,
+        asr_model_id: current.asr_model_id || id,
         study_detail_level: "faithful",
         task_parameters: current.task_parameters,
       };
     });
+  }
+
+  function handleAddAsrModelProfile() {
+    const id = `profile-${Date.now()}`;
+    setSettingsDraft((current) => {
+      const nextProfile: ModelProfileDraft = {
+        id,
+        name: "",
+        provider_type: "openai",
+        base_url: "",
+        model: "",
+        context_window: "",
+        max_tokens: "",
+        has_api_key: false,
+        api_key_preview: null,
+        api_key: "",
+      };
+      return {
+        profiles: [...current.profiles, nextProfile],
+        active_profile_id: id,
+        translation_model_id: current.translation_model_id || id,
+        learning_model_id: current.learning_model_id || id,
+        global_model_id: current.global_model_id || id,
+        asr_model_id: id,
+        study_detail_level: "faithful",
+        task_parameters: current.task_parameters,
+      };
+    });
+  }
+
+  if (view === "asr") {
+    return (
+      <main className="app-shell">
+        <AsrWorkbench
+          copy={copy}
+          item={selected}
+          outputLanguage={outputLanguage}
+          modelSettings={modelSettings}
+          roleBusy={roleSettingsBusy}
+          roleMessage={roleSettingsMessage}
+          onBack={() => setView("workspace")}
+          onOpenSettings={() => setAsrSettingsOpen(true)}
+          onAsrModelChange={handleSaveAsrModelRole}
+          onSaveTranscript={handleSaveWorkbenchTranscript}
+        />
+        {asrSettingsOpen ? (
+          <SettingsModal
+            scope="asr"
+            copy={copy}
+            draft={settingsDraft}
+            modelSettings={modelSettings}
+            busy={settingsBusy}
+            message={settingsMessage}
+            roleBusy={roleSettingsBusy}
+            roleMessage={roleSettingsMessage}
+            onClose={() => {
+              setAsrSettingsOpen(false);
+              setSettingsMessage(null);
+              setRoleSettingsMessage(null);
+              if (modelSettings) {
+                setSettingsDraft(draftFromModelSettings(modelSettings, settingsDraft.active_profile_id));
+              }
+            }}
+            onAddProfile={handleAddAsrModelProfile}
+            onDraftChange={setSettingsDraft}
+            onRoleChange={handleSaveModelRole}
+            onSave={handleSaveSettings}
+          />
+        ) : null}
+      </main>
+    );
   }
 
   return (
@@ -1732,14 +2053,26 @@ export function App() {
                 <Captions size={16} />
                 <h2>{copy.transcript}</h2>
               </div>
-              <DisplayModeControls
-                copy={copy}
-                scopeLabel={copy.transcript}
-                value={transcriptDisplayMode}
-                onChange={(value) => {
-                  if (value !== "hidden") setTranscriptDisplayMode(value);
-                }}
-              />
+              <div className="transcript-tools">
+                <button
+                  className="asr-workbench-trigger"
+                  type="button"
+                  title={copy.openAsrCorrection}
+                  onClick={() => setView("asr")}
+                  disabled={!selected?.transcript.length}
+                >
+                  <GitCompare size={17} />
+                  {copy.asrCorrection}
+                </button>
+                <DisplayModeControls
+                  copy={copy}
+                  scopeLabel={copy.transcript}
+                  value={transcriptDisplayMode}
+                  onChange={(value) => {
+                    if (value !== "hidden") setTranscriptDisplayMode(value);
+                  }}
+                />
+              </div>
             </div>
             <Transcript
               item={selected}
@@ -1875,6 +2208,1077 @@ function DisplayModeControls({
   );
 }
 
+function AsrWorkbench({
+  copy,
+  item,
+  outputLanguage,
+  modelSettings,
+  roleBusy,
+  roleMessage,
+  onBack,
+  onOpenSettings,
+  onAsrModelChange,
+  onSaveTranscript,
+}: {
+  copy: (typeof COPY)[UiLanguage];
+  item: CourseItem | null;
+  outputLanguage: OutputLanguage;
+  modelSettings: ModelSettings | null;
+  roleBusy: boolean;
+  roleMessage: string | null;
+  onBack: () => void;
+  onOpenSettings: () => void;
+  onAsrModelChange: (profileId: string) => Promise<void>;
+  onSaveTranscript: (itemId: string, transcript: TranscriptSegment[]) => Promise<CourseItem>;
+}) {
+  const editorRef = useRef<HTMLTextAreaElement | null>(null);
+  const previewRef = useRef<HTMLTextAreaElement | null>(null);
+  const asrGridRef = useRef<HTMLDivElement | null>(null);
+  const scrollSyncRef = useRef(false);
+  const asrDragCleanupRef = useRef<(() => void) | null>(null);
+  const hoverHideTimerRef = useRef<number | null>(null);
+  const [editorText, setEditorText] = useState(() => transcriptToEditorText(item?.transcript ?? []));
+  const [suggestions, setSuggestions] = useState<AsrCorrectionSuggestion[]>([]);
+  const [suggestionsExpanded, setSuggestionsExpanded] = useState(false);
+  const [saveAcceptedChanges, setSaveAcceptedChanges] = useState(() =>
+    loadBooleanPreference(ASR_SAVE_ACCEPTED_CHANGES_STORAGE_KEY, false),
+  );
+  const [sortSuggestionsByConfidence, setSortSuggestionsByConfidence] = useState(() =>
+    loadBooleanPreference(ASR_SORT_BY_CONFIDENCE_STORAGE_KEY, true),
+  );
+  const [confidenceThreshold, setConfidenceThreshold] = useState("95");
+  const [activeSuggestionId, setActiveSuggestionId] = useState<string | null>(null);
+  const [reviewWidth, setReviewWidth] = useState(420);
+  const [hoverCard, setHoverCard] = useState<AsrSuggestionHover | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<StudyJobStatus | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [userContext, setUserContext] = useState("");
+  const [searchSettings, setSearchSettings] = useState<AsrSearchSettings | null>(null);
+  const [searchDraft, setSearchDraft] = useState<AsrSearchDraft>({
+    enabled: false,
+    provider: "tavily",
+    api_key: "",
+    api_key_preview: null,
+    base_url: "",
+    result_limit: "5",
+  });
+
+  useEffect(() => {
+    setEditorText(transcriptToEditorText(item?.transcript ?? []));
+    setSuggestions([]);
+    setMessage(null);
+    setError(null);
+    setJobStatus(null);
+    setUserContext("");
+    setSuggestionsExpanded(false);
+    setHoverCard(null);
+    setActiveSuggestionId(null);
+  }, [item?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getAsrSearchSettings()
+      .then((settings) => {
+        if (cancelled) return;
+        setSearchSettings(settings);
+        setSearchDraft(settingsToSearchDraft(settings));
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSearchSettings(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (hoverHideTimerRef.current !== null) {
+        window.clearTimeout(hoverHideTimerRef.current);
+      }
+      asrDragCleanupRef.current?.();
+    };
+  }, []);
+
+  const profiles = modelSettings?.profiles ?? [];
+  const selectedModelId = modelSettings?.asr_model_id && profiles.some((profile) => profile.id === modelSettings.asr_model_id)
+    ? modelSettings.asr_model_id
+    : (profiles[0]?.id ?? "");
+  const counts = suggestionCounts(suggestions);
+  const pendingSuggestions = useMemo(
+    () => suggestions.filter((suggestion) => suggestion.status === "pending"),
+    [suggestions],
+  );
+  const reviewSuggestions = useMemo(
+    () => sortAsrReviewSuggestions(pendingSuggestions, sortSuggestionsByConfidence),
+    [pendingSuggestions, sortSuggestionsByConfidence],
+  );
+  const suggestionById = useMemo(
+    () => new Map(suggestions.map((suggestion) => [suggestion.id, suggestion])),
+    [suggestions],
+  );
+  const hasCorrectionSuggestions = pendingSuggestions.length > 0;
+  const effectiveSuggestionsExpanded = suggestionsExpanded && hasCorrectionSuggestions;
+  const activeSuggestionIndex = activeSuggestionId
+    ? reviewSuggestions.findIndex((suggestion) => suggestion.id === activeSuggestionId)
+    : -1;
+  const activeSuggestion =
+    reviewSuggestions[activeSuggestionIndex >= 0 ? activeSuggestionIndex : 0] ?? null;
+  const displaySuggestionIndex = activeSuggestion ? Math.max(0, activeSuggestionIndex) + 1 : 0;
+  const hoverSuggestion = hoverCard ? suggestionById.get(hoverCard.suggestionId) ?? null : null;
+  const progressInfo = jobStatus && busy ? asrProgressInfo(jobStatus, copy) : null;
+  const confidenceThresholdPercent = normalizedConfidenceThreshold(confidenceThreshold);
+  const thresholdAcceptCount = useMemo(
+    () => filterAsrSuggestionsByConfidence(pendingSuggestions, confidenceThresholdPercent).length,
+    [confidenceThresholdPercent, pendingSuggestions],
+  );
+  const reviewTranscript = useMemo(() => {
+    try {
+      return editorTextToTranscript(editorText);
+    } catch {
+      return item?.transcript ?? [];
+    }
+  }, [editorText, item?.transcript]);
+  const editorHighlights = useMemo(
+    () => asrEditorHighlightRanges(editorText, suggestions),
+    [editorText, suggestions],
+  );
+  const previewText = useMemo(() => {
+    try {
+      const transcript = suggestions
+        .filter((suggestion) => suggestion.status === "pending")
+        .reduce((current, suggestion) => applyAsrSuggestion(current, suggestion), editorTextToTranscript(editorText));
+      return transcriptToEditorText(transcript);
+    } catch {
+      return editorText;
+    }
+  }, [editorText, suggestions]);
+  const previewHighlights = useMemo(
+    () => asrEditorHighlightRanges(previewText, suggestions, "corrected"),
+    [previewText, suggestions],
+  );
+
+  useEffect(() => {
+    if (pendingSuggestions.length) return;
+    setSuggestionsExpanded(false);
+    setHoverCard(null);
+    setActiveSuggestionId(null);
+  }, [pendingSuggestions.length]);
+
+  useEffect(() => {
+    if (!reviewSuggestions.length) return;
+    if (activeSuggestionId && reviewSuggestions.some((suggestion) => suggestion.id === activeSuggestionId)) return;
+    setActiveSuggestionId(reviewSuggestions[0].id);
+  }, [activeSuggestionId, reviewSuggestions]);
+
+  useEffect(() => {
+    if (!hoverSuggestion || hoverSuggestion.status === "pending") return;
+    setHoverCard(null);
+  }, [hoverSuggestion]);
+
+  async function runCorrection() {
+    if (!item) return;
+    setError(null);
+    setMessage(null);
+    setSuggestions([]);
+    setSuggestionsExpanded(false);
+    setHoverCard(null);
+    try {
+      const transcript = editorTextToTranscript(editorText);
+      setBusy(`${copy.runAsrCorrection} 0%`);
+      const searchConfig = searchDraftToConfig(searchDraft);
+      const nextSearchSettings = await saveAsrSearchSettings(searchDraftToSettingsInput(searchDraft));
+      setSearchSettings(nextSearchSettings);
+      const firstStatus = await startAsrCorrectionJob(item.id, {
+        output_language: outputLanguage,
+        transcript,
+        model_id: selectedModelId || undefined,
+        user_context: userContext.trim() || undefined,
+        search: searchConfig,
+      });
+      setJobStatus(firstStatus);
+      let current = firstStatus;
+      while (current.status === "queued" || current.status === "running") {
+        await delay(1000);
+        current = await getStudyJob(firstStatus.job_id);
+        setJobStatus(current);
+        setBusy(`${current.message} ${current.progress}%`);
+      }
+      if (current.status === "failed") {
+        throw new Error(current.error ?? current.message);
+      }
+      const result = await getAsrCorrectionResult(firstStatus.job_id);
+      setSuggestions(result.suggestions);
+      setActiveSuggestionId(result.suggestions.find((suggestion) => suggestion.status === "pending")?.id ?? null);
+      setMessage(result.suggestions.length ? null : copy.noCorrectionSuggestions);
+    } catch (err) {
+      setError(asrCorrectionErrorMessage(err, copy));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function toggleSaveAcceptedChanges(checked: boolean) {
+    setSaveAcceptedChanges(checked);
+    saveBooleanPreference(ASR_SAVE_ACCEPTED_CHANGES_STORAGE_KEY, checked);
+  }
+
+  function toggleSortSuggestionsByConfidence(checked: boolean) {
+    setSortSuggestionsByConfidence(checked);
+    saveBooleanPreference(ASR_SORT_BY_CONFIDENCE_STORAGE_KEY, checked);
+  }
+
+  function changeSearchProvider(provider: AsrSearchProvider) {
+    const savedBaseUrl = searchSettings?.[provider]?.base_url ?? "";
+    const apiKeyPreview = searchSettings?.[provider]?.api_key_preview ?? null;
+    setSearchDraft((current) => ({
+      ...current,
+      provider,
+      api_key: maskedSecretValue(apiKeyPreview),
+      api_key_preview: apiKeyPreview,
+      base_url: provider === "firecrawl" ? savedBaseUrl : "",
+    }));
+  }
+
+  async function saveCurrentTranscript() {
+    if (!item) return;
+    setError(null);
+    setMessage(null);
+    try {
+      const transcript = editorTextToTranscript(editorText);
+      const next = await onSaveTranscript(item.id, transcript);
+      setEditorText(transcriptToEditorText(next.transcript));
+      setMessage(copy.transcriptSaved);
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    }
+  }
+
+  async function saveTranscriptText(nextEditorText: string) {
+    if (!item) return;
+    const transcript = editorTextToTranscript(nextEditorText);
+    const next = await onSaveTranscript(item.id, transcript);
+    setEditorText(transcriptToEditorText(next.transcript));
+    setMessage(copy.transcriptSaved);
+  }
+
+  async function acceptSuggestion(suggestionId: string) {
+    const suggestion = suggestions.find((entry) => entry.id === suggestionId);
+    if (!suggestion) return;
+    try {
+      const transcript = editorTextToTranscript(editorText);
+      const nextTranscript = applyAsrSuggestion(transcript, suggestion);
+      const nextEditorText = transcriptToEditorText(nextTranscript);
+      setEditorText(nextEditorText);
+      setSuggestions((current) =>
+        current.map((entry) => (entry.id === suggestionId ? { ...entry, status: "accepted" } : entry)),
+      );
+      if (saveAcceptedChanges) {
+        await saveTranscriptText(nextEditorText);
+      }
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    }
+  }
+
+  function rejectSuggestion(suggestionId: string) {
+    setSuggestions((current) =>
+      current.map((entry) => (entry.id === suggestionId ? { ...entry, status: "rejected" } : entry)),
+    );
+  }
+
+  async function acceptAllSuggestions() {
+    await acceptSuggestionBatch(pendingSuggestions);
+  }
+
+  async function acceptSuggestionsAboveThreshold() {
+    await acceptSuggestionBatch(
+      filterAsrSuggestionsByConfidence(pendingSuggestions, Number(confidenceThreshold)),
+    );
+  }
+
+  async function acceptSuggestionBatch(targetSuggestions: AsrCorrectionSuggestion[]) {
+    if (!targetSuggestions.length) return;
+    try {
+      const acceptedIds = new Set(targetSuggestions.map((suggestion) => suggestion.id));
+      const transcript = targetSuggestions.reduce(
+        (current, suggestion) => applyAsrSuggestion(current, suggestion),
+        editorTextToTranscript(editorText),
+      );
+      const nextEditorText = transcriptToEditorText(transcript);
+      setEditorText(nextEditorText);
+      setSuggestions((current) =>
+        current.map((entry) => (acceptedIds.has(entry.id) ? { ...entry, status: "accepted" } : entry)),
+      );
+      if (saveAcceptedChanges) {
+        await saveTranscriptText(nextEditorText);
+      }
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    }
+  }
+
+  function changePreviewText(nextPreviewText: string) {
+    try {
+      setEditorText(previewTextToEditorText(nextPreviewText, suggestions));
+      setSuggestions((current) => reconcilePreviewEditedSuggestions(nextPreviewText, current));
+    } catch {
+      setEditorText(nextPreviewText);
+    }
+  }
+
+  function focusSuggestionInPreview(suggestion: AsrCorrectionSuggestion) {
+    setActiveSuggestionId(suggestion.id);
+    const [range] = asrEditorHighlightRanges(previewText, [suggestion], "corrected");
+    if (!range || !previewRef.current) return;
+    const previewEditor = previewRef.current;
+    previewEditor.focus();
+    previewEditor.setSelectionRange(range.start, range.end);
+    window.requestAnimationFrame(() => {
+      if (!previewRef.current) return;
+      const marker = findAsrEditorMarker("preview", suggestion.id, "corrected");
+      if (marker) {
+        const maxTop = Math.max(0, previewRef.current.scrollHeight - previewRef.current.clientHeight);
+        const targetTop = marker.offsetTop - previewRef.current.clientHeight * 0.28;
+        previewRef.current.scrollTop = clamp(targetTop, 0, maxTop);
+      }
+      syncTranscriptScroll("preview", {
+        left: previewRef.current.scrollLeft,
+        top: previewRef.current.scrollTop,
+      });
+    });
+  }
+
+  function navigateSuggestion(direction: AsrSuggestionDirection) {
+    if (!reviewSuggestions.length) return;
+    const currentIndex = activeSuggestionIndex >= 0 ? activeSuggestionIndex : 0;
+    const nextIndex = clamp(currentIndex + direction, 0, reviewSuggestions.length - 1);
+    focusSuggestionInPreview(reviewSuggestions[nextIndex]);
+  }
+
+  function syncTranscriptScroll(source: "editor" | "preview", scroll: { left: number; top: number }) {
+    if (scrollSyncRef.current) return;
+    scrollSyncRef.current = true;
+    if (source === "editor" && previewRef.current) {
+      previewRef.current.scrollLeft = scroll.left;
+      previewRef.current.scrollTop = scroll.top;
+    }
+    if (source === "preview" && editorRef.current) {
+      editorRef.current.scrollLeft = scroll.left;
+      editorRef.current.scrollTop = scroll.top;
+    }
+    window.requestAnimationFrame(() => {
+      scrollSyncRef.current = false;
+    });
+  }
+
+  function clearHoverHideTimer() {
+    if (hoverHideTimerRef.current === null) return;
+    window.clearTimeout(hoverHideTimerRef.current);
+    hoverHideTimerRef.current = null;
+  }
+
+  function scheduleHoverClose() {
+    clearHoverHideTimer();
+    hoverHideTimerRef.current = window.setTimeout(() => {
+      setHoverCard(null);
+      hoverHideTimerRef.current = null;
+    }, 180);
+  }
+
+  function showSuggestionHover(suggestionId: string, event: ReactMouseEvent<HTMLElement>) {
+    const suggestion = suggestionById.get(suggestionId);
+    if (!suggestion || suggestion.status !== "pending") return;
+    clearHoverHideTimer();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const width = 320;
+    const height = 188;
+    const left = Math.min(Math.max(12, rect.left), Math.max(12, window.innerWidth - width - 12));
+    const below = rect.bottom + 8;
+    const top = below + height > window.innerHeight ? Math.max(12, rect.top - height - 8) : below;
+    setHoverCard({ suggestionId, left, top });
+  }
+
+  function acceptHoveredSuggestion(suggestionId: string) {
+    void acceptSuggestion(suggestionId);
+    setHoverCard(null);
+  }
+
+  function rejectHoveredSuggestion(suggestionId: string) {
+    rejectSuggestion(suggestionId);
+    setHoverCard(null);
+  }
+
+  function startAsrReviewDrag(event: ReactPointerEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    asrDragCleanupRef.current?.();
+    const gridBox = asrGridRef.current?.getBoundingClientRect();
+    if (!gridBox) return;
+    const handle = event.currentTarget;
+    const pointerId = event.pointerId;
+    let active = true;
+    let frameId: number | null = null;
+    let latestX = event.clientX;
+
+    const applyLayout = (clientX: number) => {
+      setReviewWidth((current) => {
+        const maxWidth = Math.min(
+          MAX_ASR_REVIEW_WIDTH,
+          Math.max(MIN_ASR_REVIEW_WIDTH, gridBox.width - MIN_ASR_EDITOR_WIDTH - 6),
+        );
+        const nextWidth = clamp(gridBox.right - clientX, MIN_ASR_REVIEW_WIDTH, maxWidth);
+        return nextWidth === current ? current : nextWidth;
+      });
+    };
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      latestX = moveEvent.clientX;
+      if (frameId !== null) return;
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        applyLayout(latestX);
+      });
+    };
+
+    const stopDrag = () => {
+      if (!active) return;
+      active = false;
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+        frameId = null;
+      }
+      handle.removeEventListener("pointermove", handlePointerMove);
+      handle.removeEventListener("pointerup", stopDrag);
+      handle.removeEventListener("pointercancel", stopDrag);
+      handle.removeEventListener("lostpointercapture", stopDrag);
+      window.removeEventListener("pointerup", stopDrag);
+      window.removeEventListener("blur", stopDrag);
+      document.body.classList.remove("is-resizing-layout");
+      if (handle.hasPointerCapture?.(pointerId)) {
+        handle.releasePointerCapture(pointerId);
+      }
+      asrDragCleanupRef.current = null;
+    };
+
+    document.body.classList.add("is-resizing-layout");
+    handle.setPointerCapture?.(pointerId);
+    handle.addEventListener("pointermove", handlePointerMove);
+    handle.addEventListener("pointerup", stopDrag);
+    handle.addEventListener("pointercancel", stopDrag);
+    handle.addEventListener("lostpointercapture", stopDrag);
+    window.addEventListener("pointerup", stopDrag);
+    window.addEventListener("blur", stopDrag);
+    asrDragCleanupRef.current = stopDrag;
+  }
+
+  const gridClassName = hasCorrectionSuggestions ? "asr-grid has-suggestions" : "asr-grid";
+  const reviewPanelClassName = [
+    "asr-review-panel",
+    hasCorrectionSuggestions ? "has-suggestions" : "",
+    effectiveSuggestionsExpanded ? "suggestions-expanded" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <section className="asr-workbench">
+      <header className="asr-topbar">
+        <button className="asr-back-button" type="button" onClick={onBack}>
+          <ArrowLeft size={16} />
+          {copy.backToWorkspace}
+        </button>
+        <div className="asr-title-block">
+          <h1>{copy.asrWorkbenchTitle}</h1>
+          <p>{item?.title ?? copy.noCourse}</p>
+        </div>
+        <button className="settings-trigger" aria-label={copy.asrModelSettingsTitle} onClick={onOpenSettings}>
+          <SettingsIcon size={18} />
+        </button>
+      </header>
+
+      {error ? <div className="error-strip" role="alert" aria-live="polite">{error}</div> : null}
+      {!hasCorrectionSuggestions && message ? (
+        <div className="status-strip">{message}</div>
+      ) : null}
+      {progressInfo ? (
+        <div className="asr-progress-card" aria-live="polite">
+          <div className="asr-progress-topline">
+            <div>
+              <span>{copy.asrProgressTitle}</span>
+              <strong>{progressInfo.phaseLabel}</strong>
+            </div>
+            <b>{jobStatus?.progress ?? 0}%</b>
+          </div>
+          {jobStatus ? <progress max={100} value={jobStatus.progress} /> : null}
+          <p>{jobStatus?.message ?? busy}</p>
+          <div className="asr-progress-meta">
+            <span>{copy.asrProgressElapsed} {progressInfo.elapsed}</span>
+            <span>{copy.asrProgressUpdated} {progressInfo.lastUpdate}</span>
+          </div>
+          {progressInfo.stale ? <p className="asr-progress-warning">{copy.asrProgressStale}</p> : null}
+        </div>
+      ) : null}
+
+      {!item?.transcript.length ? (
+        <div className="asr-empty-state">
+          <FileText size={28} />
+          <p>{copy.noAsrTranscript}</p>
+          <button type="button" onClick={onBack}>{copy.backToWorkspace}</button>
+        </div>
+      ) : (
+        <div
+          className={gridClassName}
+          ref={asrGridRef}
+          style={{ "--asr-review-width": `${reviewWidth}px` } as CSSProperties}
+        >
+          <section className="asr-editor-panel">
+            <div className="asr-panel-head">
+              <div>
+                <h2>{copy.sourceTranscriptEditor}</h2>
+                <p>{copy.asrWorkbenchSubtitle}</p>
+              </div>
+              <button className="asr-primary-action" type="button" onClick={saveCurrentTranscript} disabled={Boolean(busy)}>
+                <Save size={15} />
+                {copy.saveTranscript}
+              </button>
+            </div>
+            {hasCorrectionSuggestions ? (
+              <div className="asr-transcript-compare">
+                <div className="asr-transcript-pane source">
+                  <div className="asr-pane-label">{copy.asrBeforeTranscript}</div>
+                  <AsrSourceEditor
+                    refObject={editorRef}
+                    value={editorText}
+                    highlights={editorHighlights}
+                    activeSuggestionId={activeSuggestion?.id}
+                    suggestionById={suggestionById}
+                    copy={copy}
+                    onChange={setEditorText}
+                    onScroll={(scroll) => syncTranscriptScroll("editor", scroll)}
+                    onMarkerEnter={showSuggestionHover}
+                    onMarkerLeave={scheduleHoverClose}
+                  />
+                </div>
+                <div className="asr-transcript-pane preview">
+                  <div className="asr-pane-label with-nav">
+                    <span>{copy.asrAfterTranscript}</span>
+                    <div className="asr-pane-review-nav" aria-label={copy.correctionSuggestions}>
+                      <button
+                        type="button"
+                        onClick={() => navigateSuggestion(-1)}
+                        disabled={!activeSuggestion || displaySuggestionIndex <= 1}
+                      >
+                        <ArrowUp size={13} />
+                        {copy.previousSuggestion}
+                      </button>
+                      <strong>{displaySuggestionIndex}/{reviewSuggestions.length}</strong>
+                      <button
+                        type="button"
+                        onClick={() => navigateSuggestion(1)}
+                        disabled={!activeSuggestion || displaySuggestionIndex >= reviewSuggestions.length}
+                      >
+                        <ArrowDown size={13} />
+                        {copy.nextSuggestion}
+                      </button>
+                    </div>
+                  </div>
+                  <AsrSourceEditor
+                    refObject={previewRef}
+                    value={previewText}
+                    highlights={previewHighlights}
+                    activeSuggestionId={activeSuggestion?.id}
+                    suggestionById={suggestionById}
+                    copy={copy}
+                    onChange={changePreviewText}
+                    onScroll={(scroll) => syncTranscriptScroll("preview", scroll)}
+                    onMarkerEnter={showSuggestionHover}
+                    onMarkerLeave={scheduleHoverClose}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="asr-manual-editor">
+                <AsrSourceEditor
+                  refObject={editorRef}
+                  value={editorText}
+                  highlights={editorHighlights}
+                  suggestionById={suggestionById}
+                  copy={copy}
+                  onChange={setEditorText}
+                />
+              </div>
+            )}
+          </section>
+
+          <ResizeHandle
+            ariaLabel="调整字幕编辑区和 ASR 侧栏宽度"
+            kind="vertical"
+            onPointerDown={startAsrReviewDrag}
+          />
+
+          <aside className={reviewPanelClassName}>
+            <section className="asr-config-panel">
+              <label className="settings-field">
+                <span>{copy.asrModel}</span>
+                <select
+                  value={selectedModelId}
+                  disabled={roleBusy || !profiles.length}
+                  onChange={(event) => void onAsrModelChange(event.target.value)}
+                >
+                  {profiles.length ? (
+                    profiles.map((profile) => (
+                      <option value={profile.id} key={profile.id}>
+                        {profile.name || profile.model || copy.unnamedModelProfile}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">{copy.noModelProfiles}</option>
+                  )}
+                </select>
+                <small>{copy.asrModelHelp}</small>
+              </label>
+              {roleMessage ? (
+                <div className="settings-role-status" aria-live="polite">
+                  {roleBusy ? <Loader2 className="spin" size={13} /> : null}
+                  <span>{roleMessage}</span>
+                </div>
+              ) : null}
+              <label className="settings-field asr-context-field">
+                <span>{copy.asrUserContext}</span>
+                <textarea
+                  value={userContext}
+                  onChange={(event) => setUserContext(event.target.value)}
+                  placeholder={copy.asrUserContextPlaceholder}
+                />
+                <small>{copy.asrUserContextHelp}</small>
+              </label>
+              <div className="asr-config-actions">
+                <button className="secondary-action" type="button" onClick={onOpenSettings}>
+                  {copy.configureModelProfiles}
+                </button>
+                <label className="asr-switch">
+                  <input
+                    type="checkbox"
+                    checked={searchDraft.enabled}
+                    onChange={(event) => setSearchDraft((current) => ({ ...current, enabled: event.target.checked }))}
+                  />
+                  <span className="asr-switch-track" aria-hidden="true">
+                    <span />
+                  </span>
+                  <span>{copy.searchCalibration}</span>
+                </label>
+              </div>
+              {searchDraft.enabled ? (
+                <div className="asr-search-grid">
+                  <label className="settings-field">
+                    <span>{copy.searchProvider}</span>
+                    <select
+                      value={searchDraft.provider}
+                      onChange={(event) => changeSearchProvider(event.target.value as AsrSearchProvider)}
+                    >
+                      <option value="tavily">Tavily</option>
+                      <option value="firecrawl">Firecrawl</option>
+                    </select>
+                  </label>
+                  {searchDraft.provider === "firecrawl" ? (
+                    <label className="settings-field">
+                      <span>{copy.firecrawlBaseUrl}</span>
+                      <input
+                        value={searchDraft.base_url}
+                        onChange={(event) => setSearchDraft((current) => ({ ...current, base_url: event.target.value }))}
+                        placeholder="http://127.0.0.1:3002"
+                      />
+                    </label>
+                  ) : null}
+                  <label className="settings-field">
+                    <span>{copy.searchApiKey}</span>
+                    <input
+                      autoComplete="off"
+                      value={searchDraft.api_key}
+                      placeholder={searchDraft.api_key_preview ? copy.modelApiKeyHint : copy.apiKeyOptionalHint}
+                      onChange={(event) => setSearchDraft((current) => ({
+                        ...current,
+                        api_key: event.target.value,
+                      }))}
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span>{copy.searchResultLimit}</span>
+                    <input
+                      inputMode="numeric"
+                      value={searchDraft.result_limit}
+                      onChange={(event) => setSearchDraft((current) => ({ ...current, result_limit: event.target.value }))}
+                    />
+                  </label>
+                </div>
+              ) : null}
+              <button className="asr-primary-action wide" type="button" onClick={() => void runCorrection()} disabled={Boolean(busy) || !selectedModelId}>
+                {busy ? <Loader2 className="spin" size={15} /> : <Sparkles size={15} />}
+                {copy.runAsrCorrection}
+              </button>
+            </section>
+
+            {hasCorrectionSuggestions ? (
+              <section className="asr-suggestion-panel">
+                <div className="asr-panel-head compact">
+                  <div>
+                    <h2>{copy.correctionSuggestions}</h2>
+                    <p>
+                      {copy.pendingChanges} {counts.pending} · {copy.acceptedChanges} {counts.accepted} · {copy.rejectedChanges} {counts.rejected}
+                    </p>
+                  </div>
+                  <div className="asr-review-control-block">
+                    <div className="asr-review-options">
+                      <label className="asr-inline-check">
+                        <input
+                          type="checkbox"
+                          checked={sortSuggestionsByConfidence}
+                          onChange={(event) => toggleSortSuggestionsByConfidence(event.target.checked)}
+                        />
+                        <span>{copy.sortSuggestionsByConfidence}</span>
+                      </label>
+                      <label className="asr-inline-check">
+                        <input
+                          type="checkbox"
+                          checked={saveAcceptedChanges}
+                          onChange={(event) => toggleSaveAcceptedChanges(event.target.checked)}
+                        />
+                        <span>{copy.saveAcceptedChanges}</span>
+                      </label>
+                    </div>
+                    <div className="asr-confidence-bulk">
+                      <span className="asr-confidence-line">
+                        <span>{copy.acceptConfidencePrefix}</span>
+                        <input
+                          aria-label={copy.confidence}
+                          inputMode="decimal"
+                          value={confidenceThreshold}
+                          onBlur={(event) => setConfidenceThreshold(String(normalizedConfidenceThreshold(event.currentTarget.value)))}
+                          onChange={(event) => setConfidenceThreshold(event.target.value)}
+                        />
+                        <span>{copy.acceptConfidenceSuffix}</span>
+                      </span>
+                      <button
+                        type="button"
+                        aria-label={copy.acceptConfidenceAction}
+                        title={copy.acceptConfidenceAction}
+                        onClick={() => void acceptSuggestionsAboveThreshold()}
+                        disabled={!thresholdAcceptCount}
+                      >
+                        <Check size={14} />
+                      </button>
+                    </div>
+                  </div>
+                  <button
+                    className="asr-expand-toggle"
+                    type="button"
+                    onClick={() => setSuggestionsExpanded((current) => !current)}
+                    aria-label={effectiveSuggestionsExpanded ? copy.collapseSuggestions : copy.expandSuggestions}
+                    title={effectiveSuggestionsExpanded ? copy.collapseSuggestions : copy.expandSuggestions}
+                  >
+                    {effectiveSuggestionsExpanded ? <ChevronDown size={18} /> : <ChevronUp size={18} />}
+                  </button>
+                  <div className="asr-panel-actions">
+                    <button
+                      className="secondary-action"
+                      type="button"
+                      onClick={() => void acceptAllSuggestions()}
+                      disabled={!counts.pending}
+                    >
+                      <CheckCheck size={14} />
+                      {copy.acceptAllChanges}
+                    </button>
+                    <button
+                      className="secondary-action asr-rerun-action"
+                      type="button"
+                      onClick={() => void runCorrection()}
+                      disabled={Boolean(busy) || !selectedModelId}
+                    >
+                      <Sparkles size={14} />
+                      {copy.rerunAsrCorrection}
+                    </button>
+                  </div>
+                </div>
+                <div className="asr-suggestions">
+                  {reviewSuggestions.map((suggestion) => {
+                    const context = asrSuggestionContext(reviewTranscript, suggestion);
+                    const tooltip = asrSuggestionTitle(suggestion, copy);
+                    return (
+                      <article
+                        className={`asr-suggestion ${suggestion.status} ${suggestion.id === activeSuggestion?.id ? "active" : ""}`}
+                        data-asr-suggestion-id={suggestion.id}
+                        key={suggestion.id}
+                      >
+                        <div className="asr-suggestion-meta">
+                          <button
+                            className="asr-jump-link"
+                            type="button"
+                            onClick={() => focusSuggestionInPreview(suggestion)}
+                          >
+                            {formatTime(suggestion.start)}
+                          </button>
+                          <span>{copy.confidence} {Math.round(suggestion.confidence * 100)}%</span>
+                          <span>{suggestion.source === "search" ? copy.searchCalibration : copy.modelCalibration}</span>
+                          {!context.originalMatched ? <span className="warning">{copy.originalSpanNotFound}</span> : null}
+                          <span className="asr-suggestion-detail">
+                            {copy.suggestionDetail}
+                          </span>
+                        </div>
+                        <div className="asr-diff contextual">
+                          <div>
+                            <small>{copy.originalText}</small>
+                            <HighlightedSuggestionText
+                              text={context.originalLine}
+                              highlight={suggestion.original_text}
+                              variant="original"
+                              tooltip={tooltip}
+                              suggestionId={suggestion.id}
+                              onMarkerEnter={showSuggestionHover}
+                              onMarkerLeave={scheduleHoverClose}
+                            />
+                            {!context.originalMatched ? <em>{copy.candidateSpan}: {suggestion.original_text}</em> : null}
+                          </div>
+                          <div>
+                            <small>{copy.correctedText}</small>
+                            <HighlightedSuggestionText
+                              text={context.correctedLine}
+                              highlight={suggestion.corrected_text}
+                              variant="corrected"
+                              tooltip={tooltip}
+                              suggestionId={suggestion.id}
+                              onMarkerEnter={showSuggestionHover}
+                              onMarkerLeave={scheduleHoverClose}
+                            />
+                          </div>
+                        </div>
+                        <div className="asr-suggestion-note">
+                          <p><strong>{copy.reason}</strong>{suggestion.reason}</p>
+                          {suggestion.evidence ? <p><strong>{copy.evidence}</strong>{suggestion.evidence}</p> : null}
+                        </div>
+                        <div className="asr-suggestion-actions">
+                          <button type="button" onClick={() => void acceptSuggestion(suggestion.id)} disabled={suggestion.status !== "pending"}>
+                            <Check size={14} />
+                            {copy.acceptChange}
+                          </button>
+                          <button type="button" onClick={() => rejectSuggestion(suggestion.id)} disabled={suggestion.status !== "pending"}>
+                            <X size={14} />
+                            {copy.rejectChange}
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </section>
+            ) : null}
+          </aside>
+        </div>
+      )}
+      {hoverCard && hoverSuggestion && hoverSuggestion.status === "pending" ? (
+        <div
+          className="asr-hover-card"
+          style={{ left: hoverCard.left, top: hoverCard.top }}
+          onMouseEnter={clearHoverHideTimer}
+          onMouseLeave={scheduleHoverClose}
+          role="dialog"
+          aria-label={copy.suggestionDetail}
+        >
+          <div className="asr-hover-card-meta">
+            <span>{formatTime(hoverSuggestion.start)}</span>
+            <span>{copy.confidence} {Math.round(hoverSuggestion.confidence * 100)}%</span>
+          </div>
+          <p><strong>{copy.reason}</strong>{hoverSuggestion.reason}</p>
+          {hoverSuggestion.evidence ? <p><strong>{copy.evidence}</strong>{hoverSuggestion.evidence}</p> : null}
+          <div className="asr-hover-actions">
+            <button type="button" onClick={() => acceptHoveredSuggestion(hoverSuggestion.id)}>
+              <Check size={13} />
+              {copy.acceptChange}
+            </button>
+            <button type="button" onClick={() => rejectHoveredSuggestion(hoverSuggestion.id)}>
+              <X size={13} />
+              {copy.rejectChange}
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function HighlightedSuggestionText({
+  text,
+  highlight,
+  variant,
+  tooltip,
+  suggestionId,
+  onMarkerEnter,
+  onMarkerLeave,
+}: {
+  text: string;
+  highlight: string;
+  variant: "original" | "corrected";
+  tooltip?: string;
+  suggestionId?: string;
+  onMarkerEnter?: (suggestionId: string, event: ReactMouseEvent<HTMLElement>) => void;
+  onMarkerLeave?: () => void;
+}) {
+  const index = highlight ? text.indexOf(highlight) : -1;
+  if (index < 0) {
+    return <span className="asr-diff-text">{text}</span>;
+  }
+  return (
+    <span className="asr-diff-text">
+      {text.slice(0, index)}
+      <mark
+        className={`asr-highlight ${variant}`}
+        data-tooltip={tooltip}
+        onMouseEnter={(event) => {
+          if (suggestionId) onMarkerEnter?.(suggestionId, event);
+        }}
+        onMouseLeave={onMarkerLeave}
+      >
+        {highlight}
+      </mark>
+      {text.slice(index + highlight.length)}
+    </span>
+  );
+}
+
+function AsrSourceEditor({
+  refObject,
+  value,
+  highlights,
+  activeSuggestionId,
+  suggestionById,
+  copy,
+  onChange,
+  onScroll,
+  onMarkerEnter,
+  onMarkerLeave,
+}: {
+  refObject: MutableRefObject<HTMLTextAreaElement | null>;
+  value: string;
+  highlights: AsrEditorHighlightRange[];
+  activeSuggestionId?: string;
+  suggestionById?: Map<string, AsrCorrectionSuggestion>;
+  copy?: (typeof COPY)[UiLanguage];
+  onChange: (value: string) => void;
+  onScroll?: (scroll: { left: number; top: number }) => void;
+  onMarkerEnter?: (suggestionId: string, event: ReactMouseEvent<HTMLElement>) => void;
+  onMarkerLeave?: () => void;
+}) {
+  const [scroll, setScroll] = useState({ left: 0, top: 0 });
+  const renderOptions = {
+    activeSuggestionId,
+    suggestionById,
+    copy,
+    onMarkerEnter,
+    onMarkerLeave,
+    onMarkerMouseDown: (range: AsrEditorHighlightRange, event: ReactMouseEvent<HTMLElement>) => {
+      event.preventDefault();
+      refObject.current?.focus();
+      refObject.current?.setSelectionRange(range.start, range.end);
+    },
+  };
+  return (
+    <div className="asr-editor-shell">
+      <div className="asr-editor-backdrop" aria-hidden="true">
+        <pre style={{ transform: `translate(${-scroll.left}px, ${-scroll.top}px)` }}>
+          {renderAsrEditorText(value, highlights, renderOptions)}
+        </pre>
+      </div>
+      <textarea
+        ref={refObject}
+        className="asr-editor"
+        value={value}
+        spellCheck={false}
+        onChange={(event) => onChange(event.target.value)}
+        onScroll={(event) => {
+          const nextScroll = {
+            left: event.currentTarget.scrollLeft,
+            top: event.currentTarget.scrollTop,
+          };
+          setScroll(nextScroll);
+          onScroll?.(nextScroll);
+        }}
+      />
+      {onMarkerEnter ? (
+        <div className="asr-editor-hover-layer" aria-hidden="true">
+          <pre style={{ transform: `translate(${-scroll.left}px, ${-scroll.top}px)` }}>
+            {renderAsrEditorText(value, highlights, renderOptions)}
+          </pre>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function renderAsrEditorText(
+  value: string,
+  highlights: AsrEditorHighlightRange[],
+  options: {
+    activeSuggestionId?: string;
+    suggestionById?: Map<string, AsrCorrectionSuggestion>;
+    copy?: (typeof COPY)[UiLanguage];
+    onMarkerEnter?: (suggestionId: string, event: ReactMouseEvent<HTMLElement>) => void;
+    onMarkerLeave?: () => void;
+    onMarkerMouseDown?: (range: AsrEditorHighlightRange, event: ReactMouseEvent<HTMLElement>) => void;
+  } = {},
+): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  for (const range of highlights) {
+    if (range.start < cursor) continue;
+    if (range.start > cursor) {
+      nodes.push(value.slice(cursor, range.start));
+    }
+    const suggestion = options.suggestionById?.get(range.id);
+    const tooltip = suggestion && options.copy ? asrSuggestionTitle(suggestion, options.copy) : undefined;
+    nodes.push(
+      <mark
+        className={`asr-editor-mark ${range.variant} ${range.status} ${
+          range.id === options.activeSuggestionId ? "active" : ""
+        }`}
+        data-tooltip={tooltip}
+        data-asr-marker-id={range.id}
+        data-asr-marker-variant={range.variant}
+        key={`${range.id}-${range.start}`}
+        onMouseEnter={(event) => options.onMarkerEnter?.(range.id, event)}
+        onMouseLeave={options.onMarkerLeave}
+        onMouseDown={(event) => options.onMarkerMouseDown?.(range, event)}
+      >
+        {value.slice(range.start, range.end)}
+      </mark>,
+    );
+    cursor = range.end;
+  }
+  nodes.push(value.slice(cursor) || " ");
+  return nodes;
+}
+
+function asrSuggestionTitle(suggestion: AsrCorrectionSuggestion, copy: (typeof COPY)[UiLanguage]): string {
+  const lines = [`${copy.reason}: ${suggestion.reason || ""}`];
+  if (suggestion.evidence) {
+    lines.push(`${copy.evidence}: ${suggestion.evidence}`);
+  }
+  return lines.join("\n");
+}
+
+function findAsrEditorMarker(
+  scope: "source" | "preview",
+  suggestionId: string,
+  variant: "original" | "corrected",
+): HTMLElement | null {
+  const escapedId = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(suggestionId) : suggestionId;
+  return document.querySelector<HTMLElement>(
+    `.asr-transcript-pane.${scope} .asr-editor-backdrop [data-asr-marker-id="${escapedId}"][data-asr-marker-variant="${variant}"]`,
+  );
+}
+
 function draftFromModelSettings(settings: ModelSettings, preferredActiveProfileId?: string): SettingsDraft {
   const profiles =
     settings.profiles.length > 0
@@ -1882,7 +3286,7 @@ function draftFromModelSettings(settings: ModelSettings, preferredActiveProfileI
           ...profile,
           context_window: formatNullableNumberInput(profile.context_window),
           max_tokens: formatNullableNumberInput(profile.max_tokens),
-          api_key: "",
+          api_key: maskedSecretValue(profile.api_key_preview),
         }))
       : [
           {
@@ -1909,6 +3313,7 @@ function draftFromModelSettings(settings: ModelSettings, preferredActiveProfileI
     translation_model_id: settings.translation_model_id || firstId,
     learning_model_id: settings.learning_model_id || firstId,
     global_model_id: settings.global_model_id || firstId,
+    asr_model_id: settings.asr_model_id || firstId,
     study_detail_level: "faithful",
     task_parameters: taskParametersToDraft(settings.task_parameters),
   };
@@ -1923,7 +3328,7 @@ function modelProfileDraftToInput(profile: ModelProfileDraft): ModelProfileInput
     model: profile.model,
     context_window: parsePositiveIntegerInput(profile.context_window),
     max_tokens: parsePositiveIntegerInput(profile.max_tokens),
-    api_key: profile.api_key || undefined,
+    api_key: secretInputValue(profile.api_key, profile.api_key_preview),
   };
 }
 
@@ -1945,6 +3350,7 @@ function modelSettingsToInput(settings: ModelSettings): ModelSettingsInput {
     translation_model_id: settings.translation_model_id,
     learning_model_id: settings.learning_model_id,
     global_model_id: settings.global_model_id,
+    asr_model_id: settings.asr_model_id,
     study_detail_level: "faithful",
     task_parameters: settings.task_parameters,
   };
@@ -1997,6 +3403,7 @@ function taskParameterLabel(key: TaskParameterKey, copy: (typeof COPY)[UiLanguag
   return {
     title_translation: copy.titleTranslationTask,
     subtitle_translation: copy.subtitleTranslationTask,
+    asr_correction: copy.asrCorrectionTask,
     semantic_segmentation: copy.semanticSegmentationTask,
     guide: copy.guideTask,
     outline: copy.outlineTask,
@@ -2006,6 +3413,7 @@ function taskParameterLabel(key: TaskParameterKey, copy: (typeof COPY)[UiLanguag
 }
 
 function SettingsModal({
+  scope = "workspace",
   copy,
   draft,
   modelSettings,
@@ -2019,6 +3427,7 @@ function SettingsModal({
   onRoleChange,
   onSave,
 }: {
+  scope?: "workspace" | "asr";
   copy: (typeof COPY)[UiLanguage];
   draft: SettingsDraft;
   modelSettings: ModelSettings | null;
@@ -2032,6 +3441,7 @@ function SettingsModal({
   onRoleChange: (role: ModelRoleKey, profileId: string) => void;
   onSave: () => void;
 }) {
+  const isAsrScope = scope === "asr";
   const selectedProfile = draft.profiles.find((profile) => profile.id === draft.active_profile_id) ?? draft.profiles[0];
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   const [modelsBusy, setModelsBusy] = useState(false);
@@ -2108,7 +3518,7 @@ function SettingsModal({
       const payload = await listAvailableModels({
         provider_type: selectedProfile.provider_type ?? "openai",
         base_url: selectedProfile.base_url,
-        api_key: selectedProfile.api_key || undefined,
+        api_key: secretInputValue(selectedProfile.api_key, selectedProfile.api_key_preview),
         profile_id: selectedProfile.id,
       });
       setModelOptions(payload.models);
@@ -2123,13 +3533,14 @@ function SettingsModal({
   const configuredCount = modelSettings?.profiles.filter((profile) => profile.has_api_key).length ?? 0;
   const baseUrlPlaceholder =
     selectedProfile?.provider_type === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1";
+  const taskParameterKeys: TaskParameterKey[] = isAsrScope ? ["asr_correction"] : TASK_PARAMETER_KEYS;
 
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <div className="modal-head">
           <div>
-            <h2 id="settings-title">{copy.modelSettingsTitle}</h2>
+            <h2 id="settings-title">{isAsrScope ? copy.asrModelSettingsTitle : copy.modelSettingsTitle}</h2>
             <p>
               {configuredCount ? `${copy.modelConfigured} · ${configuredCount}` : copy.modelNotConfigured}
               {selectedProfile?.api_key_preview ? ` · ${selectedProfile.api_key_preview}` : ""}
@@ -2139,49 +3550,51 @@ function SettingsModal({
             <X size={18} />
           </button>
         </div>
-        <div className="settings-grid">
-          <label className="settings-field">
-            <span>{copy.translationModel}</span>
-            <select
-              value={roleValue("translation_model_id")}
-              disabled={roleBusy || !roleProfiles.length}
-              onChange={(event) => setRole("translation_model_id", event.target.value)}
-            >
-              {roleProfileOptions}
-            </select>
-            <small>{copy.translationModelHelp}</small>
-          </label>
-          <label className="settings-field">
-            <span>{copy.learningModel}</span>
-            <select
-              value={roleValue("learning_model_id")}
-              disabled={roleBusy || !roleProfiles.length}
-              onChange={(event) => setRole("learning_model_id", event.target.value)}
-            >
-              {roleProfileOptions}
-            </select>
-            <small>{copy.learningModelHelp}</small>
-          </label>
-          <label className="settings-field">
-            <span>{copy.globalModel}</span>
-            <select
-              value={roleValue("global_model_id")}
-              disabled={roleBusy || !roleProfiles.length}
-              onChange={(event) => setRole("global_model_id", event.target.value)}
-            >
-              {roleProfileOptions}
-            </select>
-            <small>{copy.globalModelHelp}</small>
-          </label>
-        </div>
-        {roleMessage ? (
+        {!isAsrScope ? (
+          <div className="settings-grid">
+            <label className="settings-field">
+              <span>{copy.translationModel}</span>
+              <select
+                value={roleValue("translation_model_id")}
+                disabled={roleBusy || !roleProfiles.length}
+                onChange={(event) => setRole("translation_model_id", event.target.value)}
+              >
+                {roleProfileOptions}
+              </select>
+              <small>{copy.translationModelHelp}</small>
+            </label>
+            <label className="settings-field">
+              <span>{copy.learningModel}</span>
+              <select
+                value={roleValue("learning_model_id")}
+                disabled={roleBusy || !roleProfiles.length}
+                onChange={(event) => setRole("learning_model_id", event.target.value)}
+              >
+                {roleProfileOptions}
+              </select>
+              <small>{copy.learningModelHelp}</small>
+            </label>
+            <label className="settings-field">
+              <span>{copy.globalModel}</span>
+              <select
+                value={roleValue("global_model_id")}
+                disabled={roleBusy || !roleProfiles.length}
+                onChange={(event) => setRole("global_model_id", event.target.value)}
+              >
+                {roleProfileOptions}
+              </select>
+              <small>{copy.globalModelHelp}</small>
+            </label>
+          </div>
+        ) : null}
+        {!isAsrScope && roleMessage ? (
           <div className="settings-role-status" aria-live="polite">
             {roleBusy ? <Loader2 className="spin" size={13} /> : null}
             <span>{roleMessage}</span>
           </div>
         ) : null}
         <div className="settings-subhead">
-          <span>{copy.modelProfileLibrary}</span>
+          <span>{isAsrScope ? copy.asrModelProfileLibrary : copy.modelProfileLibrary}</span>
           <button type="button" className="secondary-action" onClick={onAddProfile}>
             {copy.addModelProfile}
           </button>
@@ -2291,7 +3704,7 @@ function SettingsModal({
                   <span>Temperature</span>
                   <span>{copy.taskMaxTokens}</span>
                 </div>
-                {TASK_PARAMETER_KEYS.map((key) => {
+                {taskParameterKeys.map((key) => {
                   const label = taskParameterLabel(key, copy);
                   return (
                     <div className="task-parameter-row" key={key}>
@@ -2318,17 +3731,17 @@ function SettingsModal({
         <label className="settings-field">
           <span>{copy.modelApiKey}</span>
           <input
-            type="password"
+            autoComplete="off"
             value={selectedProfile?.api_key ?? ""}
             onChange={(event) => updateSelectedProfile({ api_key: event.target.value })}
-            placeholder={copy.modelApiKeyHint}
+            placeholder={selectedProfile?.api_key_preview ? copy.modelApiKeyHint : copy.apiKeyOptionalHint}
           />
         </label>
         <div className="modal-actions">
           {message ? <span>{message}</span> : null}
           <button onClick={onSave} disabled={busy}>
             {busy ? <Loader2 className="spin" size={15} /> : null}
-            {copy.saveSettings}
+            {isAsrScope ? copy.saveAsrSettings : copy.saveSettings}
           </button>
         </div>
       </section>
@@ -3265,6 +4678,68 @@ function displayTimeToSeconds(value: string): number {
   return parts[0] * 60 + parts[1];
 }
 
+function maskedSecretValue(preview: string | null | undefined): string {
+  return preview ?? "";
+}
+
+function secretInputValue(value: string, preview: string | null | undefined): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return preview && trimmed === preview.trim() ? undefined : trimmed;
+}
+
+function searchDraftToConfig(draft: AsrSearchDraft): AsrCorrectionSearchConfig {
+  const apiKey = secretInputValue(draft.api_key, draft.api_key_preview);
+  return {
+    enabled: draft.enabled,
+    provider: draft.provider,
+    api_key: apiKey,
+    base_url: draft.base_url.trim() || undefined,
+    result_limit: parsePositiveIntegerInput(draft.result_limit) ?? 5,
+  };
+}
+
+function settingsToSearchDraft(settings: AsrSearchSettings): AsrSearchDraft {
+  const service = settings[settings.provider];
+  return {
+    enabled: settings.enabled,
+    provider: settings.provider,
+    api_key: maskedSecretValue(service.api_key_preview),
+    api_key_preview: service.api_key_preview,
+    base_url: settings.provider === "firecrawl" ? settings.firecrawl.base_url ?? "" : "",
+    result_limit: String(settings.result_limit || 5),
+  };
+}
+
+function searchDraftToSettingsInput(draft: AsrSearchDraft): AsrSearchSettingsInput {
+  const resultLimit = parsePositiveIntegerInput(draft.result_limit) ?? 5;
+  const apiKey = secretInputValue(draft.api_key, draft.api_key_preview);
+  const input: AsrSearchSettingsInput = {
+    enabled: draft.enabled,
+    provider: draft.provider,
+    result_limit: resultLimit,
+  };
+  if (draft.provider === "firecrawl") {
+    input.firecrawl = {
+      base_url: draft.base_url.trim() || null,
+      ...(apiKey ? { api_key: apiKey } : {}),
+    };
+  } else if (apiKey) {
+    input.tavily = { api_key: apiKey };
+  }
+  return input;
+}
+
+function suggestionCounts(suggestions: AsrCorrectionSuggestion[]): Record<"pending" | "accepted" | "rejected", number> {
+  return suggestions.reduce(
+    (counts, suggestion) => {
+      counts[suggestion.status] += 1;
+      return counts;
+    },
+    { pending: 0, accepted: 0, rejected: 0 },
+  );
+}
+
 function isPreviewItem(item: CourseItem): boolean {
   return item.id.startsWith("preview-");
 }
@@ -3411,6 +4886,35 @@ function loadBooleanPreference(key: string, fallback: boolean): boolean {
     return fallback;
   }
   return fallback;
+}
+
+function saveBooleanPreference(key: string, value: boolean) {
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    // Local storage is optional; the in-memory state already changed.
+  }
+}
+
+function initialSelectedCourse(items: CourseItem[]): CourseItem | null {
+  const selectedId = loadSelectedCourseId();
+  return (selectedId ? items.find((item) => item.id === selectedId) : null) ?? items[0] ?? null;
+}
+
+function loadSelectedCourseId(): string | null {
+  try {
+    return window.localStorage.getItem(SELECTED_COURSE_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function saveSelectedCourseId(itemId: string) {
+  try {
+    window.localStorage.setItem(SELECTED_COURSE_STORAGE_KEY, itemId);
+  } catch {
+    // Remembering the last selected course is a convenience only.
+  }
 }
 
 function mergeStringKeys(keys: string[]): string[] {
@@ -3627,6 +5131,48 @@ function errorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function asrProgressInfo(status: StudyJobStatus, copy: (typeof COPY)[UiLanguage]) {
+  const now = Date.now();
+  const startedAt = status.started_at ? Date.parse(status.started_at) : Number.NaN;
+  const updatedAt = status.updated_at ? Date.parse(status.updated_at) : Number.NaN;
+  const elapsedMs = Number.isFinite(startedAt) ? Math.max(0, now - startedAt) : 0;
+  const staleMs = Number.isFinite(updatedAt) ? Math.max(0, now - updatedAt) : 0;
+  return {
+    phaseLabel: asrPhaseLabel(status.phase, copy),
+    elapsed: formatShortDuration(elapsedMs),
+    lastUpdate: Number.isFinite(updatedAt) ? formatShortDuration(staleMs) : "-",
+    stale: status.status === "running" && staleMs > 30000,
+  };
+}
+
+function asrPhaseLabel(phase: string, copy: (typeof COPY)[UiLanguage]): string {
+  return {
+    queued: copy.asrPhaseQueued,
+    preparing: copy.asrPhasePreparing,
+    candidate: copy.asrPhaseCandidate,
+    search: copy.asrPhaseSearch,
+    review: copy.asrPhaseReview,
+    model_request: copy.asrPhaseModelRequest,
+    model_wait: copy.asrPhaseModelWait,
+    model_parse: copy.asrPhaseModelParse,
+    finalizing: copy.asrPhaseFinalizing,
+    complete: copy.asrPhaseComplete,
+    failed: copy.asrPhaseFailed,
+  }[phase] ?? phase;
+}
+
+function formatShortDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function asrCorrectionErrorMessage(error: unknown, copy: (typeof COPY)[UiLanguage]): string {
+  const message = errorMessage(error, copy.unknownError);
+  return message.trim().toLowerCase() === "not found" ? copy.asrCorrectionApiUnavailable : message;
+}
+
 function extractionErrorMessage(
   error: unknown,
   mode: ExtractMode,
@@ -3719,6 +5265,12 @@ function getOutlineMaxDepth(nodes: OutlineNode[]): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function normalizedConfidenceThreshold(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 95;
+  return clamp(parsed, 0, 100);
 }
 
 function playerHeightMinimum(placement: CaptionPlacement): number {

@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from .ai import LlmProvider, LlmProviderSet
-from .models import ModelProviderType, StudyDetailLevel, TaskParameterKey, TaskParameterOverride
+from .models import AsrSearchProvider, ModelProviderType, StudyDetailLevel, TaskParameterKey, TaskParameterOverride
 
 
 class ModelProfileConfig(BaseModel):
@@ -23,6 +23,24 @@ class ModelProfileConfig(BaseModel):
     api_key: str | None = None
 
 
+class AsrSearchServiceConfig(BaseModel):
+    base_url: str | None = None
+    api_key: str | None = None
+
+
+class AsrSearchSettings(BaseModel):
+    enabled: bool = False
+    provider: AsrSearchProvider = "tavily"
+    result_limit: int = Field(default=5, ge=1, le=10)
+    tavily: AsrSearchServiceConfig = Field(
+        default_factory=lambda: AsrSearchServiceConfig(base_url="https://api.tavily.com")
+    )
+    firecrawl: AsrSearchServiceConfig = Field(default_factory=AsrSearchServiceConfig)
+
+    def service_for(self, provider: AsrSearchProvider) -> AsrSearchServiceConfig:
+        return self.firecrawl if provider == "firecrawl" else self.tavily
+
+
 class Settings(BaseModel):
     data_dir: Path = Path(".course-navigator")
     llm_base_url: str | None = None
@@ -32,6 +50,8 @@ class Settings(BaseModel):
     translation_model_id: str = "default"
     learning_model_id: str = "default"
     global_model_id: str = "default"
+    asr_model_id: str = "default"
+    asr_search: AsrSearchSettings = Field(default_factory=AsrSearchSettings)
     study_detail_level: StudyDetailLevel = "faithful"
     task_parameters: dict[TaskParameterKey, TaskParameterOverride] = Field(default_factory=dict)
 
@@ -102,6 +122,8 @@ def load_settings() -> Settings:
         translation_model_id=os.getenv("COURSE_NAVIGATOR_TRANSLATION_MODEL_ID", "default"),
         learning_model_id=os.getenv("COURSE_NAVIGATOR_LEARNING_MODEL_ID", "default"),
         global_model_id=os.getenv("COURSE_NAVIGATOR_GLOBAL_MODEL_ID", "default"),
+        asr_model_id=os.getenv("COURSE_NAVIGATOR_ASR_MODEL_ID", "default"),
+        asr_search=_load_asr_search_settings(),
         study_detail_level=os.getenv("COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL", "faithful"),  # type: ignore[arg-type]
         task_parameters=_load_task_parameters(os.getenv("COURSE_NAVIGATOR_TASK_PARAMETERS")),
     )
@@ -146,6 +168,43 @@ def _load_task_parameters(raw: str | None) -> dict[TaskParameterKey, TaskParamet
         except ValueError:
             continue
     return parameters
+
+
+def _load_asr_search_settings() -> AsrSearchSettings:
+    provider = os.getenv("COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER", "tavily")
+    if provider not in get_args(AsrSearchProvider):
+        provider = "tavily"
+    return AsrSearchSettings(
+        enabled=_env_bool("COURSE_NAVIGATOR_ASR_SEARCH_ENABLED", False),
+        provider=provider,  # type: ignore[arg-type]
+        result_limit=_env_int("COURSE_NAVIGATOR_ASR_SEARCH_RESULT_LIMIT", 5, minimum=1, maximum=10),
+        tavily=AsrSearchServiceConfig(
+            base_url=os.getenv("COURSE_NAVIGATOR_TAVILY_BASE_URL") or "https://api.tavily.com",
+            api_key=os.getenv("COURSE_NAVIGATOR_TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY"),
+        ),
+        firecrawl=AsrSearchServiceConfig(
+            base_url=os.getenv("COURSE_NAVIGATOR_FIRECRAWL_BASE_URL") or os.getenv("FIRECRAWL_API_URL"),
+            api_key=os.getenv("COURSE_NAVIGATOR_FIRECRAWL_API_KEY") or os.getenv("FIRECRAWL_API_KEY"),
+        ),
+    )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return min(max(value, minimum), maximum)
 
 
 def _profile_name_from_model(model: str) -> str:

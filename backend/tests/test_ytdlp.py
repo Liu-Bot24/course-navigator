@@ -77,6 +77,10 @@ def test_fetch_metadata_parses_ytdlp_json(monkeypatch):
                 "id": "abc123",
                 "title": "A Lesson",
                 "duration": 125,
+                "uploader": "Lesson Uploader",
+                "channel": "Lesson Channel",
+                "creator": "Lesson Creator",
+                "description": "Lesson summary with trusted course terms.",
                 "playlist_title": "A Course",
                 "playlist_index": 3,
                 "webpage_url": "https://example.com/watch",
@@ -106,6 +110,10 @@ def test_fetch_metadata_parses_ytdlp_json(monkeypatch):
     assert "--cookies-from-browser" in calls[0]
     assert metadata.id == "abc123"
     assert metadata.title == "A Lesson"
+    assert metadata.uploader == "Lesson Uploader"
+    assert metadata.channel == "Lesson Channel"
+    assert metadata.creator == "Lesson Creator"
+    assert metadata.description == "Lesson summary with trusted course terms."
     assert metadata.playlist_title == "A Course"
     assert metadata.playlist_index == 3
     assert metadata.language == "en"
@@ -161,6 +169,18 @@ def test_choose_source_subtitle_language_matches_language_family():
 
 def test_choose_source_subtitle_language_skips_danmaku():
     metadata = make_metadata(language="zh", subtitles=["danmaku", "ai-zh"], automatic_captions=[])
+
+    assert choose_source_subtitle_language(metadata) == "ai-zh"
+
+
+def test_choose_source_subtitle_language_prefers_chinese_for_bilibili_without_metadata_language():
+    metadata = make_metadata(
+        language=None,
+        subtitles=["ai-ar", "ai-en", "ai-es", "ai-ja", "ai-pt", "ai-zh", "danmaku"],
+        automatic_captions=[],
+        title="【毕导】光一直在欺骗你",
+        extractor="BiliBili",
+    )
 
     assert choose_source_subtitle_language(metadata) == "ai-zh"
 
@@ -274,6 +294,41 @@ def test_extract_subtitles_uses_auto_source_language(monkeypatch, tmp_path):
     assert segments[0].text == "こんにちは"
 
 
+def test_extract_subtitles_clears_stale_subtitle_files(monkeypatch, tmp_path):
+    Path(tmp_path, "abc.ai-ar.vtt").write_text(
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nمرحبا\n",
+        encoding="utf-8",
+    )
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        Path(tmp_path, "abc.ai-zh.vtt").write_text(
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n你好\n",
+            encoding="utf-8",
+        )
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = ExtractRequest(url="https://www.bilibili.com/video/BVabc/")
+    metadata = make_metadata(
+        language=None,
+        subtitles=["ai-ar", "ai-zh", "danmaku"],
+        automatic_captions=[],
+        title="中文视频",
+        extractor="BiliBili",
+    )
+
+    segments = runner.extract_subtitles(request, tmp_path, metadata)
+
+    assert segments[0].text == "你好"
+    assert not Path(tmp_path, "abc.ai-ar.vtt").exists()
+
+
 def test_extract_subtitles_falls_back_to_hls_manifest_tracks(monkeypatch, tmp_path):
     class Result:
         returncode = 0
@@ -356,13 +411,19 @@ def test_find_newest_subtitle_handles_removed_directory(tmp_path):
     assert ytdlp_module._find_newest_subtitle(tmp_path / "removed") is None
 
 
-def make_metadata(language: str, subtitles: list[str], automatic_captions: list[str]) -> VideoMetadata:
+def make_metadata(
+    language: str | None,
+    subtitles: list[str],
+    automatic_captions: list[str],
+    title: str = "A Lesson",
+    extractor: str = "youtube",
+) -> VideoMetadata:
     return VideoMetadata(
         id="abc123",
-        title="A Lesson",
+        title=title,
         duration=125,
         webpage_url="https://example.com/watch",
-        extractor="youtube",
+        extractor=extractor,
         language=language,
         subtitles=subtitles,
         automatic_captions=automatic_captions,

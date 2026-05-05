@@ -36,14 +36,18 @@ vi.mock("./api", () => ({
     translation_model_id: "default",
     learning_model_id: "default",
     global_model_id: "default",
+    asr_model_id: "default",
     study_detail_level: "faithful",
     task_parameters: {},
   }),
   getStudyJob: vi.fn(),
+  getAsrCorrectionResult: vi.fn(),
   itemVideoPath: (itemId: string) => `/api/items/${itemId}/video`,
   listAvailableModels: vi.fn(),
   listItems: vi.fn().mockResolvedValue([]),
   saveModelSettings: vi.fn(),
+  saveTranscript: vi.fn(),
+  startAsrCorrectionJob: vi.fn(),
   startDownloadJob: vi.fn(),
   startStudyJob: vi.fn(),
   startTranslationJob: vi.fn(),
@@ -57,6 +61,8 @@ describe("App language defaults", () => {
     window.localStorage.removeItem("course-navigator-manual-collections");
     window.localStorage.removeItem("course-navigator-collapsed-collections");
     window.localStorage.removeItem("course-navigator-time-map-auto-open");
+    window.localStorage.removeItem("course-navigator-last-selected-course");
+    window.localStorage.removeItem("course-navigator-asr-save-accepted-changes");
   });
 
   it("uses Chinese UI and a language menu by default", async () => {
@@ -447,6 +453,7 @@ describe("App language defaults", () => {
       translation_model_id: "default",
       learning_model_id: "default",
       global_model_id: "mimo",
+      asr_model_id: "default",
       study_detail_level: "faithful" as const,
       task_parameters: {},
     };
@@ -537,6 +544,7 @@ describe("App language defaults", () => {
       translation_model_id: "default",
       learning_model_id: "default",
       global_model_id: "default",
+      asr_model_id: "default",
       study_detail_level: "faithful",
       task_parameters: {
         title_translation: { temperature: 0.3, max_tokens: 512 },
@@ -774,6 +782,32 @@ describe("App language defaults", () => {
     fireEvent.click(screen.getByRole("button", { name: "展开时间地图" }));
     expect(window.localStorage.getItem("course-navigator-time-map-auto-open")).toBe("true");
     expect(await screen.findByText("Second map")).toBeTruthy();
+  });
+
+  it("restores the last selected course after reloading the workspace", async () => {
+    const first = {
+      id: "deeplearning-default",
+      source_url: "https://learn.deeplearning.ai/courses/example",
+      title: "DeepLearning default lesson",
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    const second = {
+      ...first,
+      id: "last-edited-video",
+      source_url: "https://example.com/last",
+      title: "Last edited video",
+    };
+    window.localStorage.setItem("course-navigator-last-selected-course", "last-edited-video");
+    vi.mocked(listItems).mockResolvedValueOnce([first, second]);
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Last edited video" })).toBeTruthy();
   });
 });
 

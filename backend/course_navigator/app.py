@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -18,11 +19,20 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .ai import _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
-from .config import ModelProfileConfig, Settings, load_settings
+from .asr import suggest_asr_corrections
+from .config import AsrSearchServiceConfig, AsrSearchSettings, ModelProfileConfig, Settings, load_settings
 from .library import CourseLibrary
 from .models import (
     CourseItem,
     CourseItemUpdate,
+    AsrCorrectionRequest,
+    AsrCorrectionResult,
+    AsrCorrectionSearchConfig,
+    AsrCorrectionSuggestion,
+    AsrSearchProvider,
+    AsrSearchServiceSettingsResponse,
+    AsrSearchSettingsResponse,
+    AsrSearchSettingsUpdate,
     DownloadRequest,
     DownloadResponse,
     ExtractRequest,
@@ -35,8 +45,11 @@ from .models import (
     StudyMaterial,
     StudyRequest,
     TranscriptSegment,
+    TranscriptUpdateRequest,
 )
 from .ytdlp import YtDlpError, YtDlpRunner, is_subtitle_unavailable_error
+
+logger = logging.getLogger("course_navigator.app")
 
 
 def create_app(
@@ -51,7 +64,9 @@ def create_app(
     library = CourseLibrary(active_data_dir)
     ytdlp_runner = runner or YtDlpRunner()
     jobs: dict[str, StudyJobStatus] = {}
+    asr_results: dict[str, AsrCorrectionResult] = {}
     jobs_lock = Lock()
+    asr_results_lock = Lock()
     deleted_items: set[str] = set()
     deleted_items_lock = Lock()
     study_executor = ThreadPoolExecutor(max_workers=2)
@@ -216,6 +231,23 @@ def create_app(
         library.save(item)
         return _normalize_item_for_response(item)
 
+    @app.put("/api/items/{item_id}/transcript")
+    def update_transcript(item_id: str, request: TranscriptUpdateRequest) -> CourseItem:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        transcript = _validated_transcript(request.transcript)
+        item.transcript = transcript
+        if item.study:
+            item.study = item.study.model_copy(
+                update={
+                    "translated_transcript": [],
+                    "context_summary": None,
+                }
+            )
+        library.save(item)
+        return _normalize_item_for_response(item)
+
     @app.delete("/api/items/{item_id}")
     def delete_item(item_id: str) -> dict[str, bool]:
         item = library.get(item_id)
@@ -277,6 +309,7 @@ def create_app(
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
         job_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
         job = StudyJobStatus(
             job_id=job_id,
             item_id=item_id,
@@ -284,6 +317,8 @@ def create_app(
             progress=0,
             phase="queued",
             message="已加入后台生成队列",
+            started_at=now,
+            updated_at=now,
         )
         with jobs_lock:
             jobs[job_id] = job
@@ -300,6 +335,7 @@ def create_app(
         if not item.transcript:
             raise HTTPException(status_code=400, detail="请先提取字幕，再翻译字幕")
         job_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
         job = StudyJobStatus(
             job_id=job_id,
             item_id=item_id,
@@ -307,6 +343,8 @@ def create_app(
             progress=0,
             phase="queued",
             message="已加入字幕翻译队列",
+            started_at=now,
+            updated_at=now,
         )
         with jobs_lock:
             jobs[job_id] = job
@@ -320,6 +358,7 @@ def create_app(
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
         job_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
         job = StudyJobStatus(
             job_id=job_id,
             item_id=item_id,
@@ -327,10 +366,45 @@ def create_app(
             progress=0,
             phase="queued",
             message="已加入视频缓存队列",
+            started_at=now,
+            updated_at=now,
         )
         with jobs_lock:
             jobs[job_id] = job
         download_executor.submit(_run_download_job, job_id, item_id, request)
+        return job
+
+    @app.post("/api/items/{item_id}/asr-correction-jobs")
+    def create_asr_correction_job(item_id: str, request: AsrCorrectionRequest | None = None) -> StudyJobStatus:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        active_request = request or AsrCorrectionRequest()
+        transcript = active_request.transcript or item.transcript
+        if not transcript:
+            raise HTTPException(status_code=400, detail="请先提取字幕，再校正 ASR")
+        model_id = (active_request.model_id or settings_state["value"].asr_model_id).strip()
+        provider = settings_state["value"].provider_for(model_id)
+        if not provider:
+            raise HTTPException(status_code=400, detail="请先为 ASR 校正配置可用模型")
+        active_request.search = _effective_asr_search_config(active_request.search, settings_state["value"])
+        job_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        job = StudyJobStatus(
+            job_id=job_id,
+            item_id=item_id,
+            status="queued",
+            progress=0,
+            phase="queued",
+            message="已加入 ASR 校正队列",
+            started_at=now,
+            updated_at=now,
+        )
+        with jobs_lock:
+            jobs[job_id] = job
+        with asr_results_lock:
+            asr_results.pop(job_id, None)
+        study_executor.submit(_run_asr_correction_job, job_id, item_id, _validated_transcript(transcript), model_id, active_request)
         return job
 
     @app.get("/api/jobs/{job_id}")
@@ -341,9 +415,31 @@ def create_app(
             raise HTTPException(status_code=404, detail="Study job not found")
         return job
 
+    @app.get("/api/asr-correction-jobs/{job_id}/result")
+    def get_asr_correction_result(job_id: str) -> AsrCorrectionResult:
+        with asr_results_lock:
+            result = asr_results.get(job_id)
+        if not result:
+            raise HTTPException(status_code=404, detail="ASR correction result not found")
+        return result
+
     @app.get("/api/settings/model")
     def get_model_settings() -> ModelSettingsResponse:
         return _model_settings_response(settings_state["value"])
+
+    @app.get("/api/settings/asr-search")
+    def get_asr_search_settings() -> AsrSearchSettingsResponse:
+        return _asr_search_settings_response(settings_state["value"])
+
+    @app.put("/api/settings/asr-search")
+    def update_asr_search_settings(request: AsrSearchSettingsUpdate) -> AsrSearchSettingsResponse:
+        current = settings_state["value"]
+        next_search = _updated_asr_search_settings(current.asr_search, request)
+        next_settings = current.model_copy(update={"asr_search": next_search})
+        settings_state["value"] = next_settings
+        if env_path:
+            _write_model_env(env_path, next_settings)
+        return _asr_search_settings_response(next_settings)
 
     @app.put("/api/settings/model")
     def update_model_settings(request: ModelSettingsUpdate) -> ModelSettingsResponse:
@@ -376,7 +472,10 @@ def create_app(
         translation_model_id = request.translation_model_id.strip()
         learning_model_id = request.learning_model_id.strip()
         global_model_id = request.global_model_id.strip()
-        role_ids = {translation_model_id, learning_model_id, global_model_id}
+        asr_model_id = request.asr_model_id.strip()
+        if "asr_model_id" not in request.model_fields_set and asr_model_id not in profile_ids:
+            asr_model_id = global_model_id if global_model_id in profile_ids else profiles[0].id
+        role_ids = {translation_model_id, learning_model_id, global_model_id, asr_model_id}
         if not role_ids <= profile_ids:
             raise HTTPException(status_code=400, detail="Every model slot must reference an existing profile")
         default_profile = next((profile for profile in profiles if profile.id == learning_model_id), profiles[0])
@@ -389,6 +488,7 @@ def create_app(
                 "translation_model_id": translation_model_id,
                 "learning_model_id": learning_model_id,
                 "global_model_id": global_model_id,
+                "asr_model_id": asr_model_id,
                 "study_detail_level": request.study_detail_level,
                 "task_parameters": request.task_parameters,
             }
@@ -470,6 +570,7 @@ def create_app(
             job = jobs.get(job_id)
             if not job:
                 return None
+            updates.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
             next_job = job.model_copy(update=updates)
             jobs[job_id] = next_job
             return next_job
@@ -554,6 +655,7 @@ def create_app(
             item.study = study
             library.save(item)
         except Exception as exc:
+            logger.exception("Study job failed: job_id=%s item_id=%s", job_id, item_id)
             _set_job(
                 job_id,
                 status="failed",
@@ -739,6 +841,76 @@ def create_app(
             message="视频缓存完成",
         )
 
+    def _run_asr_correction_job(
+        job_id: str,
+        item_id: str,
+        transcript: list[TranscriptSegment],
+        model_id: str,
+        request: AsrCorrectionRequest,
+    ) -> None:
+        _set_job(
+            job_id,
+            status="running",
+            progress=1,
+            phase="preparing",
+            message="正在启动 ASR 校正",
+        )
+
+        def update_progress(phase: str, progress: int, message: str) -> None:
+            _set_job(
+                job_id,
+                status="running",
+                progress=max(1, min(99, progress)),
+                phase=phase,
+                message=message,
+            )
+
+        try:
+            item = library.get(item_id)
+            if not item:
+                raise ValueError("Course item not found")
+            provider = settings_state["value"].provider_for(model_id)
+            if not provider:
+                raise ValueError("请先为 ASR 校正配置可用模型")
+            suggestions = suggest_asr_corrections(
+                title=item.title,
+                transcript=transcript,
+                provider=provider,
+                search_config=request.search,
+                context=_asr_context_for_item(item, request.user_context),
+                output_language=request.output_language,
+                progress=update_progress,
+            )
+            update_progress("finalizing", 96, "正在整理校正建议和置信度")
+            normalized = _coerce_asr_suggestions(suggestions, transcript)
+            result = AsrCorrectionResult(
+                job_id=job_id,
+                item_id=item_id,
+                generated_at=datetime.now(timezone.utc).isoformat(),
+                search_enabled=request.search.enabled,
+                search_provider=request.search.provider if request.search.enabled else None,
+                suggestions=normalized,
+            )
+            with asr_results_lock:
+                asr_results[job_id] = result
+        except Exception as exc:
+            _set_job(
+                job_id,
+                status="failed",
+                progress=100,
+                phase="failed",
+                message="ASR 校正失败",
+                error=str(exc),
+            )
+            return
+        _set_job(
+            job_id,
+            status="succeeded",
+            progress=100,
+            phase="complete",
+            message="ASR 校正建议已生成",
+        )
+
     return app
 
 
@@ -757,6 +929,100 @@ def _same_transcript(left: list[TranscriptSegment], right: list[TranscriptSegmen
     )
 
 
+def _validated_transcript(transcript: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    if not transcript:
+        raise HTTPException(status_code=400, detail="字幕不能为空")
+    normalized: list[TranscriptSegment] = []
+    previous_start = -1.0
+    for segment in transcript:
+        text = segment.text.strip()
+        if not text:
+            continue
+        if segment.end < segment.start:
+            raise HTTPException(status_code=400, detail="字幕结束时间不能早于开始时间")
+        if segment.start < previous_start:
+            raise HTTPException(status_code=400, detail="字幕时间轴必须保持递增")
+        normalized.append(TranscriptSegment(start=segment.start, end=segment.end, text=text))
+        previous_start = segment.start
+    if not normalized:
+        raise HTTPException(status_code=400, detail="字幕不能为空")
+    return normalized
+
+
+def _coerce_asr_suggestions(
+    suggestions: list[AsrCorrectionSuggestion] | list[dict[str, object]],
+    transcript: list[TranscriptSegment],
+) -> list[AsrCorrectionSuggestion]:
+    normalized: list[AsrCorrectionSuggestion] = []
+    for index, suggestion in enumerate(suggestions):
+        if isinstance(suggestion, AsrCorrectionSuggestion):
+            normalized.append(suggestion)
+            continue
+        segment_index = int(suggestion.get("segment_index", -1)) if isinstance(suggestion.get("segment_index"), int) else -1
+        if segment_index < 0 or segment_index >= len(transcript):
+            continue
+        segment = transcript[segment_index]
+        original_text = str(suggestion.get("original_text") or "").strip()
+        corrected_text = str(suggestion.get("corrected_text") or "").strip()
+        if not original_text or not corrected_text:
+            continue
+        normalized.append(
+            AsrCorrectionSuggestion(
+                id=str(suggestion.get("id") or f"asr-{segment_index}-{index}"),
+                segment_index=segment_index,
+                start=segment.start,
+                end=segment.end,
+                original_text=original_text,
+                corrected_text=corrected_text,
+                confidence=float(suggestion.get("confidence") or 0),
+                reason=str(suggestion.get("reason") or "模型建议校正此 ASR 片段。"),
+                evidence=str(suggestion.get("evidence") or "").strip() or None,
+                status="pending",
+                source="search" if suggestion.get("source") == "search" else "model",
+            )
+        )
+    return normalized
+
+
+def _asr_context_for_item(item: CourseItem, user_context: str | None = None) -> dict[str, object]:
+    metadata = item.metadata
+    context: dict[str, object] = {
+        "title": item.title,
+        "collection_title": item.collection_title,
+        "source_url": item.source_url,
+        "duration": item.duration,
+        "user_context": user_context.strip() if user_context else None,
+    }
+    if metadata:
+        context.update(
+            {
+                "metadata_title": metadata.title,
+                "uploader": metadata.uploader,
+                "channel": metadata.channel,
+                "creator": metadata.creator,
+                "description": _truncate_for_prompt(metadata.description, 1200),
+                "webpage_url": metadata.webpage_url,
+                "extractor": metadata.extractor,
+                "language": metadata.language,
+                "playlist_title": metadata.playlist_title,
+                "playlist_index": metadata.playlist_index,
+                "duration": metadata.duration or item.duration,
+                "subtitles": metadata.subtitles,
+                "automatic_captions": metadata.automatic_captions,
+            }
+        )
+    return context
+
+
+def _truncate_for_prompt(value: str | None, limit: int) -> str | None:
+    if not value:
+        return None
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}\n...truncated..."
+
+
 def _extract_transcript_with_source(
     runner: YtDlpRunner,
     request: ExtractRequest,
@@ -773,12 +1039,23 @@ def _extract_transcript_with_source(
     except YtDlpError as exc:
         if not is_subtitle_unavailable_error(exc):
             raise
+        if _metadata_has_source_subtitles(metadata):
+            raise YtDlpError("站方字幕存在，但当前访问方式没有下载到字幕；请使用浏览器模式或 cookies 重新提取。") from exc
 
     try:
         transcript = _extract_asr_transcript(runner, request, transcript_dir, item_id)
     except YtDlpError:
         return [], None
     return transcript, "asr" if transcript else None
+
+
+def _metadata_has_source_subtitles(metadata: VideoMetadata | None) -> bool:
+    if not metadata:
+        return False
+    return any(
+        language.strip().lower() not in {"danmaku", "live_chat", "comments", "rechat"}
+        for language in [*metadata.subtitles, *metadata.automatic_captions]
+    )
 
 
 def _extract_asr_transcript(
@@ -1027,8 +1304,79 @@ def _model_settings_response(settings: Settings) -> ModelSettingsResponse:
         translation_model_id=_role_id_or_first(settings.translation_model_id, profiles),
         learning_model_id=_role_id_or_first(settings.learning_model_id, profiles),
         global_model_id=_role_id_or_first(settings.global_model_id, profiles),
+        asr_model_id=_role_id_or_first(settings.asr_model_id, profiles),
         study_detail_level=settings.study_detail_level,
         task_parameters=settings.task_parameters,
+    )
+
+
+def _asr_search_settings_response(settings: Settings) -> AsrSearchSettingsResponse:
+    search = settings.asr_search
+    return AsrSearchSettingsResponse(
+        enabled=search.enabled,
+        provider=search.provider,
+        result_limit=search.result_limit,
+        tavily=_asr_search_service_response(search.tavily),
+        firecrawl=_asr_search_service_response(search.firecrawl),
+    )
+
+
+def _asr_search_service_response(service: AsrSearchServiceConfig) -> AsrSearchServiceSettingsResponse:
+    return AsrSearchServiceSettingsResponse(
+        base_url=service.base_url,
+        has_api_key=bool(service.api_key),
+        api_key_preview=_preview_key(service.api_key),
+    )
+
+
+def _updated_asr_search_settings(current: AsrSearchSettings, request: AsrSearchSettingsUpdate) -> AsrSearchSettings:
+    provider = request.provider if "provider" in request.model_fields_set and request.provider else current.provider
+    result_limit = request.result_limit if "result_limit" in request.model_fields_set and request.result_limit else current.result_limit
+    enabled = request.enabled if "enabled" in request.model_fields_set and request.enabled is not None else current.enabled
+    return current.model_copy(
+        update={
+            "enabled": enabled,
+            "provider": provider,
+            "result_limit": result_limit,
+            "tavily": _updated_asr_search_service(current.tavily, request.tavily),
+            "firecrawl": _updated_asr_search_service(current.firecrawl, request.firecrawl),
+        }
+    )
+
+
+def _updated_asr_search_service(
+    current: AsrSearchServiceConfig,
+    request: object | None,
+) -> AsrSearchServiceConfig:
+    if request is None:
+        return current
+    fields = getattr(request, "model_fields_set", set())
+    base_url = current.base_url
+    api_key = current.api_key
+    if "base_url" in fields:
+        raw_base_url = getattr(request, "base_url", None)
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) and raw_base_url.strip() else None
+    if "api_key" in fields:
+        raw_api_key = getattr(request, "api_key", None)
+        if isinstance(raw_api_key, str) and raw_api_key.strip():
+            api_key = raw_api_key.strip()
+    return current.model_copy(update={"base_url": base_url, "api_key": api_key})
+
+
+def _effective_asr_search_config(
+    request: AsrCorrectionSearchConfig,
+    settings: Settings,
+) -> AsrCorrectionSearchConfig:
+    if not request.enabled:
+        return request
+    provider: AsrSearchProvider = request.provider
+    saved = settings.asr_search.service_for(provider)
+    return request.model_copy(
+        update={
+            "api_key": request.api_key or saved.api_key,
+            "base_url": request.base_url or saved.base_url,
+            "result_limit": request.result_limit or settings.asr_search.result_limit,
+        }
     )
 
 
@@ -1036,8 +1384,8 @@ def _preview_key(api_key: str | None) -> str | None:
     if not api_key:
         return None
     if len(api_key) <= 10:
-        return "已配置"
-    return f"{api_key[:4]}...{api_key[-4:]}"
+        return "*" * len(api_key)
+    return f"{api_key[:4]}{'*' * 8}{api_key[-4:]}"
 
 
 def _write_model_env(path: Path, settings: Settings) -> None:
@@ -1069,6 +1417,14 @@ def _write_model_env(path: Path, settings: Settings) -> None:
         "COURSE_NAVIGATOR_TRANSLATION_MODEL_ID": settings.translation_model_id,
         "COURSE_NAVIGATOR_LEARNING_MODEL_ID": settings.learning_model_id,
         "COURSE_NAVIGATOR_GLOBAL_MODEL_ID": settings.global_model_id,
+        "COURSE_NAVIGATOR_ASR_MODEL_ID": settings.asr_model_id,
+        "COURSE_NAVIGATOR_ASR_SEARCH_ENABLED": "true" if settings.asr_search.enabled else "false",
+        "COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER": settings.asr_search.provider,
+        "COURSE_NAVIGATOR_ASR_SEARCH_RESULT_LIMIT": str(settings.asr_search.result_limit),
+        "COURSE_NAVIGATOR_TAVILY_BASE_URL": settings.asr_search.tavily.base_url or "",
+        "COURSE_NAVIGATOR_TAVILY_API_KEY": settings.asr_search.tavily.api_key or "",
+        "COURSE_NAVIGATOR_FIRECRAWL_BASE_URL": settings.asr_search.firecrawl.base_url or "",
+        "COURSE_NAVIGATOR_FIRECRAWL_API_KEY": settings.asr_search.firecrawl.api_key or "",
         "COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL": settings.study_detail_level,
         "COURSE_NAVIGATOR_TASK_PARAMETERS": json.dumps(task_parameters_payload, ensure_ascii=False),
     }

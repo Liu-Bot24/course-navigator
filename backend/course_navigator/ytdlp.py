@@ -18,6 +18,16 @@ class YtDlpError(RuntimeError):
 
 
 NON_AUXILIARY_SUBTITLE_SELECTOR = "all,-danmaku,-live_chat,-comments,-rechat"
+DEFAULT_SUBTITLE_LANGUAGE_PRIORITY = (
+    "zh-Hans",
+    "zh-CN",
+    "ai-zh",
+    "zh",
+    "zh-Hant",
+    "zh-TW",
+    "en",
+    "ja",
+)
 
 
 def build_auth_args(request: ExtractRequest | DownloadRequest) -> list[str]:
@@ -65,6 +75,10 @@ class YtDlpRunner:
             id=str(payload.get("id") or "unknown"),
             title=str(payload.get("title") or "Untitled"),
             duration=payload.get("duration"),
+            uploader=_safe_str(payload.get("uploader")),
+            channel=_safe_str(payload.get("channel")),
+            creator=_safe_str(payload.get("creator")),
+            description=_safe_str(payload.get("description")),
             playlist_title=_safe_str(payload.get("playlist_title") or payload.get("playlist")),
             playlist_index=_safe_int(payload.get("playlist_index")),
             webpage_url=str(payload.get("webpage_url") or request.url),
@@ -83,6 +97,7 @@ class YtDlpRunner:
         metadata: VideoMetadata | None = None,
     ) -> list[TranscriptSegment]:
         target_dir.mkdir(parents=True, exist_ok=True)
+        _clear_subtitle_files(target_dir)
         output_template = str(target_dir / "%(id)s.%(ext)s")
         subtitle_language = choose_source_subtitle_language(metadata, request.language)
         cmd = [
@@ -233,10 +248,15 @@ def choose_source_subtitle_language(metadata: VideoMetadata | None, requested: s
         if match:
             return match
 
+    if _metadata_looks_chinese(metadata):
+        match = _best_preferred_language(available, ("ai-zh", "zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW"))
+        if match:
+            return match
+
     if subtitles:
-        return subtitles[0]
+        return _best_preferred_language(subtitles, DEFAULT_SUBTITLE_LANGUAGE_PRIORITY) or subtitles[0]
     if automatic_captions:
-        return automatic_captions[0]
+        return _best_preferred_language(automatic_captions, DEFAULT_SUBTITLE_LANGUAGE_PRIORITY) or automatic_captions[0]
     if metadata.subtitles:
         return NON_AUXILIARY_SUBTITLE_SELECTOR
     if metadata.automatic_captions:
@@ -292,6 +312,43 @@ def _download_percent(line: str) -> int | None:
 def _is_auxiliary_subtitle_language(language: str) -> bool:
     normalized = language.strip().lower()
     return normalized in {"danmaku", "live_chat", "comments", "rechat"}
+
+
+def _metadata_looks_chinese(metadata: VideoMetadata) -> bool:
+    if (metadata.extractor or "").lower().startswith("bili"):
+        return True
+    fields = (
+        metadata.title,
+        metadata.uploader or "",
+        metadata.channel or "",
+        metadata.creator or "",
+    )
+    return any(re.search(r"[\u4e00-\u9fff]", field) for field in fields)
+
+
+def _best_preferred_language(available: list[str], priority: tuple[str, ...]) -> str | None:
+    if not available:
+        return None
+    lowered = {language.lower(): language for language in available}
+    for preferred in priority:
+        exact = lowered.get(preferred.lower())
+        if exact:
+            return exact
+    for preferred in priority:
+        preferred_base = preferred.split("-", 1)[0].lower()
+        for candidate in available:
+            normalized = candidate.lower()
+            if normalized == f"ai-{preferred_base}" or normalized.split("-", 1)[0] == preferred_base:
+                return candidate
+    return None
+
+
+def _clear_subtitle_files(target_dir: Path) -> None:
+    if not target_dir.exists():
+        return
+    for path in target_dir.iterdir():
+        if path.is_file() and path.suffix.lower() in {".vtt", ".srt"}:
+            path.unlink()
 
 
 def _has_audio_and_video(format_payload: dict) -> bool:
