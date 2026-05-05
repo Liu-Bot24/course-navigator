@@ -9,7 +9,14 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from .ai import LlmProvider, LlmProviderSet
-from .models import AsrSearchProvider, ModelProviderType, StudyDetailLevel, TaskParameterKey, TaskParameterOverride
+from .models import (
+    AsrSearchProvider,
+    ModelProviderType,
+    OnlineAsrProvider,
+    StudyDetailLevel,
+    TaskParameterKey,
+    TaskParameterOverride,
+)
 
 
 class ModelProfileConfig(BaseModel):
@@ -41,6 +48,40 @@ class AsrSearchSettings(BaseModel):
         return self.firecrawl if provider == "firecrawl" else self.tavily
 
 
+class OnlineAsrServiceConfig(BaseModel):
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+
+
+class OnlineAsrSettings(BaseModel):
+    provider: OnlineAsrProvider = "none"
+    openai: OnlineAsrServiceConfig = Field(
+        default_factory=lambda: OnlineAsrServiceConfig(
+            base_url="https://api.openai.com/v1",
+            model="whisper-1",
+        )
+    )
+    groq: OnlineAsrServiceConfig = Field(
+        default_factory=lambda: OnlineAsrServiceConfig(
+            base_url="https://api.groq.com/openai/v1",
+            model="whisper-large-v3-turbo",
+        )
+    )
+    xai: OnlineAsrServiceConfig = Field(
+        default_factory=lambda: OnlineAsrServiceConfig(
+            base_url="https://api.x.ai/v1",
+            model="grok-2-voice-1212",
+        )
+    )
+    custom: OnlineAsrServiceConfig = Field(default_factory=OnlineAsrServiceConfig)
+
+    def service_for(self, provider: OnlineAsrProvider) -> OnlineAsrServiceConfig:
+        if provider == "none":
+            return OnlineAsrServiceConfig()
+        return getattr(self, provider)
+
+
 class Settings(BaseModel):
     data_dir: Path = Path(".course-navigator")
     llm_base_url: str | None = None
@@ -52,6 +93,7 @@ class Settings(BaseModel):
     global_model_id: str = "default"
     asr_model_id: str = "default"
     asr_search: AsrSearchSettings = Field(default_factory=AsrSearchSettings)
+    online_asr: OnlineAsrSettings = Field(default_factory=OnlineAsrSettings)
     study_detail_level: StudyDetailLevel = "faithful"
     task_parameters: dict[TaskParameterKey, TaskParameterOverride] = Field(default_factory=dict)
 
@@ -124,6 +166,7 @@ def load_settings() -> Settings:
         global_model_id=os.getenv("COURSE_NAVIGATOR_GLOBAL_MODEL_ID", "default"),
         asr_model_id=os.getenv("COURSE_NAVIGATOR_ASR_MODEL_ID", "default"),
         asr_search=_load_asr_search_settings(),
+        online_asr=_load_online_asr_settings(),
         study_detail_level=os.getenv("COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL", "faithful"),  # type: ignore[arg-type]
         task_parameters=_load_task_parameters(os.getenv("COURSE_NAVIGATOR_TASK_PARAMETERS")),
     )
@@ -187,6 +230,41 @@ def _load_asr_search_settings() -> AsrSearchSettings:
             api_key=os.getenv("COURSE_NAVIGATOR_FIRECRAWL_API_KEY") or os.getenv("FIRECRAWL_API_KEY"),
         ),
     )
+
+
+def _load_online_asr_settings() -> OnlineAsrSettings:
+    explicit_provider = os.getenv("COURSE_NAVIGATOR_ONLINE_ASR_PROVIDER")
+    provider = explicit_provider if explicit_provider in get_args(OnlineAsrProvider) else "none"
+    settings = OnlineAsrSettings(
+        provider=provider,  # type: ignore[arg-type]
+        openai=OnlineAsrServiceConfig(
+            base_url="https://api.openai.com/v1",
+            model="whisper-1",
+            api_key=os.getenv("COURSE_NAVIGATOR_OPENAI_ASR_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        ),
+        groq=OnlineAsrServiceConfig(
+            base_url="https://api.groq.com/openai/v1",
+            model="whisper-large-v3-turbo",
+            api_key=os.getenv("COURSE_NAVIGATOR_GROQ_ASR_API_KEY") or os.getenv("GROQ_API_KEY"),
+        ),
+        xai=OnlineAsrServiceConfig(
+            base_url="https://api.x.ai/v1",
+            model=os.getenv("COURSE_NAVIGATOR_XAI_ASR_MODEL") or "grok-2-voice-1212",
+            api_key=os.getenv("COURSE_NAVIGATOR_XAI_ASR_API_KEY") or os.getenv("XAI_API_KEY"),
+        ),
+        custom=OnlineAsrServiceConfig(
+            base_url=os.getenv("COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL"),
+            model=os.getenv("COURSE_NAVIGATOR_CUSTOM_ASR_MODEL"),
+            api_key=os.getenv("COURSE_NAVIGATOR_CUSTOM_ASR_API_KEY"),
+        ),
+    )
+    if not explicit_provider:
+        for candidate in ("xai", "openai", "groq", "custom"):
+            service = settings.service_for(candidate)  # type: ignore[arg-type]
+            if service.api_key:
+                return settings.model_copy(update={"provider": candidate})
+        return settings.model_copy(update={"provider": "none"})
+    return settings
 
 
 def _env_bool(name: str, default: bool) -> bool:

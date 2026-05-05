@@ -4,7 +4,7 @@ from time import sleep
 from fastapi.testclient import TestClient
 
 from course_navigator.app import create_app
-from course_navigator.config import Settings
+from course_navigator.config import OnlineAsrSettings, Settings
 from course_navigator.models import TranscriptSegment, VideoMetadata
 from course_navigator.ytdlp import YtDlpError
 
@@ -514,6 +514,96 @@ def test_extract_route_can_force_asr_source(tmp_path):
     assert response.json()["transcript"][0]["text"] == "Forced ASR line."
 
 
+def test_extract_job_can_force_asr_source_with_progress(tmp_path):
+    class ForceAsrRunner(FakeRunner):
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise AssertionError("subtitle extraction should not run when ASR is forced")
+
+        def extract_asr(self, request, target_dir: Path, item_id: str, progress=None):
+            if progress:
+                progress(55, "正在本地 ASR 转写音频")
+            sleep(0.03)
+            return [TranscriptSegment(start=0, end=3, text="Forced ASR line.")]
+
+    client = make_client(tmp_path, runner=ForceAsrRunner())
+
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": "https://learn.deeplearning.ai/courses/example",
+            "mode": "normal",
+            "subtitle_source": "asr",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    assert payload["item_id"] == "abc123"
+    item = client.get("/api/items/abc123").json()
+    assert item["transcript_source"] == "asr"
+    assert item["transcript"][0]["text"] == "Forced ASR line."
+
+
+def test_extract_route_can_force_online_asr_source(tmp_path, monkeypatch):
+    class OnlineAsrRunner(FakeRunner):
+        subtitle_called = False
+
+        def fetch_metadata(self, request):
+            metadata = super().fetch_metadata(request)
+            metadata.language = "en"
+            return metadata
+
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            self.subtitle_called = True
+            raise AssertionError("subtitle extraction should not run when online ASR is forced")
+
+    captured = {}
+
+    def fake_online_asr(request, target_dir, item_id, yt_dlp_binary, settings):
+        captured["provider"] = settings.provider
+        captured["binary"] = yt_dlp_binary
+        captured["item_id"] = item_id
+        captured["language"] = request.language
+        return [TranscriptSegment(start=0, end=2.5, text="Online ASR line.")]
+
+    monkeypatch.setattr("course_navigator.app.extract_online_asr_transcript", fake_online_asr)
+    runner = OnlineAsrRunner()
+    client = make_client(
+        tmp_path,
+        runner=runner,
+        settings=Settings(
+            data_dir=tmp_path,
+            online_asr=OnlineAsrSettings(
+                provider="xai",
+                xai={"api_key": "xai-test"},
+            ),
+        ),
+    )
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "url": "https://learn.deeplearning.ai/courses/example",
+            "mode": "normal",
+            "subtitle_source": "online_asr",
+        },
+    )
+
+    assert response.status_code == 200
+    assert runner.subtitle_called is False
+    assert response.json()["transcript_source"] == "online_asr"
+    assert response.json()["transcript"][0]["text"] == "Online ASR line."
+    assert captured == {"provider": "xai", "binary": "yt-dlp", "item_id": "abc123", "language": "en"}
+
+
 def test_extract_uses_safe_id_for_subtitle_directory(tmp_path):
     class OddIdRunner(FakeRunner):
         def fetch_metadata(self, request):
@@ -962,6 +1052,71 @@ def test_asr_search_settings_can_be_read_and_updated_without_exposing_keys(tmp_p
     written = env_path.read_text(encoding="utf-8")
     assert "COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER=\"firecrawl\"" in written
     assert "COURSE_NAVIGATOR_FIRECRAWL_BASE_URL=\"http://127.0.0.1:43123\"" in written
+
+
+def test_online_asr_settings_can_be_read_and_updated_without_exposing_keys(tmp_path):
+    env_path = tmp_path / ".env"
+    client = make_client(
+        tmp_path,
+        env_path=env_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            online_asr=OnlineAsrSettings(
+                provider="openai",
+                openai={"api_key": "sk-openai-secret"},
+                custom={"base_url": "https://asr.example.com/v1", "model": "speech-model", "api_key": "custom-secret"},
+            ),
+        ),
+    )
+
+    initial = client.get("/api/settings/online-asr")
+
+    assert initial.status_code == 200
+    payload = initial.json()
+    assert payload["provider"] == "openai"
+    assert payload["openai"]["has_api_key"] is True
+    assert payload["openai"]["api_key_preview"] != "sk-openai-secret"
+    assert "api_key" not in payload["openai"]
+    assert payload["custom"]["base_url"] == "https://asr.example.com/v1"
+    assert payload["custom"]["model"] == "speech-model"
+
+    updated = client.put(
+        "/api/settings/online-asr",
+        json={
+            "provider": "xai",
+            "xai": {"api_key": "xai-secret-value"},
+            "custom": {"base_url": "https://custom.example.com/audio", "model": "custom-whisper"},
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["provider"] == "xai"
+    assert updated.json()["xai"]["has_api_key"] is True
+    written = env_path.read_text(encoding="utf-8")
+    assert "COURSE_NAVIGATOR_ONLINE_ASR_PROVIDER=\"xai\"" in written
+    assert "COURSE_NAVIGATOR_XAI_ASR_API_KEY=\"xai-secret-value\"" in written
+    assert "COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL=\"https://custom.example.com/audio\"" in written
+    assert "COURSE_NAVIGATOR_CUSTOM_ASR_MODEL=\"custom-whisper\"" in written
+
+
+def test_online_asr_settings_can_disable_provider(tmp_path):
+    env_path = tmp_path / ".env"
+    client = make_client(
+        tmp_path,
+        env_path=env_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            online_asr=OnlineAsrSettings(provider="xai", xai={"api_key": "xai-secret-value"}),
+        ),
+    )
+
+    updated = client.put("/api/settings/online-asr", json={"provider": "none"})
+
+    assert updated.status_code == 200
+    assert updated.json()["provider"] == "none"
+    written = env_path.read_text(encoding="utf-8")
+    assert "COURSE_NAVIGATOR_ONLINE_ASR_PROVIDER=\"none\"" in written
+    assert "COURSE_NAVIGATOR_XAI_ASR_API_KEY=\"xai-secret-value\"" in written
 
 
 def test_model_list_endpoint_uses_saved_profile_key(tmp_path, monkeypatch):

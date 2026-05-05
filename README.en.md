@@ -16,7 +16,8 @@ It is built for learners, researchers, and course-heavy teams who need to unders
 
 - Build a course library with collections, lesson titles, ordering, and local video cache controls.
 - Import and export lightweight course packages for sharing organized courses, corrected subtitles, translated subtitles, and AI study material.
-- Extract subtitles from supported video pages with `yt-dlp`.
+- Extract subtitles from supported video pages with `yt-dlp`, or use local ASR, online ASR, or a local subtitle upload.
+- Online ASR supports xAI, OpenAI Whisper, Groq Whisper, and custom compatible endpoints.
 - Use direct access, browser login, or a cookies file for videos that require authentication.
 - Watch supported videos with clickable transcripts, bilingual subtitle views, and timestamp navigation.
 - Generate AI study material, including a guide, outline, interpretation, and detailed notes.
@@ -29,6 +30,9 @@ It is built for learners, researchers, and course-heavy teams who need to unders
 
 ## What's New
 
+- Subtitle sources: local subtitle upload and online ASR are now supported. Online ASR extracts audio, compresses it, splits it when needed, and returns timestamped subtitles for videos without platform captions.
+- Online ASR setup: choose xAI, OpenAI Whisper, Groq Whisper, a custom endpoint, or “Do not use online ASR.” Provider changes are saved immediately, and ASR prefers the source video language when it is available.
+- Local ASR improvements: extraction now shows progress, and Chinese output is normalized to Simplified Chinese.
 - Course package sharing: choose individual courses or full collections from the library and export a lightweight share package. Packages include video links, corrected subtitles, translated subtitles, AI study material, and an optional note. They do not include local video caches or model profiles. Full collections keep their collection name and lesson order when imported.
 - Better ASR search validation: search results are first synthesized into background information, then used together with video metadata and user reference text for the final correction pass. This helps reduce incorrect edits caused by outdated model knowledge.
 - Improved ASR review flow: suggestion navigation, linked before/after scrolling, hover review cards, confidence sorting, threshold acceptance, and optional auto-save after accepting suggestions.
@@ -109,6 +113,13 @@ The app also reads optional environment settings:
 | `COURSE_NAVIGATOR_TAVILY_API_KEY` | Tavily API key | Empty |
 | `COURSE_NAVIGATOR_FIRECRAWL_BASE_URL` | Firecrawl API address | Empty |
 | `COURSE_NAVIGATOR_FIRECRAWL_API_KEY` | Firecrawl API key | Empty |
+| `COURSE_NAVIGATOR_ONLINE_ASR_PROVIDER` | Online ASR provider: `none`, `xai`, `openai`, `groq`, or `custom` | `none`; a configured key can be selected automatically |
+| `COURSE_NAVIGATOR_XAI_ASR_API_KEY` | xAI online ASR API key | Empty |
+| `COURSE_NAVIGATOR_OPENAI_ASR_API_KEY` | OpenAI Whisper API key | Empty |
+| `COURSE_NAVIGATOR_GROQ_ASR_API_KEY` | Groq Whisper API key | Empty |
+| `COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL` | Custom online ASR endpoint | Empty |
+| `COURSE_NAVIGATOR_CUSTOM_ASR_MODEL` | Custom online ASR model name | Empty |
+| `COURSE_NAVIGATOR_CUSTOM_ASR_API_KEY` | Custom online ASR API key | Empty |
 
 Firecrawl can use either the hosted service or a self-hosted service:
 
@@ -118,6 +129,8 @@ Firecrawl can use either the hosted service or a self-hosted service:
 | Self-hosted Firecrawl | Your Firecrawl service address, for example `http://192.168.1.10:3002` | Fill this in if your self-hosted service requires authentication; otherwise leave it empty |
 
 You can enter the service root URL. Course Navigator uses the `/v1/search` endpoint for search requests, so `https://api.firecrawl.dev` becomes `https://api.firecrawl.dev/v1/search`.
+
+Online ASR can be configured in the app settings. Preset providers only need an API key; custom endpoints need a base URL, model name, and API key. ASR tries to produce subtitles in the source video language; translation remains a separate subtitle translation step.
 
 The startup script supports custom local ports:
 
@@ -139,6 +152,15 @@ Course Navigator supports three extraction modes:
 | Cookies file | You already have an exported cookies file for the site. |
 
 Supported sites, subtitle languages, and automatic captions depend on `yt-dlp` and the source platform.
+
+## Subtitle Sources
+
+| Source | Use when |
+| --- | --- |
+| Source first | Prefer platform subtitles and fall back to local ASR when they are missing. |
+| Local ASR | Generate timestamped subtitles on your machine. |
+| Online ASR | Generate timestamped subtitles with a configured online speech-to-text service. |
+| Local upload | Upload an existing TXT, MD, SRT, VTT, or similar subtitle text file. |
 
 ## Course Management
 

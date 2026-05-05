@@ -16,7 +16,8 @@ Course Navigator 是一个视频课程学习工作台。你可以粘贴支持的
 
 - 建立课程库，支持专辑分组、课程标题、排序和本地视频缓存管理。
 - 导入和导出轻量课程包，用于分享已整理好的课程、校正后的字幕、翻译字幕和 AI 学习材料。
-- 通过 `yt-dlp` 从支持的视频页面提取字幕。
+- 通过 `yt-dlp` 从支持的视频页面提取字幕，也可以使用本地 ASR、在线 ASR 或本地上传字幕文件。
+- 在线 ASR 支持 xAI、OpenAI Whisper、Groq Whisper 和自定义兼容接口。
 - 对需要登录的视频，可使用直接访问、浏览器登录状态或 cookies 文件。
 - 在支持的视频源上边看视频边点击字幕跳转，支持双语字幕视图和时间戳导航。
 - 生成 AI 学习材料，包括导览、大纲、解读和详解。
@@ -29,6 +30,9 @@ Course Navigator 是一个视频课程学习工作台。你可以粘贴支持的
 
 ## 最近更新
 
+- 字幕来源升级：新增本地上传字幕文件和在线 ASR。在线 ASR 会自动抽取音频、压缩并分块转写，适合没有站方字幕但需要时间戳字幕的视频。
+- 在线 ASR 配置优化：支持 xAI、OpenAI Whisper、Groq Whisper、自定义接口和“不使用在线 ASR”。切换服务会立即保存，ASR 会优先使用视频源语言；无法确定时交给服务自动识别。
+- 本地 ASR 体验优化：提取过程会显示进度，中文结果会转换为简体中文。
 - 课程包分享：可以从课程库选择单个课程或完整专辑导出分享包。分享包包含视频链接、校正后的字幕、翻译字幕、AI 学习材料和可选留言，不包含本地视频缓存或模型档案。导入完整专辑时会保留专辑名称和课程顺序。
 - ASR 搜索校验升级：搜索结果会先归纳成背景信息，再和视频元数据、附加参考信息一起参与最终校正，减少因为模型知识过时造成的误改。
 - ASR 校正体验优化：支持修改建议导航、修改前/修改后同步滚动、悬停审阅、置信度排序、一键接受高置信度建议和接受后自动保存。
@@ -109,6 +113,13 @@ http://127.0.0.1:5173
 | `COURSE_NAVIGATOR_TAVILY_API_KEY` | Tavily API Key | 空 |
 | `COURSE_NAVIGATOR_FIRECRAWL_BASE_URL` | Firecrawl API 地址 | 空 |
 | `COURSE_NAVIGATOR_FIRECRAWL_API_KEY` | Firecrawl API Key | 空 |
+| `COURSE_NAVIGATOR_ONLINE_ASR_PROVIDER` | 在线 ASR 服务，可选 `none`、`xai`、`openai`、`groq`、`custom` | `none`，有可用 Key 时会自动选择 |
+| `COURSE_NAVIGATOR_XAI_ASR_API_KEY` | xAI 在线 ASR API Key | 空 |
+| `COURSE_NAVIGATOR_OPENAI_ASR_API_KEY` | OpenAI Whisper API Key | 空 |
+| `COURSE_NAVIGATOR_GROQ_ASR_API_KEY` | Groq Whisper API Key | 空 |
+| `COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL` | 自定义在线 ASR 接口地址 | 空 |
+| `COURSE_NAVIGATOR_CUSTOM_ASR_MODEL` | 自定义在线 ASR 模型名称 | 空 |
+| `COURSE_NAVIGATOR_CUSTOM_ASR_API_KEY` | 自定义在线 ASR API Key | 空 |
 
 Firecrawl 可以使用官方服务或自托管服务：
 
@@ -118,6 +129,8 @@ Firecrawl 可以使用官方服务或自托管服务：
 | 自托管服务 | 你的 Firecrawl 服务地址，例如 `http://192.168.1.10:3002` | 如果你的自托管服务开启了鉴权就填写；没有开启可留空 |
 
 填写地址时可以只填服务根地址。Course Navigator 会在请求搜索时自动使用 `/v1/search` 接口；例如 `https://api.firecrawl.dev` 会请求到 `https://api.firecrawl.dev/v1/search`。
+
+在线 ASR 可以在应用设置里配置。预设服务只需要填写 API Key；自定义接口需要填写接口地址、模型名称和 API Key。ASR 会尽量生成视频源语言字幕，翻译仍然由后续字幕翻译功能完成。
 
 一键启动脚本支持自定义本地端口：
 
@@ -139,6 +152,15 @@ Course Navigator 支持三种提取模式：
 | Cookies 文件 | 你已经为目标网站导出了 cookies 文件。 |
 
 支持的网站、字幕语言和自动字幕可用性取决于 `yt-dlp` 和视频平台本身。
+
+## 字幕来源
+
+| 字幕来源 | 适用场景 |
+| --- | --- |
+| 原字幕优先 | 优先下载视频平台已有字幕，缺失时回退到本地 ASR。 |
+| 本地 ASR | 在本机用语音识别生成带时间戳字幕。 |
+| 在线 ASR | 使用已配置的在线语音识别服务生成带时间戳字幕。 |
+| 本地上传 | 上传已有的 TXT、MD、SRT、VTT 等字幕文本文件。 |
 
 ## 课程管理
 

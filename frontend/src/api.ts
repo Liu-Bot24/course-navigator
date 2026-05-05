@@ -10,6 +10,8 @@ import type {
   ModelSettings,
   ModelSettingsInput,
   ModelProviderType,
+  OnlineAsrSettings,
+  OnlineAsrSettingsInput,
   OutputLanguage,
   StudySection,
   StudyJobStatus,
@@ -45,6 +47,20 @@ export async function extractCourse(input: {
   subtitle_source?: TranscriptSource;
 }): Promise<CourseItem> {
   return requestJson<CourseItem>("/extract", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function startExtractJob(input: {
+  url: string;
+  mode: ExtractMode;
+  browser: string;
+  cookies_path?: string;
+  language?: string;
+  subtitle_source?: TranscriptSource;
+}): Promise<StudyJobStatus> {
+  return requestJson<StudyJobStatus>("/extract-jobs", {
     method: "POST",
     body: JSON.stringify(input),
   });
@@ -126,6 +142,17 @@ export async function getAsrSearchSettings(): Promise<AsrSearchSettings> {
 
 export async function saveAsrSearchSettings(input: AsrSearchSettingsInput): Promise<AsrSearchSettings> {
   return requestJson<AsrSearchSettings>("/settings/asr-search", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function getOnlineAsrSettings(): Promise<OnlineAsrSettings> {
+  return requestJson<OnlineAsrSettings>("/settings/online-asr");
+}
+
+export async function saveOnlineAsrSettings(input: OnlineAsrSettingsInput): Promise<OnlineAsrSettings> {
+  return requestJson<OnlineAsrSettings>("/settings/online-asr", {
     method: "PUT",
     body: JSON.stringify(input),
   });

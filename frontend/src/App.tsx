@@ -44,6 +44,7 @@ import {
   getAsrCorrectionResult,
   getAsrSearchSettings,
   getModelSettings,
+  getOnlineAsrSettings,
   getStudyJob,
   importCoursePackage,
   itemVideoPath,
@@ -52,7 +53,9 @@ import {
   previewCourse,
   saveModelSettings,
   saveAsrSearchSettings,
+  saveOnlineAsrSettings,
   saveTranscript,
+  startExtractJob,
   startAsrCorrectionJob,
   startDownloadJob,
   startStudyJob,
@@ -71,6 +74,7 @@ import {
   sortAsrReviewSuggestions,
   transcriptToEditorText,
 } from "./asrWorkbench";
+import { parseUploadedSubtitleText } from "./subtitleUpload";
 import type {
   AsrCorrectionSearchConfig,
   AsrCorrectionSuggestion,
@@ -85,6 +89,9 @@ import type {
   ModelProviderType,
   ModelSettings,
   ModelSettingsInput,
+  OnlineAsrProvider,
+  OnlineAsrSettings,
+  OnlineAsrSettingsInput,
   OutputLanguage,
   OutlineNode,
   StudyMaterial,
@@ -106,6 +113,15 @@ type CaptionDisplayMode = TextDisplayMode | "hidden";
 type CaptionPlacement = "overlay" | "panel";
 type LayoutDragKind = "left" | "right" | "player";
 type AsrSuggestionDirection = -1 | 1;
+type SubtitleSourceChoice = TranscriptSource | "local_upload";
+
+function requestTranscriptSource(source: SubtitleSourceChoice): TranscriptSource {
+  return source === "local_upload" ? "subtitles" : source;
+}
+
+function usesBackgroundSubtitleExtraction(source: SubtitleSourceChoice): boolean {
+  return source === "asr" || source === "online_asr";
+}
 type ModelProfileDraft = Omit<ModelProfile, "context_window" | "max_tokens"> & {
   api_key: string;
   context_window: string;
@@ -144,6 +160,19 @@ type AsrSearchDraft = {
   api_key_preview: string | null;
   base_url: string;
   result_limit: string;
+};
+type OnlineAsrDraft = {
+  provider: OnlineAsrProvider;
+  openai_api_key: string;
+  openai_api_key_preview: string | null;
+  groq_api_key: string;
+  groq_api_key_preview: string | null;
+  xai_api_key: string;
+  xai_api_key_preview: string | null;
+  custom_base_url: string;
+  custom_model: string;
+  custom_api_key: string;
+  custom_api_key_preview: string | null;
 };
 type AsrSuggestionHover = {
   suggestionId: string;
@@ -197,6 +226,12 @@ const COPY = {
     subtitleSource: "字幕来源",
     subtitleSourceOriginal: "原字幕优先",
     subtitleSourceAsr: "本地 ASR",
+    subtitleSourceOnlineAsr: "在线 ASR",
+    subtitleSourceLocalUpload: "本地上传",
+    uploadSubtitleFile: "上传字幕文件",
+    importingLocalSubtitle: "正在导入本地字幕",
+    localSubtitleNoTarget: "请先打开或选择一个课程，再上传本地字幕。",
+    localSubtitleEmpty: "没有解析到可用字幕。",
     subtitlesReady: "已有字幕",
     translationReady: "已有译文",
     extractAuth: "提取登录",
@@ -226,6 +261,20 @@ const COPY = {
     translationModelHelp: "字幕逐句翻译和标题翻译，优先使用便宜、快速、稳定的小模型。",
     learningModelHelp: "生成每个语义学习块的解读、详解和高保真文本，负责内容质量。",
     globalModelHelp: "生成上下文摘要、语义分块、导览、大纲和跨块整合，需要更强的长上下文能力。",
+    onlineAsrSettingsTitle: "在线 ASR",
+    onlineAsrSettingsHelp: "用于在没有站方字幕时通过在线语音识别生成带时间戳字幕。预设服务只需要填写 API Key；自定义接口会自动识别分段、词级时间戳、SRT 或 VTT 返回。",
+    onlineAsrProvider: "在线 ASR 服务",
+    onlineAsrProviderNone: "不使用在线 ASR",
+    onlineAsrProviderOpenAI: "OpenAI Whisper",
+    onlineAsrProviderGroq: "Groq Whisper",
+    onlineAsrProviderXai: "xAI",
+    onlineAsrProviderCustom: "自定义",
+    onlineAsrApiKey: "在线 ASR API Key",
+    onlineAsrCustomBaseUrl: "自定义接口地址",
+    onlineAsrCustomModel: "自定义模型名称",
+    onlineAsrPresetHelp: "选择在线 ASR 作为字幕来源时，会自动抽取音频、压缩并分块转写。",
+    onlineAsrCustomHelp: "自定义接口会自动兼容分段时间戳、词级时间戳、SRT 和 VTT；纯文本转写不能作为字幕。",
+    onlineAsrProviderSaved: "在线 ASR 服务已保存",
     advancedModelSettings: "高级调用参数",
     advancedModelSettingsHelp: "留空使用代码默认值。这里覆盖具体任务调用；不熟悉模型参数时建议保持默认。",
     modelCapabilitySettings: "模型能力覆盖",
@@ -454,6 +503,12 @@ const COPY = {
     subtitleSource: "Subtitle source",
     subtitleSourceOriginal: "Source first",
     subtitleSourceAsr: "Local ASR",
+    subtitleSourceOnlineAsr: "Online ASR",
+    subtitleSourceLocalUpload: "Local upload",
+    uploadSubtitleFile: "Upload subtitle file",
+    importingLocalSubtitle: "Importing local subtitles",
+    localSubtitleNoTarget: "Open or select a course before uploading local subtitles.",
+    localSubtitleEmpty: "No usable subtitles were found in this file.",
     subtitlesReady: "Transcript ready",
     translationReady: "Translation ready",
     extractAuth: "Auth",
@@ -483,6 +538,20 @@ const COPY = {
     translationModelHelp: "Sentence-by-sentence subtitle and title translation; best with a fast, cheaper model.",
     learningModelHelp: "Generates interpretation, detailed notes, and high-fidelity text for each semantic block.",
     globalModelHelp: "Context summary, semantic segmentation, guide, outline, and cross-block synthesis.",
+    onlineAsrSettingsTitle: "Online ASR",
+    onlineAsrSettingsHelp: "Use an online speech-to-text service to generate timestamped subtitles when source subtitles are unavailable. Preset services only need an API key; custom endpoints auto-detect segment timestamps, word timestamps, SRT, or VTT responses.",
+    onlineAsrProvider: "Online ASR service",
+    onlineAsrProviderNone: "Do not use online ASR",
+    onlineAsrProviderOpenAI: "OpenAI Whisper",
+    onlineAsrProviderGroq: "Groq Whisper",
+    onlineAsrProviderXai: "xAI",
+    onlineAsrProviderCustom: "Custom",
+    onlineAsrApiKey: "Online ASR API Key",
+    onlineAsrCustomBaseUrl: "Custom base URL",
+    onlineAsrCustomModel: "Custom model name",
+    onlineAsrPresetHelp: "When Online ASR is selected as the subtitle source, audio is extracted, compressed, split, and transcribed automatically.",
+    onlineAsrCustomHelp: "Custom endpoints auto-detect segment timestamps, word timestamps, SRT, and VTT. Plain text responses cannot be used as subtitles.",
+    onlineAsrProviderSaved: "Online ASR service saved",
     advancedModelSettings: "Advanced call parameters",
     advancedModelSettingsHelp: "Blank fields use code defaults. These values override individual task calls.",
     modelCapabilitySettings: "Model capability overrides",
@@ -740,13 +809,26 @@ const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
   study_detail_level: "faithful",
   task_parameters: emptyTaskParameterDrafts(),
 };
+const EMPTY_ONLINE_ASR_DRAFT: OnlineAsrDraft = {
+  provider: "none",
+  openai_api_key: "",
+  openai_api_key_preview: null,
+  groq_api_key: "",
+  groq_api_key_preview: null,
+  xai_api_key: "",
+  xai_api_key_preview: null,
+  custom_base_url: "",
+  custom_model: "",
+  custom_api_key: "",
+  custom_api_key_preview: null,
+};
 
 export function App() {
   const [url, setUrl] = useState("");
   const [mode, setMode] = useState<ExtractMode>("browser");
   const [browser, setBrowser] = useState("chrome");
   const [cookiesPath, setCookiesPath] = useState("");
-  const [subtitleSource, setSubtitleSource] = useState<TranscriptSource>("subtitles");
+  const [subtitleSource, setSubtitleSource] = useState<SubtitleSourceChoice>("subtitles");
   const [uiLanguage, setUiLanguage] = useState<UiLanguage>("zh-CN");
   const [outputLanguage, setOutputLanguage] = useState<OutputLanguage>("zh-CN");
   const [videoCaptionDisplayMode, setVideoCaptionDisplayMode] = useState<CaptionDisplayMode>("bilingual");
@@ -768,6 +850,8 @@ export function App() {
   const [asrSettingsOpen, setAsrSettingsOpen] = useState(false);
   const [modelSettings, setModelSettings] = useState<ModelSettings | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(EMPTY_SETTINGS_DRAFT);
+  const [onlineAsrSettings, setOnlineAsrSettings] = useState<OnlineAsrSettings | null>(null);
+  const [onlineAsrDraft, setOnlineAsrDraft] = useState<OnlineAsrDraft>(EMPTY_ONLINE_ASR_DRAFT);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [roleSettingsBusy, setRoleSettingsBusy] = useState(false);
@@ -798,11 +882,12 @@ export function App() {
   const [editingCollectionDraft, setEditingCollectionDraft] = useState("");
   const [savingCollectionKey, setSavingCollectionKey] = useState<string | null>(null);
   const [savingTitleId, setSavingTitleId] = useState<string | null>(null);
-  const [activeJobKind, setActiveJobKind] = useState<"study" | "translation" | "download" | null>(null);
+  const [activeJobKind, setActiveJobKind] = useState<"study" | "translation" | "download" | "extract" | null>(null);
   const workspaceRef = useRef<HTMLElement | null>(null);
   const mainColumnRef = useRef<HTMLElement | null>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
+  const subtitleUploadInputRef = useRef<HTMLInputElement | null>(null);
   const copy = COPY[uiLanguage];
 
   useEffect(() => {
@@ -819,6 +904,12 @@ export function App() {
       .then((settings) => {
         setModelSettings(settings);
         setSettingsDraft(draftFromModelSettings(settings));
+      })
+      .catch(() => undefined);
+    getOnlineAsrSettings()
+      .then((settings) => {
+        setOnlineAsrSettings(settings);
+        setOnlineAsrDraft(draftFromOnlineAsrSettings(settings));
       })
       .catch(() => undefined);
   }, []);
@@ -895,6 +986,10 @@ export function App() {
   async function handleOpenUrl() {
     const normalizedUrl = url.trim();
     if (!normalizedUrl) return;
+    if (subtitleSource === "local_upload") {
+      openLocalSubtitlePicker();
+      return;
+    }
     setError(null);
     setJobStatus(null);
     setSourceMode("embed");
@@ -916,7 +1011,11 @@ export function App() {
       if (previewItem.transcript.length) {
         return;
       }
-      await extractUrlToItem(normalizedUrl);
+      if (usesBackgroundSubtitleExtraction(subtitleSource)) {
+        await runExtractJob(normalizedUrl);
+      } else {
+        await extractUrlToItem(normalizedUrl);
+      }
     } catch (err) {
       setError(extractionErrorMessage(err, mode, browser, copy.unknownError));
     } finally {
@@ -927,6 +1026,10 @@ export function App() {
   }
 
   async function handleGetSubtitles() {
+    if (subtitleSource === "local_upload") {
+      openLocalSubtitlePicker();
+      return;
+    }
     const normalizedUrl = url.trim() || selected?.source_url.trim() || "";
     if (!normalizedUrl) return;
     const existing = findExistingItemForUrl(items, normalizedUrl);
@@ -940,12 +1043,60 @@ export function App() {
     setSeekTime(0);
     setPlayheadTime(0);
     try {
-      await extractUrlToItem(normalizedUrl);
+      if (usesBackgroundSubtitleExtraction(subtitleSource)) {
+        await runExtractJob(normalizedUrl);
+      } else {
+        await extractUrlToItem(normalizedUrl);
+      }
     } catch (err) {
       setError(extractionErrorMessage(err, mode, browser, copy.unknownError));
     } finally {
       setBusy(null);
       setJobStatus(null);
+      setActiveJobKind(null);
+    }
+  }
+
+  function handleSubtitleSourceChange(nextSource: SubtitleSourceChoice) {
+    setSubtitleSource(nextSource);
+    if (nextSource === "local_upload") {
+      window.setTimeout(() => openLocalSubtitlePicker(), 0);
+    }
+  }
+
+  function openLocalSubtitlePicker() {
+    subtitleUploadInputRef.current?.click();
+  }
+
+  async function handleLocalSubtitleFile(event: ReactChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0] ?? null;
+    event.currentTarget.value = "";
+    if (!file) return;
+    setError(null);
+    setJobStatus(null);
+    setBusy(copy.importingLocalSubtitle);
+    try {
+      const normalizedUrl = url.trim();
+      const selectedMatchesUrl =
+        selected && normalizedUrl ? canonicalSourceKey(selected.source_url) === canonicalSourceKey(normalizedUrl) : true;
+      let target = selectedMatchesUrl && selected && !isPreviewItem(selected) ? selected : null;
+      if (!target && normalizedUrl) {
+        target = await previewUrlToItem(normalizedUrl);
+      }
+      if (!target) {
+        throw new Error(copy.localSubtitleNoTarget);
+      }
+      const text = await file.text();
+      const transcript = parseUploadedSubtitleText(text, file.name, target.duration);
+      if (!transcript.length) {
+        throw new Error(copy.localSubtitleEmpty);
+      }
+      await handleSaveWorkbenchTranscript(target.id, transcript);
+      setSubtitleSource("local_upload");
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setBusy(null);
       setActiveJobKind(null);
     }
   }
@@ -1145,6 +1296,30 @@ export function App() {
     }
     await refreshItems(itemId);
     setSourceMode("local");
+  }
+
+  async function runExtractJob(sourceUrl: string) {
+    setActiveJobKind("extract");
+    setBusy(`${copy.extracting} 0%`);
+    const firstStatus = await startExtractJob({
+      url: sourceUrl,
+      mode,
+      browser,
+      cookies_path: mode === "cookies" ? cookiesPath : undefined,
+      subtitle_source: requestTranscriptSource(subtitleSource),
+    });
+    setJobStatus(firstStatus);
+    let current = firstStatus;
+    while (current.status === "queued" || current.status === "running") {
+      await delay(1000);
+      current = await getStudyJob(firstStatus.job_id);
+      setJobStatus(current);
+      setBusy(`${current.message} ${current.progress}%`);
+    }
+    if (current.status === "failed") {
+      throw new Error(current.error ?? current.message);
+    }
+    await refreshItems(current.item_id || undefined);
   }
 
   async function handleDownload() {
@@ -1452,7 +1627,7 @@ export function App() {
       mode,
       browser,
       cookies_path: mode === "cookies" ? cookiesPath : undefined,
-      subtitle_source: subtitleSource,
+      subtitle_source: requestTranscriptSource(subtitleSource),
     });
     selectCourse(item);
     setItems((current) => sortCourseItems([item, ...current.filter((entry) => entry.id !== item.id)]));
@@ -1466,7 +1641,7 @@ export function App() {
       mode,
       browser,
       cookies_path: mode === "cookies" ? cookiesPath : undefined,
-      subtitle_source: subtitleSource,
+      subtitle_source: requestTranscriptSource(subtitleSource),
     });
     selectCourse(item);
     setItems((current) => sortCourseItems([item, ...current.filter((entry) => entry.id !== item.id)]));
@@ -1575,13 +1750,29 @@ export function App() {
         study_detail_level: "faithful",
         task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
       });
+      const nextOnlineAsr = await saveOnlineAsrSettings(onlineAsrDraftToInput(onlineAsrDraft));
       setModelSettings(next);
       setSettingsDraft(draftFromModelSettings(next, settingsDraft.active_profile_id));
+      setOnlineAsrSettings(nextOnlineAsr);
+      setOnlineAsrDraft(draftFromOnlineAsrSettings(nextOnlineAsr));
       setSettingsMessage(copy.settingsSaved);
     } catch (err) {
       setSettingsMessage(errorMessage(err, copy.unknownError));
     } finally {
       setSettingsBusy(false);
+    }
+  }
+
+  async function handleOnlineAsrProviderChange(provider: OnlineAsrProvider) {
+    setOnlineAsrDraft((current) => ({ ...current, provider }));
+    setSettingsMessage(null);
+    try {
+      const next = await saveOnlineAsrSettings({ provider });
+      setOnlineAsrSettings(next);
+      setOnlineAsrDraft((current) => ({ ...current, provider: next.provider }));
+      setSettingsMessage(copy.onlineAsrProviderSaved);
+    } catch (err) {
+      setSettingsMessage(errorMessage(err, copy.unknownError));
     }
   }
 
@@ -1734,6 +1925,7 @@ export function App() {
             scope="asr"
             copy={copy}
             draft={settingsDraft}
+            onlineAsrDraft={onlineAsrDraft}
             modelSettings={modelSettings}
             busy={settingsBusy}
             message={settingsMessage}
@@ -1746,9 +1938,14 @@ export function App() {
               if (modelSettings) {
                 setSettingsDraft(draftFromModelSettings(modelSettings, settingsDraft.active_profile_id));
               }
+              if (onlineAsrSettings) {
+                setOnlineAsrDraft(draftFromOnlineAsrSettings(onlineAsrSettings));
+              }
             }}
             onAddProfile={handleAddAsrModelProfile}
             onDraftChange={setSettingsDraft}
+            onOnlineAsrDraftChange={setOnlineAsrDraft}
+            onOnlineAsrProviderChange={handleOnlineAsrProviderChange}
             onRoleChange={handleSaveModelRole}
             onSave={handleSaveSettings}
           />
@@ -1839,12 +2036,22 @@ export function App() {
             <select
               aria-label={copy.subtitleSource}
               value={subtitleSource}
-              onChange={(event) => setSubtitleSource(event.target.value as TranscriptSource)}
+              onChange={(event) => handleSubtitleSourceChange(event.target.value as SubtitleSourceChoice)}
             >
               <option value="subtitles">{copy.subtitleSourceOriginal}</option>
               <option value="asr">{copy.subtitleSourceAsr}</option>
+              <option value="online_asr">{copy.subtitleSourceOnlineAsr}</option>
+              <option value="local_upload">{copy.subtitleSourceLocalUpload}</option>
             </select>
           </label>
+          <input
+            ref={subtitleUploadInputRef}
+            aria-label={copy.uploadSubtitleFile}
+            className="visually-hidden"
+            type="file"
+            accept=".srt,.vtt,.txt,.md,.markdown,.lrc,.ass,.ssa,text/plain,text/markdown,text/vtt"
+            onChange={(event) => void handleLocalSubtitleFile(event)}
+          />
           <label className="control-field">
             <span>{copy.interfaceLanguage}</span>
             <select
@@ -1877,7 +2084,7 @@ export function App() {
             onClick={() => void handleGetSubtitles()}
             disabled={Boolean(busy) || !(url.trim() || selected?.source_url)}
           >
-            {busy === copy.extracting ? <Loader2 className="spin" size={16} /> : <Captions size={16} />}
+            {activeJobKind === "extract" ? <Loader2 className="spin" size={16} /> : <Captions size={16} />}
             {copy.getSubtitles}
           </button>
           <button
@@ -1896,6 +2103,7 @@ export function App() {
         <SettingsModal
           copy={copy}
           draft={settingsDraft}
+          onlineAsrDraft={onlineAsrDraft}
           modelSettings={modelSettings}
           busy={settingsBusy}
           message={settingsMessage}
@@ -1908,9 +2116,14 @@ export function App() {
             if (modelSettings) {
               setSettingsDraft(draftFromModelSettings(modelSettings, settingsDraft.active_profile_id));
             }
+            if (onlineAsrSettings) {
+              setOnlineAsrDraft(draftFromOnlineAsrSettings(onlineAsrSettings));
+            }
           }}
           onAddProfile={handleAddModelProfile}
           onDraftChange={setSettingsDraft}
+          onOnlineAsrDraftChange={setOnlineAsrDraft}
+          onOnlineAsrProviderChange={handleOnlineAsrProviderChange}
           onRoleChange={handleSaveModelRole}
           onSave={handleSaveSettings}
         />
@@ -3879,6 +4092,7 @@ function SettingsModal({
   scope = "workspace",
   copy,
   draft,
+  onlineAsrDraft,
   modelSettings,
   busy,
   message,
@@ -3887,12 +4101,15 @@ function SettingsModal({
   onClose,
   onAddProfile,
   onDraftChange,
+  onOnlineAsrDraftChange,
+  onOnlineAsrProviderChange,
   onRoleChange,
   onSave,
 }: {
   scope?: "workspace" | "asr";
   copy: (typeof COPY)[UiLanguage];
   draft: SettingsDraft;
+  onlineAsrDraft: OnlineAsrDraft;
   modelSettings: ModelSettings | null;
   busy: boolean;
   message: string | null;
@@ -3901,6 +4118,8 @@ function SettingsModal({
   onClose: () => void;
   onAddProfile: () => void;
   onDraftChange: (draft: SettingsDraft) => void;
+  onOnlineAsrDraftChange: (draft: OnlineAsrDraft) => void;
+  onOnlineAsrProviderChange: (provider: OnlineAsrProvider) => void;
   onRoleChange: (role: ModelRoleKey, profileId: string) => void;
   onSave: () => void;
 }) {
@@ -3909,6 +4128,7 @@ function SettingsModal({
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   const [modelsBusy, setModelsBusy] = useState(false);
   const [modelsMessage, setModelsMessage] = useState<string | null>(null);
+  const [onlineAsrOpen, setOnlineAsrOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const roleProfiles = modelSettings?.profiles.length ? modelSettings.profiles : draft.profiles;
   const roleProfileIds = useMemo(() => new Set(roleProfiles.map((profile) => profile.id)), [roleProfiles]);
@@ -3956,6 +4176,10 @@ function SettingsModal({
         },
       },
     });
+  }
+
+  function updateOnlineAsrDraft(update: Partial<OnlineAsrDraft>) {
+    onOnlineAsrDraftChange({ ...onlineAsrDraft, ...update });
   }
 
   function updateProviderType(providerType: ModelProviderType) {
@@ -4054,6 +4278,76 @@ function SettingsModal({
           <div className="settings-role-status" aria-live="polite">
             {roleBusy ? <Loader2 className="spin" size={13} /> : null}
             <span>{roleMessage}</span>
+          </div>
+        ) : null}
+        {!isAsrScope ? (
+          <div className="settings-advanced online-asr-settings">
+            <button
+              type="button"
+              className="settings-advanced-toggle"
+              aria-expanded={onlineAsrOpen}
+              onClick={() => setOnlineAsrOpen((value) => !value)}
+            >
+              <ChevronRight size={16} className={onlineAsrOpen ? "rotate" : ""} />
+              {copy.onlineAsrSettingsTitle}
+            </button>
+            {onlineAsrOpen ? (
+              <>
+                <p>{copy.onlineAsrSettingsHelp}</p>
+                <div className="settings-grid compact-settings-grid">
+                  <label className="settings-field">
+                    <span>{copy.onlineAsrProvider}</span>
+                    <select
+                      value={onlineAsrDraft.provider}
+                      onChange={(event) => onOnlineAsrProviderChange(event.target.value as OnlineAsrProvider)}
+                    >
+                      <option value="none">{copy.onlineAsrProviderNone}</option>
+                      <option value="openai">{copy.onlineAsrProviderOpenAI}</option>
+                      <option value="groq">{copy.onlineAsrProviderGroq}</option>
+                      <option value="xai">{copy.onlineAsrProviderXai}</option>
+                      <option value="custom">{copy.onlineAsrProviderCustom}</option>
+                    </select>
+                  </label>
+                  {onlineAsrDraft.provider === "custom" ? (
+                    <label className="settings-field">
+                      <span>{copy.onlineAsrCustomModel}</span>
+                      <input
+                        value={onlineAsrDraft.custom_model}
+                        onChange={(event) => updateOnlineAsrDraft({ custom_model: event.target.value })}
+                        placeholder="whisper-large-v3"
+                      />
+                    </label>
+                  ) : null}
+                </div>
+                {onlineAsrDraft.provider === "custom" ? (
+                  <label className="settings-field">
+                    <span>{copy.onlineAsrCustomBaseUrl}</span>
+                    <input
+                      value={onlineAsrDraft.custom_base_url}
+                      onChange={(event) => updateOnlineAsrDraft({ custom_base_url: event.target.value })}
+                      placeholder="https://api.example.com/v1/audio/transcriptions"
+                    />
+                  </label>
+                ) : null}
+                {onlineAsrDraft.provider !== "none" ? (
+                  <label className="settings-field">
+                    <span>{copy.onlineAsrApiKey}</span>
+                    <input
+                      aria-label={copy.onlineAsrApiKey}
+                      autoComplete="off"
+                      value={onlineAsrApiKeyValue(onlineAsrDraft)}
+                      onChange={(event) =>
+                        updateOnlineAsrDraft(onlineAsrApiKeyUpdate(onlineAsrDraft.provider, event.target.value))
+                      }
+                      placeholder={onlineAsrApiKeyPreview(onlineAsrDraft) ? copy.modelApiKeyHint : copy.apiKeyOptionalHint}
+                    />
+                    <small>
+                      {onlineAsrDraft.provider === "custom" ? copy.onlineAsrCustomHelp : copy.onlineAsrPresetHelp}
+                    </small>
+                  </label>
+                ) : null}
+              </>
+            ) : null}
           </div>
         ) : null}
         <div className="settings-subhead">
@@ -5149,6 +5443,70 @@ function secretInputValue(value: string, preview: string | null | undefined): st
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   return preview && trimmed === preview.trim() ? undefined : trimmed;
+}
+
+function draftFromOnlineAsrSettings(settings: OnlineAsrSettings): OnlineAsrDraft {
+  return {
+    provider: settings.provider,
+    openai_api_key: maskedSecretValue(settings.openai.api_key_preview),
+    openai_api_key_preview: settings.openai.api_key_preview,
+    groq_api_key: maskedSecretValue(settings.groq.api_key_preview),
+    groq_api_key_preview: settings.groq.api_key_preview,
+    xai_api_key: maskedSecretValue(settings.xai.api_key_preview),
+    xai_api_key_preview: settings.xai.api_key_preview,
+    custom_base_url: settings.custom.base_url ?? "",
+    custom_model: settings.custom.model ?? "",
+    custom_api_key: maskedSecretValue(settings.custom.api_key_preview),
+    custom_api_key_preview: settings.custom.api_key_preview,
+  };
+}
+
+function onlineAsrDraftToInput(draft: OnlineAsrDraft): OnlineAsrSettingsInput {
+  const openaiApiKey = secretInputValue(draft.openai_api_key, draft.openai_api_key_preview);
+  const groqApiKey = secretInputValue(draft.groq_api_key, draft.groq_api_key_preview);
+  const xaiApiKey = secretInputValue(draft.xai_api_key, draft.xai_api_key_preview);
+  const customApiKey = secretInputValue(draft.custom_api_key, draft.custom_api_key_preview);
+  return {
+    provider: draft.provider,
+    openai: openaiApiKey ? { api_key: openaiApiKey } : {},
+    groq: groqApiKey ? { api_key: groqApiKey } : {},
+    xai: xaiApiKey ? { api_key: xaiApiKey } : {},
+    custom: {
+      base_url: draft.custom_base_url.trim() || null,
+      model: draft.custom_model.trim() || null,
+      ...(customApiKey ? { api_key: customApiKey } : {}),
+    },
+  };
+}
+
+function onlineAsrApiKeyValue(draft: OnlineAsrDraft): string {
+  return {
+    none: "",
+    openai: draft.openai_api_key,
+    groq: draft.groq_api_key,
+    xai: draft.xai_api_key,
+    custom: draft.custom_api_key,
+  }[draft.provider];
+}
+
+function onlineAsrApiKeyPreview(draft: OnlineAsrDraft): string | null {
+  return {
+    none: null,
+    openai: draft.openai_api_key_preview,
+    groq: draft.groq_api_key_preview,
+    xai: draft.xai_api_key_preview,
+    custom: draft.custom_api_key_preview,
+  }[draft.provider];
+}
+
+function onlineAsrApiKeyUpdate(provider: OnlineAsrProvider, value: string): Partial<OnlineAsrDraft> {
+  return {
+    none: {},
+    openai: { openai_api_key: value },
+    groq: { groq_api_key: value },
+    xai: { xai_api_key: value },
+    custom: { custom_api_key: value },
+  }[provider];
 }
 
 function searchDraftToConfig(draft: AsrSearchDraft): AsrCorrectionSearchConfig {

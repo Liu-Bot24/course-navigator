@@ -3,11 +3,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   extractCourse,
+  getOnlineAsrSettings,
   getModelSettings,
   getStudyJob,
   listItems,
   previewCourse,
+  saveOnlineAsrSettings,
   saveModelSettings,
+  saveTranscript,
+  startExtractJob,
   startDownloadJob,
   updateCourseItem,
 } from "./api";
@@ -40,6 +44,13 @@ vi.mock("./api", () => ({
     study_detail_level: "faithful",
     task_parameters: {},
   }),
+  getOnlineAsrSettings: vi.fn().mockResolvedValue({
+    provider: "xai",
+    openai: { has_api_key: false, api_key_preview: null },
+    groq: { has_api_key: true, api_key_preview: "gsk...test" },
+    xai: { has_api_key: true, api_key_preview: "xai...test" },
+    custom: { base_url: null, model: null, has_api_key: false, api_key_preview: null },
+  }),
   getStudyJob: vi.fn(),
   getAsrCorrectionResult: vi.fn(),
   importCoursePackage: vi.fn(),
@@ -47,8 +58,16 @@ vi.mock("./api", () => ({
   listAvailableModels: vi.fn(),
   listItems: vi.fn().mockResolvedValue([]),
   saveModelSettings: vi.fn(),
+  saveOnlineAsrSettings: vi.fn().mockResolvedValue({
+    provider: "xai",
+    openai: { has_api_key: false, api_key_preview: null },
+    groq: { has_api_key: true, api_key_preview: "gsk...test" },
+    xai: { has_api_key: true, api_key_preview: "xai...test" },
+    custom: { base_url: null, model: null, has_api_key: false, api_key_preview: null },
+  }),
   saveTranscript: vi.fn(),
   startAsrCorrectionJob: vi.fn(),
+  startExtractJob: vi.fn(),
   startDownloadJob: vi.fn(),
   startStudyJob: vi.fn(),
   startTranslationJob: vi.fn(),
@@ -97,6 +116,44 @@ describe("App language defaults", () => {
     expect(screen.getByRole("button", { name: "解读" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "详解" })).toBeTruthy();
     expect(screen.queryByPlaceholderText("en")).toBeNull();
+  });
+
+  it("imports local subtitle files from the subtitle source menu", async () => {
+    const item = {
+      id: "local-upload-course",
+      source_url: "https://example.com/video",
+      title: "Local upload demo",
+      duration: 10,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    const parsedTranscript = [{ start: 1, end: 3.5, text: "Hello world" }];
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveTranscript).mockResolvedValueOnce({ ...item, transcript: parsedTranscript });
+
+    render(<App />);
+
+    expect((await screen.findAllByText("Local upload demo")).length).toBeGreaterThan(0);
+
+    const sourceSelect = screen.getByRole("combobox", { name: "字幕来源" }) as HTMLSelectElement;
+    fireEvent.change(sourceSelect, { target: { value: "local_upload" } });
+    const file = new File(["1\n00:00:01,000 --> 00:00:03,500\nHello world"], "demo.srt", { type: "text/plain" });
+    Object.defineProperty(file, "text", {
+      value: vi.fn().mockResolvedValue("1\n00:00:01,000 --> 00:00:03,500\nHello world"),
+    });
+    fireEvent.change(screen.getByLabelText("上传字幕文件"), {
+      target: {
+        files: [file],
+      },
+    });
+
+    await waitFor(() => {
+      expect(saveTranscript).toHaveBeenCalledWith("local-upload-course", parsedTranscript);
+    });
+    expect(sourceSelect.value).toBe("local_upload");
   });
 
   it("does not embed Bilibili by default and offers force streaming", async () => {
@@ -424,6 +481,54 @@ describe("App language defaults", () => {
     expect(screen.getByText("任务策略覆盖")).toBeTruthy();
     expect(screen.getByText("上下文窗口上限（选填）")).toBeTruthy();
     expect(screen.getByText("最大输出上限（选填）")).toBeTruthy();
+  });
+
+  it("configures online ASR presets from the main settings dialog", async () => {
+    vi.mocked(saveModelSettings).mockResolvedValueOnce({
+      profiles: [
+        {
+          id: "default",
+          name: "Primary Chat Model",
+          provider_type: "openai",
+          base_url: "https://api.primary.example/v1",
+          model: "provider/primary-chat",
+          context_window: null,
+          max_tokens: null,
+          has_api_key: true,
+          api_key_preview: "sk...test",
+        },
+      ],
+      translation_model_id: "default",
+      learning_model_id: "default",
+      global_model_id: "default",
+      asr_model_id: "default",
+      study_detail_level: "faithful",
+      task_parameters: {},
+    });
+    vi.mocked(saveOnlineAsrSettings).mockResolvedValueOnce({
+      provider: "xai",
+      openai: { has_api_key: false, api_key_preview: null },
+      groq: { has_api_key: true, api_key_preview: "gsk...test" },
+      xai: { has_api_key: true, api_key_preview: "xai...test" },
+      custom: { base_url: null, model: null, has_api_key: false, api_key_preview: null },
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "模型设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: /在线 ASR/ }));
+    fireEvent.change(screen.getByLabelText("在线 ASR 服务"), { target: { value: "xai" } });
+    fireEvent.change(await screen.findByLabelText("在线 ASR API Key"), { target: { value: "xai-new-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存档案" }));
+
+    await waitFor(() => {
+      expect(saveOnlineAsrSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: "xai",
+          xai: { api_key: "xai-new-key" },
+        }),
+      );
+    });
   });
 
   it("auto-saves model slot changes without saving the profile draft", async () => {

@@ -9,7 +9,8 @@ JobStatusValue = Literal["queued", "running", "succeeded", "failed"]
 StudySection = Literal["all", "guide", "outline", "detailed", "high"]
 ModelProviderType = Literal["openai", "anthropic"]
 StudyDetailLevel = Literal["fast", "standard", "detailed", "faithful"]
-TranscriptSource = Literal["subtitles", "asr", "imported"]
+TranscriptSource = Literal["subtitles", "asr", "online_asr", "imported"]
+OnlineAsrProvider = Literal["none", "openai", "groq", "xai", "custom"]
 TaskParameterKey = Literal[
     "title_translation",
     "subtitle_translation",
@@ -160,6 +161,44 @@ class AsrSearchSettingsUpdate(BaseModel):
     result_limit: int | None = Field(default=None, ge=1, le=10)
     tavily: AsrSearchServiceSettingsUpdate | None = None
     firecrawl: AsrSearchServiceSettingsUpdate | None = None
+
+
+class OnlineAsrServiceSettingsResponse(BaseModel):
+    api_key_preview: str | None = None
+    has_api_key: bool = False
+
+
+class OnlineAsrCustomSettingsResponse(BaseModel):
+    base_url: str | None = None
+    model: str | None = None
+    api_key_preview: str | None = None
+    has_api_key: bool = False
+
+
+class OnlineAsrSettingsResponse(BaseModel):
+    provider: OnlineAsrProvider = "none"
+    openai: OnlineAsrServiceSettingsResponse = Field(default_factory=OnlineAsrServiceSettingsResponse)
+    groq: OnlineAsrServiceSettingsResponse = Field(default_factory=OnlineAsrServiceSettingsResponse)
+    xai: OnlineAsrServiceSettingsResponse = Field(default_factory=OnlineAsrServiceSettingsResponse)
+    custom: OnlineAsrCustomSettingsResponse = Field(default_factory=OnlineAsrCustomSettingsResponse)
+
+
+class OnlineAsrServiceSettingsUpdate(BaseModel):
+    api_key: str | None = None
+
+
+class OnlineAsrCustomSettingsUpdate(BaseModel):
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+
+
+class OnlineAsrSettingsUpdate(BaseModel):
+    provider: OnlineAsrProvider | None = None
+    openai: OnlineAsrServiceSettingsUpdate | None = None
+    groq: OnlineAsrServiceSettingsUpdate | None = None
+    xai: OnlineAsrServiceSettingsUpdate | None = None
+    custom: OnlineAsrCustomSettingsUpdate | None = None
 
 
 class AsrCorrectionRequest(BaseModel):

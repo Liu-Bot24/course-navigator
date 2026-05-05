@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urljoin
@@ -11,6 +12,11 @@ from urllib.request import Request, urlopen
 
 from .models import DownloadRequest, ExtractRequest, TranscriptSegment, VideoMetadata
 from .subtitles import parse_subtitle_text
+
+try:
+    from opencc import OpenCC
+except ImportError:  # pragma: no cover - dependency is declared, this keeps manual installs readable.
+    OpenCC = None  # type: ignore[assignment]
 
 
 class YtDlpError(RuntimeError):
@@ -180,8 +186,16 @@ class YtDlpRunner:
             raise YtDlpError("yt-dlp did not produce a video file")
         return max(candidates, key=lambda path: path.stat().st_mtime)
 
-    def extract_asr(self, request: ExtractRequest, target_dir: Path, item_id: str) -> list[TranscriptSegment]:
+    def extract_asr(
+        self,
+        request: ExtractRequest,
+        target_dir: Path,
+        item_id: str,
+        progress: Callable[[int, str], None] | None = None,
+    ) -> list[TranscriptSegment]:
         target_dir.mkdir(parents=True, exist_ok=True)
+        if progress:
+            progress(3, "正在准备本地 ASR 音频")
         audio_template = str(target_dir / f"{item_id}.%(ext)s")
         audio_cmd = [
             self.binary,
@@ -196,6 +210,8 @@ class YtDlpRunner:
         audio_result = subprocess.run(audio_cmd, capture_output=True, text=True, check=False)
         if audio_result.returncode != 0:
             raise YtDlpError(_friendly_error(audio_result.stderr.strip(), request, "yt-dlp audio extraction failed"))
+        if progress:
+            progress(32, "音频已抽取，正在启动本地 ASR")
 
         audio_file = _find_newest_audio(target_dir, item_id)
         if not audio_file:
@@ -217,18 +233,33 @@ class YtDlpRunner:
             str(target_dir),
         ]
         if request.language and request.language != "auto":
-            asr_cmd.extend(["--language", request.language])
-        asr_result = subprocess.run(asr_cmd, capture_output=True, text=True, check=False)
-        if asr_result.returncode != 0:
-            raise YtDlpError(asr_result.stderr.strip() or "Local ASR failed")
+            asr_cmd.extend(["--language", _whisper_language(request.language)])
+        if progress:
+            progress(40, "本地 ASR 正在转写音频")
+        asr_process = subprocess.Popen(asr_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        started_at = time.monotonic()
+        stdout = ""
+        stderr = ""
+        while True:
+            try:
+                stdout, stderr = asr_process.communicate(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                if progress:
+                    elapsed = time.monotonic() - started_at
+                    progress(min(88, 40 + int(elapsed * 1.8)), f"本地 ASR 正在转写音频，已用时 {int(elapsed)}s")
+        if asr_process.returncode != 0:
+            raise YtDlpError(stderr.strip() or stdout.strip() or "Local ASR failed")
+        if progress:
+            progress(92, "本地 ASR 已生成字幕，正在整理文本")
 
         subtitle_file = _find_newest_subtitle(target_dir)
         if not subtitle_file:
             raise YtDlpError("Local ASR did not produce a subtitle file")
-        return parse_subtitle_text(
+        return _simplify_chinese_segments(parse_subtitle_text(
             subtitle_file.read_text(encoding="utf-8", errors="replace"),
             subtitle_file.suffix.lstrip("."),
-        )
+        ))
 
 
 def choose_source_subtitle_language(metadata: VideoMetadata | None, requested: str = "auto") -> str:
@@ -511,6 +542,28 @@ def _find_newest_audio(target_dir: Path, item_id: str) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _whisper_language(language: str) -> str:
+    return {
+        "zh": "Chinese",
+        "zh-CN": "Chinese",
+        "zh-Hans": "Chinese",
+        "zh-Hant": "Chinese",
+        "zh-TW": "Chinese",
+    }.get(language, language)
+
+
+def _simplify_chinese_segments(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    if not segments:
+        return segments
+    converter = OpenCC("t2s") if OpenCC else None
+    if not converter:
+        return segments
+    return [
+        TranscriptSegment(start=segment.start, end=segment.end, text=converter.convert(segment.text))
+        for segment in segments
+    ]
 
 
 def _friendly_error(

@@ -38,7 +38,8 @@ export type StudyMaterial = {
 export type UiLanguage = "zh-CN" | "en";
 
 export type OutputLanguage = "zh-CN" | "en" | "ja";
-export type TranscriptSource = "subtitles" | "asr" | "imported";
+export type TranscriptSource = "subtitles" | "asr" | "online_asr" | "imported";
+export type OnlineAsrProvider = "none" | "openai" | "groq" | "xai" | "custom";
 export type StudySection = "all" | "guide" | "outline" | "detailed" | "high";
 export type ModelProviderType = "openai" | "anthropic";
 export type StudyDetailLevel = "fast" | "standard" | "detailed" | "faithful";
@@ -149,6 +150,41 @@ export type AsrSearchSettingsInput = {
   result_limit?: number;
   tavily?: AsrSearchServiceSettingsInput;
   firecrawl?: AsrSearchServiceSettingsInput;
+};
+
+export type OnlineAsrServiceSettings = {
+  has_api_key: boolean;
+  api_key_preview: string | null;
+};
+
+export type OnlineAsrCustomSettings = OnlineAsrServiceSettings & {
+  base_url?: string | null;
+  model?: string | null;
+};
+
+export type OnlineAsrSettings = {
+  provider: OnlineAsrProvider;
+  openai: OnlineAsrServiceSettings;
+  groq: OnlineAsrServiceSettings;
+  xai: OnlineAsrServiceSettings;
+  custom: OnlineAsrCustomSettings;
+};
+
+export type OnlineAsrServiceSettingsInput = {
+  api_key?: string;
+};
+
+export type OnlineAsrCustomSettingsInput = OnlineAsrServiceSettingsInput & {
+  base_url?: string | null;
+  model?: string | null;
+};
+
+export type OnlineAsrSettingsInput = {
+  provider?: OnlineAsrProvider;
+  openai?: OnlineAsrServiceSettingsInput;
+  groq?: OnlineAsrServiceSettingsInput;
+  xai?: OnlineAsrServiceSettingsInput;
+  custom?: OnlineAsrCustomSettingsInput;
 };
 
 export type AsrCorrectionSource = "model" | "search";

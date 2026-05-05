@@ -4,7 +4,14 @@ from pathlib import Path
 import pytest
 import course_navigator.ytdlp as ytdlp_module
 
+from course_navigator.config import OnlineAsrServiceConfig, OnlineAsrSettings
 from course_navigator.models import DownloadRequest, ExtractRequest, VideoMetadata
+from course_navigator.online_asr import (
+    _audio_chunks,
+    _segments_from_payload,
+    _transcribe_chunk,
+    extract_online_asr_transcript,
+)
 from course_navigator.ytdlp import (
     YtDlpError,
     YtDlpRunner,
@@ -421,6 +428,200 @@ def test_download_video_explains_missing_ffmpeg(monkeypatch, tmp_path):
 
     with pytest.raises(YtDlpError, match="缺少 ffmpeg"):
         runner.download_video(request, tmp_path, "abc")
+
+
+def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        if "--extract-audio" in cmd:
+            Path(tmp_path, "abc.wav").write_text("audio", encoding="utf-8")
+        return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, cmd, stdout, stderr, text):
+            calls.append(cmd)
+            Path(tmp_path, "abc.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n這是一個測試\n",
+                encoding="utf-8",
+            )
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/whisper" if name == "whisper" else None)
+    runner = YtDlpRunner(binary="yt-dlp")
+    progress: list[int] = []
+
+    result = runner.extract_asr(
+        ExtractRequest(url="https://www.youtube.com/watch?v=abc", subtitle_source="asr"),
+        tmp_path,
+        "abc",
+        progress=lambda value, _message: progress.append(value),
+    )
+
+    assert result[0].text == "这是一个测试"
+    assert progress[0] == 3
+    assert max(progress) >= 90
+
+
+def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        if "--extract-audio" in cmd:
+            (tmp_path / "abc.online-source.wav").write_text("audio", encoding="utf-8")
+        elif cmd[0] == "ffmpeg":
+            Path(cmd[-1]).write_bytes(b"mp3")
+        return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr(
+        "course_navigator.online_asr._transcribe_chunk",
+        lambda provider, service, audio_path, language: {
+            "segments": [{"start": 0.0, "end": 1.5, "text": "online transcript"}]
+        },
+    )
+
+    result = extract_online_asr_transcript(
+        ExtractRequest(url="https://www.youtube.com/watch?v=abc", subtitle_source="online_asr"),
+        tmp_path,
+        "abc",
+        "yt-dlp",
+        OnlineAsrSettings(provider="xai", xai={"api_key": "xai-test"}),
+    )
+
+    ffmpeg_cmd = next(cmd for cmd in calls if cmd[0] == "ffmpeg")
+    assert "-b:a" in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-b:a") + 1] == "64k"
+    assert result[0].text == "online transcript"
+
+
+def test_online_asr_turns_provider_http_errors_into_user_errors(monkeypatch, tmp_path):
+    audio = tmp_path / "sample.mp3"
+    audio.write_bytes(b"mp3")
+
+    class FakeResponse:
+        status_code = 401
+        headers = {"content-type": "application/json"}
+        text = '{"error":{"message":"bad auth"}}'
+
+        def json(self):
+            return {"error": {"message": "bad auth"}}
+
+    monkeypatch.setattr("httpx.post", lambda *args, **kwargs: FakeResponse())
+
+    with pytest.raises(YtDlpError, match="HTTP 401.*bad auth"):
+        _transcribe_chunk("openai", OnlineAsrServiceConfig(api_key="secret"), audio, "zh-CN")
+
+
+def test_xai_online_asr_omits_format_when_language_is_auto(monkeypatch, tmp_path):
+    audio = tmp_path / "sample.mp3"
+    audio.write_bytes(b"mp3")
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = "{}"
+
+        def json(self):
+            return {"words": [{"word": "hello", "start": 0, "end": 0.5}]}
+
+    def fake_post(endpoint, headers, data, files, timeout):
+        captured["endpoint"] = endpoint
+        captured["data"] = dict(data)
+        return FakeResponse()
+
+    monkeypatch.setattr("httpx.post", fake_post)
+
+    payload = _transcribe_chunk("xai", OnlineAsrServiceConfig(api_key="secret"), audio, "auto")
+
+    assert payload == {"words": [{"word": "hello", "start": 0, "end": 0.5}]}
+    assert captured["endpoint"] == "https://api.x.ai/v1/stt"
+    assert "format" not in captured["data"]
+    assert "language" not in captured["data"]
+
+
+def test_xai_online_asr_uses_format_only_for_supported_language(monkeypatch, tmp_path):
+    audio = tmp_path / "sample.mp3"
+    audio.write_bytes(b"mp3")
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = "{}"
+
+        def json(self):
+            return {"words": [{"word": "hello", "start": 0, "end": 0.5}]}
+
+    def fake_post(endpoint, headers, data, files, timeout):
+        calls.append(dict(data))
+        return FakeResponse()
+
+    monkeypatch.setattr("httpx.post", fake_post)
+
+    _transcribe_chunk("xai", OnlineAsrServiceConfig(api_key="secret"), audio, "en")
+    _transcribe_chunk("xai", OnlineAsrServiceConfig(api_key="secret"), audio, "zh-CN")
+
+    assert calls[0]["language"] == "en"
+    assert calls[0]["format"] == "true"
+    assert "language" not in calls[1]
+    assert "format" not in calls[1]
+
+
+def test_online_asr_splits_large_compressed_audio(monkeypatch, tmp_path):
+    audio = tmp_path / "lesson.mp3"
+    audio.write_bytes(b"0" * 101)
+    chunks_created = []
+
+    def fake_duration(path):
+        return 120.0
+
+    def fake_run(cmd, capture_output, text, check):
+        chunk_path = Path(cmd[-1])
+        chunk_path.write_bytes(b"chunk")
+        chunks_created.append(chunk_path)
+        return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    monkeypatch.setattr("course_navigator.online_asr._audio_duration", fake_duration)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    chunks = _audio_chunks(audio, "lesson", tmp_path, limit_bytes=50)
+
+    assert len(chunks) == 3
+    assert chunks[0][1] == 0.0
+    assert chunks[1][1] < 40.1
+    assert all(path.exists() for path in chunks_created)
+
+
+def test_online_asr_parses_segment_and_word_timestamp_payloads():
+    segment_result = _segments_from_payload(
+        {"segments": [{"start": 1.0, "end": 2.0, "text": "Segment text"}]},
+        offset=10,
+    )
+    word_result = _segments_from_payload(
+        {
+            "words": [
+                {"word": "你", "start": 0.0, "end": 0.2},
+                {"word": "好", "start": 0.2, "end": 0.4},
+            ]
+        },
+        offset=3,
+    )
+
+    assert segment_result[0].start == 11
+    assert segment_result[0].text == "Segment text"
+    assert word_result[0].start == 3
+    assert word_result[0].text == "你好"
 
 
 def test_find_newest_subtitle_handles_removed_directory(tmp_path):

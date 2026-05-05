@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -20,7 +21,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .ai import _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
 from .asr import suggest_asr_corrections
-from .config import AsrSearchServiceConfig, AsrSearchSettings, ModelProfileConfig, Settings, load_settings
+from .config import (
+    AsrSearchServiceConfig,
+    AsrSearchSettings,
+    ModelProfileConfig,
+    OnlineAsrServiceConfig,
+    OnlineAsrSettings,
+    Settings,
+    load_settings,
+)
 from .library import CourseLibrary
 from .models import (
     CourseItem,
@@ -43,12 +52,18 @@ from .models import (
     ModelSettingsResponse,
     ModelSettingsUpdate,
     ModelProfileResponse,
+    OnlineAsrCustomSettingsResponse,
+    OnlineAsrProvider,
+    OnlineAsrServiceSettingsResponse,
+    OnlineAsrSettingsResponse,
+    OnlineAsrSettingsUpdate,
     StudyJobStatus,
     StudyMaterial,
     StudyRequest,
     TranscriptSegment,
     TranscriptUpdateRequest,
 )
+from .online_asr import extract_online_asr_transcript
 from .ytdlp import YtDlpError, YtDlpRunner, is_subtitle_unavailable_error
 
 logger = logging.getLogger("course_navigator.app")
@@ -73,12 +88,14 @@ def create_app(
     deleted_items_lock = Lock()
     study_executor = ThreadPoolExecutor(max_workers=2)
     download_executor = ThreadPoolExecutor(max_workers=1)
+    extract_executor = ThreadPoolExecutor(max_workers=1)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
         study_executor.shutdown(wait=False, cancel_futures=True)
         download_executor.shutdown(wait=False, cancel_futures=True)
+        extract_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Course Navigator", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
@@ -181,18 +198,30 @@ def create_app(
     @app.post("/api/extract")
     def extract(request: ExtractRequest) -> CourseItem:
         try:
-            metadata = ytdlp_runner.fetch_metadata(request)
-            item_id = _safe_item_id(metadata.id)
-            transcript_dir = active_data_dir / "subtitles" / item_id
-            transcript, transcript_source = _extract_transcript_with_source(
-                ytdlp_runner,
-                request,
-                transcript_dir,
-                item_id,
-                metadata,
-            )
+            return _extract_and_save_course(request)
         except (ValueError, YtDlpError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _extract_and_save_course(
+        request: ExtractRequest,
+        progress: Callable[[str, int, str], None] | None = None,
+    ) -> CourseItem:
+        if progress:
+            progress("metadata", 3, "正在读取视频信息")
+        metadata = ytdlp_runner.fetch_metadata(request)
+        item_id = _safe_item_id(metadata.id)
+        if progress:
+            progress("metadata", 8, "已读取视频信息，正在准备字幕")
+        transcript_dir = active_data_dir / "subtitles" / item_id
+        transcript, transcript_source = _extract_transcript_with_source(
+            ytdlp_runner,
+            request,
+            transcript_dir,
+            item_id,
+            metadata,
+            settings_state["value"],
+            progress=progress,
+        )
 
         existing = library.get(item_id)
         keep_existing_study = bool(existing and _same_transcript(existing.transcript, transcript))
@@ -218,6 +247,8 @@ def create_app(
             study=existing.study if keep_existing_study else None,
             local_video_path=existing.local_video_path if existing else None,
         )
+        if progress:
+            progress("saving", 96, "正在保存字幕")
         with deleted_items_lock:
             deleted_items.discard(item.id)
         library.save(item)
@@ -411,6 +442,25 @@ def create_app(
         download_executor.submit(_run_download_job, job_id, item_id, request)
         return job
 
+    @app.post("/api/extract-jobs")
+    def create_extract_job(request: ExtractRequest) -> StudyJobStatus:
+        job_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        job = StudyJobStatus(
+            job_id=job_id,
+            item_id="",
+            status="queued",
+            progress=0,
+            phase="queued",
+            message="已加入字幕提取队列",
+            started_at=now,
+            updated_at=now,
+        )
+        with jobs_lock:
+            jobs[job_id] = job
+        extract_executor.submit(_run_extract_job, job_id, request)
+        return job
+
     @app.post("/api/items/{item_id}/asr-correction-jobs")
     def create_asr_correction_job(item_id: str, request: AsrCorrectionRequest | None = None) -> StudyJobStatus:
         item = library.get(item_id)
@@ -477,6 +527,20 @@ def create_app(
         if env_path:
             _write_model_env(env_path, next_settings)
         return _asr_search_settings_response(next_settings)
+
+    @app.get("/api/settings/online-asr")
+    def get_online_asr_settings() -> OnlineAsrSettingsResponse:
+        return _online_asr_settings_response(settings_state["value"])
+
+    @app.put("/api/settings/online-asr")
+    def update_online_asr_settings(request: OnlineAsrSettingsUpdate) -> OnlineAsrSettingsResponse:
+        current = settings_state["value"]
+        next_online_asr = _updated_online_asr_settings(current.online_asr, request)
+        next_settings = current.model_copy(update={"online_asr": next_online_asr})
+        settings_state["value"] = next_settings
+        if env_path:
+            _write_model_env(env_path, next_settings)
+        return _online_asr_settings_response(next_settings)
 
     @app.put("/api/settings/model")
     def update_model_settings(request: ModelSettingsUpdate) -> ModelSettingsResponse:
@@ -611,6 +675,45 @@ def create_app(
             next_job = job.model_copy(update=updates)
             jobs[job_id] = next_job
             return next_job
+
+    def _run_extract_job(job_id: str, request: ExtractRequest) -> None:
+        _set_job(
+            job_id,
+            status="running",
+            progress=1,
+            phase="preparing",
+            message="正在启动字幕提取",
+        )
+
+        def update_progress(phase: str, progress: int, message: str) -> None:
+            _set_job(
+                job_id,
+                status="running",
+                progress=max(1, min(99, progress)),
+                phase=phase,
+                message=message,
+            )
+
+        try:
+            item = _extract_and_save_course(request, progress=update_progress)
+            _set_job(
+                job_id,
+                item_id=item.id,
+                status="succeeded",
+                progress=100,
+                phase="complete",
+                message="字幕已提取",
+            )
+        except Exception as exc:
+            logger.exception("Extract job failed: job_id=%s url=%s", job_id, request.url)
+            _set_job(
+                job_id,
+                status="failed",
+                progress=100,
+                phase="failed",
+                message="字幕提取失败",
+                error=str(exc),
+            )
 
     def _run_study_job(job_id: str, item_id: str, output_language: str, section: str) -> None:
         _set_job(
@@ -1082,12 +1185,21 @@ def _extract_transcript_with_source(
     transcript_dir: Path,
     item_id: str,
     metadata,
+    settings: Settings,
+    progress: Callable[[str, int, str], None] | None = None,
 ) -> tuple[list[TranscriptSegment], str | None]:
+    asr_request = _request_with_metadata_language(request, metadata)
     if request.subtitle_source == "asr":
-        return _extract_asr_transcript(runner, request, transcript_dir, item_id), "asr"
+        return _extract_asr_transcript(runner, asr_request, transcript_dir, item_id, progress), "asr"
+    if request.subtitle_source == "online_asr":
+        return _extract_online_asr_transcript(runner, asr_request, transcript_dir, item_id, settings, progress), "online_asr"
 
     try:
+        if progress:
+            progress("subtitles", 15, "正在下载站方字幕")
         transcript = runner.extract_subtitles(request, transcript_dir, metadata)
+        if progress:
+            progress("subtitles", 88, "站方字幕已下载")
         return transcript, "subtitles" if transcript else None
     except YtDlpError as exc:
         if not is_subtitle_unavailable_error(exc):
@@ -1096,10 +1208,19 @@ def _extract_transcript_with_source(
             raise YtDlpError("站方字幕存在，但当前访问方式没有下载到字幕；请使用浏览器模式或 cookies 重新提取。") from exc
 
     try:
-        transcript = _extract_asr_transcript(runner, request, transcript_dir, item_id)
+        transcript = _extract_asr_transcript(runner, asr_request, transcript_dir, item_id, progress)
     except YtDlpError:
         return [], None
     return transcript, "asr" if transcript else None
+
+
+def _request_with_metadata_language(request: ExtractRequest, metadata) -> ExtractRequest:
+    if request.language and request.language != "auto":
+        return request
+    metadata_language = getattr(metadata, "language", None)
+    if isinstance(metadata_language, str) and metadata_language.strip():
+        return request.model_copy(update={"language": metadata_language.strip()})
+    return request
 
 
 def _metadata_has_source_subtitles(metadata: VideoMetadata | None) -> bool:
@@ -1116,13 +1237,47 @@ def _extract_asr_transcript(
     request: ExtractRequest,
     transcript_dir: Path,
     item_id: str,
+    progress: Callable[[str, int, str], None] | None = None,
 ) -> list[TranscriptSegment]:
     extractor = getattr(runner, "extract_asr", None)
     if not callable(extractor):
         if request.subtitle_source == "asr":
             raise YtDlpError("当前提取器不支持本地 ASR")
         return []
+    if progress:
+        return extractor(
+            request,
+            transcript_dir,
+            item_id,
+            progress=lambda value, message: progress("asr", value, message),
+        )
     return extractor(request, transcript_dir, item_id)
+
+
+def _extract_online_asr_transcript(
+    runner: YtDlpRunner,
+    request: ExtractRequest,
+    transcript_dir: Path,
+    item_id: str,
+    settings: Settings,
+    progress: Callable[[str, int, str], None] | None = None,
+) -> list[TranscriptSegment]:
+    if progress:
+        return extract_online_asr_transcript(
+            request,
+            transcript_dir,
+            item_id,
+            getattr(runner, "binary", "yt-dlp"),
+            settings.online_asr,
+            progress=lambda value, message: progress("online_asr", value, message),
+        )
+    return extract_online_asr_transcript(
+        request,
+        transcript_dir,
+        item_id,
+        getattr(runner, "binary", "yt-dlp"),
+        settings.online_asr,
+    )
 
 
 def _normalize_item_for_response(item: CourseItem) -> CourseItem:
@@ -1397,6 +1552,33 @@ def _asr_search_service_response(service: AsrSearchServiceConfig) -> AsrSearchSe
     )
 
 
+def _online_asr_settings_response(settings: Settings) -> OnlineAsrSettingsResponse:
+    online_asr = settings.online_asr
+    return OnlineAsrSettingsResponse(
+        provider=online_asr.provider,
+        openai=_online_asr_service_response(online_asr.openai),
+        groq=_online_asr_service_response(online_asr.groq),
+        xai=_online_asr_service_response(online_asr.xai),
+        custom=_online_asr_custom_response(online_asr.custom),
+    )
+
+
+def _online_asr_service_response(service: OnlineAsrServiceConfig) -> OnlineAsrServiceSettingsResponse:
+    return OnlineAsrServiceSettingsResponse(
+        has_api_key=bool(service.api_key),
+        api_key_preview=_preview_key(service.api_key),
+    )
+
+
+def _online_asr_custom_response(service: OnlineAsrServiceConfig) -> OnlineAsrCustomSettingsResponse:
+    return OnlineAsrCustomSettingsResponse(
+        base_url=service.base_url,
+        model=service.model,
+        has_api_key=bool(service.api_key),
+        api_key_preview=_preview_key(service.api_key),
+    )
+
+
 def _updated_asr_search_settings(current: AsrSearchSettings, request: AsrSearchSettingsUpdate) -> AsrSearchSettings:
     provider = request.provider if "provider" in request.model_fields_set and request.provider else current.provider
     result_limit = request.result_limit if "result_limit" in request.model_fields_set and request.result_limit else current.result_limit
@@ -1429,6 +1611,44 @@ def _updated_asr_search_service(
         if isinstance(raw_api_key, str) and raw_api_key.strip():
             api_key = raw_api_key.strip()
     return current.model_copy(update={"base_url": base_url, "api_key": api_key})
+
+
+def _updated_online_asr_settings(current: OnlineAsrSettings, request: OnlineAsrSettingsUpdate) -> OnlineAsrSettings:
+    provider = request.provider if "provider" in request.model_fields_set and request.provider is not None else current.provider
+    return current.model_copy(
+        update={
+            "provider": provider,
+            "openai": _updated_online_asr_service(current.openai, request.openai, keep_base=True),
+            "groq": _updated_online_asr_service(current.groq, request.groq, keep_base=True),
+            "xai": _updated_online_asr_service(current.xai, request.xai, keep_base=True),
+            "custom": _updated_online_asr_service(current.custom, request.custom, keep_base=False),
+        }
+    )
+
+
+def _updated_online_asr_service(
+    current: OnlineAsrServiceConfig,
+    request: object | None,
+    *,
+    keep_base: bool,
+) -> OnlineAsrServiceConfig:
+    if request is None:
+        return current
+    fields = getattr(request, "model_fields_set", set())
+    base_url = current.base_url
+    model = current.model
+    api_key = current.api_key
+    if not keep_base and "base_url" in fields:
+        raw_base_url = getattr(request, "base_url", None)
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) and raw_base_url.strip() else None
+    if not keep_base and "model" in fields:
+        raw_model = getattr(request, "model", None)
+        model = raw_model.strip() if isinstance(raw_model, str) and raw_model.strip() else None
+    if "api_key" in fields:
+        raw_api_key = getattr(request, "api_key", None)
+        if isinstance(raw_api_key, str) and raw_api_key.strip():
+            api_key = raw_api_key.strip()
+    return current.model_copy(update={"base_url": base_url, "model": model, "api_key": api_key})
 
 
 def _effective_asr_search_config(
@@ -1493,6 +1713,14 @@ def _write_model_env(path: Path, settings: Settings) -> None:
         "COURSE_NAVIGATOR_TAVILY_API_KEY": settings.asr_search.tavily.api_key or "",
         "COURSE_NAVIGATOR_FIRECRAWL_BASE_URL": settings.asr_search.firecrawl.base_url or "",
         "COURSE_NAVIGATOR_FIRECRAWL_API_KEY": settings.asr_search.firecrawl.api_key or "",
+        "COURSE_NAVIGATOR_ONLINE_ASR_PROVIDER": settings.online_asr.provider,
+        "COURSE_NAVIGATOR_OPENAI_ASR_API_KEY": settings.online_asr.openai.api_key or "",
+        "COURSE_NAVIGATOR_GROQ_ASR_API_KEY": settings.online_asr.groq.api_key or "",
+        "COURSE_NAVIGATOR_XAI_ASR_API_KEY": settings.online_asr.xai.api_key or "",
+        "COURSE_NAVIGATOR_XAI_ASR_MODEL": settings.online_asr.xai.model or "",
+        "COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL": settings.online_asr.custom.base_url or "",
+        "COURSE_NAVIGATOR_CUSTOM_ASR_MODEL": settings.online_asr.custom.model or "",
+        "COURSE_NAVIGATOR_CUSTOM_ASR_API_KEY": settings.online_asr.custom.api_key or "",
         "COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL": settings.study_detail_level,
         "COURSE_NAVIGATOR_TASK_PARAMETERS": json.dumps(task_parameters_payload, ensure_ascii=False),
     }
