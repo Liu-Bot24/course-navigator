@@ -519,6 +519,12 @@ def _friendly_error(
     fallback: str,
 ) -> str:
     message = stderr or fallback
+    if _looks_like_missing_ffmpeg(message):
+        return (
+            "缺少 ffmpeg，当前操作需要合并或转换媒体文件。"
+            "请安装 ffmpeg 后重试；字幕提取、字幕浏览和 AI 校正仍可继续使用。"
+            f"原始错误：{message}"
+        )
     if "Sign in to confirm" not in message:
         return message
     if request.mode == "browser":
@@ -539,4 +545,15 @@ def _friendly_error(
     return (
         "YouTube 要求登录验证。请在 Course Navigator 中把提取登录改为浏览器 Cookie "
         f"或 Cookies 文件后重试。原始错误：{message}"
+    )
+
+
+def _looks_like_missing_ffmpeg(message: str) -> bool:
+    normalized = message.lower()
+    return "ffmpeg" in normalized and (
+        "not found" in normalized
+        or "not installed" in normalized
+        or "please install" in normalized
+        or "install ffmpeg" in normalized
+        or "ffmpeg-location" in normalized
     )

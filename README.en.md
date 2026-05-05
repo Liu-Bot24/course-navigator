@@ -1,0 +1,175 @@
+# Course Navigator
+
+[中文说明](README.md)
+
+Course Navigator is a video course workspace that turns subtitles into a navigable study experience. Paste a supported video URL, extract subtitles, review the transcript beside the video, organize lessons into collections, and use AI to translate, analyze, and correct ASR text.
+
+It is built for learners, researchers, and course-heavy teams who need to understand long videos quickly, keep courses organized, and jump back to the right moment without scrubbing through hours of playback.
+
+## Highlights
+
+- Build a course library with collections, lesson titles, ordering, and local video cache controls.
+- Extract subtitles from supported video pages with `yt-dlp`.
+- Use direct access, browser login, or a cookies file for videos that require authentication.
+- Watch supported videos with clickable transcripts, bilingual subtitle views, and timestamp navigation.
+- Generate AI study material, including a guide, outline, interpretation, and detailed notes.
+- Regenerate the guide, outline, interpretation, or detailed notes independently when only one section needs updating.
+- Translate subtitles and titles.
+- Correct ASR subtitles in a dedicated review workbench with editable before/after views, hover review cards, confidence scores, accept/reject controls, confidence sorting, threshold batch acceptance, optional auto-save, and a second correction pass.
+- Add your own reference terms, names, product names, and common recognition errors before ASR correction.
+- Optionally validate ASR correction candidates with Tavily or Firecrawl.
+- Use one shared model profile library for translation, study generation, and ASR correction, with OpenAI-compatible and Anthropic formats.
+
+## Requirements
+
+- Node.js 20 or newer, with npm.
+- Python 3.11 or newer.
+- `uv` for Python dependency management.
+- `ffmpeg`, optional at startup but needed for local video cache, audio extraction, and media conversion.
+- `curl`, used by the start script to check service readiness.
+
+`yt-dlp` is installed with the Python project dependencies.
+
+The app can start without `ffmpeg`. If you use media cache or local audio workflows, install it with your system package manager, for example:
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu or Debian
+sudo apt install ffmpeg
+
+# Windows
+winget install Gyan.FFmpeg
+```
+
+## Quick Start
+
+```bash
+git clone https://github.com/Liu-Bot24/course-navigator.git
+cd course-navigator
+npm start
+```
+
+The start command installs dependencies, creates local settings when needed, starts the API, and starts the web app. If `ffmpeg` is missing, startup shows a warning and continues.
+
+Open:
+
+```text
+http://127.0.0.1:5173
+```
+
+Press `Ctrl+C` in the terminal to stop both services.
+
+## AI Setup
+
+Course Navigator can extract, browse, and manually edit subtitles without an AI model. AI translation, study generation, and ASR correction need at least one model profile.
+
+In the app settings, create a model profile, choose a provider format, enter the API address, model name, and API key, then assign profiles to the tasks you want to use:
+
+| Task | What it does |
+| --- | --- |
+| Subtitle model | Subtitle and title translation. |
+| Study model | Interpretation and detailed study text. |
+| Structure model | Context summaries, semantic blocks, guide, and outline. |
+| ASR correction model | ASR correction suggestions in the correction workbench. |
+
+Model profiles support:
+
+| Provider format | Typical API address |
+| --- | --- |
+| OpenAI compatible | `https://api.openai.com/v1` or another compatible endpoint |
+| Anthropic | `https://api.anthropic.com/v1` or a compatible Anthropic endpoint |
+
+The app also reads optional environment settings:
+
+| Setting | Controls | Default |
+| --- | --- | --- |
+| `COURSE_NAVIGATOR_DATA_DIR` | Local app data directory | `.course-navigator` |
+| `COURSE_NAVIGATOR_LLM_BASE_URL` | Optional single-profile API address | Empty |
+| `COURSE_NAVIGATOR_LLM_API_KEY` | Optional single-profile API key | Empty |
+| `COURSE_NAVIGATOR_LLM_MODEL` | Optional single-profile model name | Empty |
+| `COURSE_NAVIGATOR_ASR_SEARCH_ENABLED` | Enables search-assisted ASR correction | `false` |
+| `COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER` | Search provider for ASR validation | `tavily` |
+| `COURSE_NAVIGATOR_ASR_SEARCH_RESULT_LIMIT` | Search results per query | `5` |
+| `COURSE_NAVIGATOR_TAVILY_API_KEY` | Tavily API key | Empty |
+| `COURSE_NAVIGATOR_FIRECRAWL_BASE_URL` | Firecrawl API address | Empty |
+| `COURSE_NAVIGATOR_FIRECRAWL_API_KEY` | Firecrawl API key | Empty |
+
+The startup script supports custom local ports:
+
+| Setting | Controls | Default |
+| --- | --- | --- |
+| `COURSE_NAVIGATOR_API_HOST` | API host | `127.0.0.1` |
+| `COURSE_NAVIGATOR_API_PORT` | API port | `8000` |
+| `COURSE_NAVIGATOR_WEB_HOST` | Web app host | `127.0.0.1` |
+| `COURSE_NAVIGATOR_WEB_PORT` | Web app port | `5173` |
+
+## Video Access
+
+Course Navigator supports three extraction modes:
+
+| Mode | Use when |
+| --- | --- |
+| Normal | The video is public and can be accessed directly. |
+| Browser login | The video works in your browser and needs your logged-in session. |
+| Cookies file | You already have an exported cookies file for the site. |
+
+Supported sites, subtitle languages, and automatic captions depend on `yt-dlp` and the source platform.
+
+## Course Management
+
+The library can group videos into collections, edit course and collection names, adjust lesson order, copy source links, remove records, and manage local video caches. Collections are useful for playlists, lecture series, interviews, or any long-running learning project.
+
+## AI Study Material
+
+After subtitles are available, Course Navigator can generate study material in the selected output language:
+
+- Guide: prerequisites, prompts, review suggestions, and a quick orientation.
+- Outline: a navigable structure linked to video timestamps.
+- Interpretation: explanatory notes for the main learning blocks.
+- Detailed notes: a fuller text version for careful review.
+
+Each section can be regenerated independently, so you can refresh only the part that needs improvement.
+
+## ASR Correction
+
+The ASR correction workbench is designed for subtitles created by automatic speech recognition. It works with the same model profile library as the main workspace.
+
+You can:
+
+- edit the subtitle text directly,
+- add reference information for known terms, people, products, and common ASR mistakes,
+- generate targeted AI correction suggestions,
+- compare the original text and corrected preview side by side,
+- hover highlighted changes to see the reason, evidence, and accept/reject controls,
+- review all suggestions in the side panel,
+- sort by confidence,
+- accept all suggestions above a confidence threshold,
+- auto-save accepted suggestions when you enable that option,
+- run another AI correction pass after manual edits or accepted changes,
+- enable Tavily or Firecrawl search validation when a correction needs external evidence.
+
+Accepted changes can be saved back to the main video workspace so the corrected subtitles become the active transcript.
+
+## Manual Commands
+
+The one-command start is recommended. If you prefer separate terminals:
+
+```bash
+uv sync
+npm install
+npm run dev:api
+```
+
+Then in another terminal:
+
+```bash
+npm run dev
+```
+
+## Privacy And Data
+
+Course Navigator stores course records, generated study material, local settings, and cached media on your machine.
+
+When you use AI translation, study generation, or ASR correction, the relevant transcript text and context are sent to the model provider you configured. When search-assisted ASR correction is enabled, search queries are sent to the search provider you configured. Keep API keys on your own machine and use providers you trust.

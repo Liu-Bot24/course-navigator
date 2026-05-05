@@ -19,7 +19,8 @@ need_command() {
 
 warn_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    echo "Warning: $1 was not found. Some media cache or local ASR workflows may be unavailable." >&2
+    echo "Warning: $1 was not found." >&2
+    echo "Course Navigator will still start, but local video cache, audio extraction, and media conversion may fail until $1 is installed." >&2
   fi
 }
 

@@ -407,6 +407,22 @@ def test_download_video_reports_percentage_progress(monkeypatch, tmp_path):
     assert 95 in progress or 100 in progress
 
 
+def test_download_video_explains_missing_ffmpeg(monkeypatch, tmp_path):
+    class FakeProcess:
+        def __init__(self, cmd, stdout, stderr, text):
+            self.stdout = iter(["ERROR: ffmpeg not found. Please install or provide --ffmpeg-location\n"])
+
+        def wait(self):
+            return 1
+
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
+
+    with pytest.raises(YtDlpError, match="缺少 ffmpeg"):
+        runner.download_video(request, tmp_path, "abc")
+
+
 def test_find_newest_subtitle_handles_removed_directory(tmp_path):
     assert ytdlp_module._find_newest_subtitle(tmp_path / "removed") is None
 
