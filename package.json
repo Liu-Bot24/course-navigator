@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "start": "bash scripts/start.sh",
     "dev:api": "uv run uvicorn course_navigator.app:app --app-dir backend --host 127.0.0.1 --port 8000",
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
