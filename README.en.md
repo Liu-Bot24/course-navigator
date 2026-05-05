@@ -6,6 +6,10 @@ Course Navigator is a video course workspace that turns subtitles into a navigab
 
 It is built for learners, researchers, and course-heavy teams who need to understand long videos quickly, keep courses organized, and jump back to the right moment without scrubbing through hours of playback.
 
+## Interface Preview
+
+![Course Navigator video course workspace](docs/images/course-navigator-workspace.jpg)
+
 ## Highlights
 
 - Build a course library with collections, lesson titles, ordering, and local video cache controls.
@@ -96,6 +100,15 @@ The app also reads optional environment settings:
 | `COURSE_NAVIGATOR_FIRECRAWL_BASE_URL` | Firecrawl API address | Empty |
 | `COURSE_NAVIGATOR_FIRECRAWL_API_KEY` | Firecrawl API key | Empty |
 
+Firecrawl can use either the hosted service or a self-hosted service:
+
+| Mode | Firecrawl address | API key |
+| --- | --- | --- |
+| Hosted Firecrawl | `https://api.firecrawl.dev` | Use the API key from the Firecrawl dashboard |
+| Self-hosted Firecrawl | Your Firecrawl service address, for example `http://192.168.1.10:3002` | Fill this in if your self-hosted service requires authentication; otherwise leave it empty |
+
+You can enter the service root URL. Course Navigator uses the `/v1/search` endpoint for search requests, so `https://api.firecrawl.dev` becomes `https://api.firecrawl.dev/v1/search`.
+
 The startup script supports custom local ports:
 
 | Setting | Controls | Default |
@@ -136,6 +149,8 @@ Each section can be regenerated independently, so you can refresh only the part 
 
 The ASR correction workbench is designed for subtitles created by automatic speech recognition. It works with the same model profile library as the main workspace.
 
+![ASR correction workbench](docs/images/course-navigator-asr-correction.jpg)
+
 You can:
 
 - edit the subtitle text directly,
@@ -148,7 +163,7 @@ You can:
 - accept all suggestions above a confidence threshold,
 - auto-save accepted suggestions when you enable that option,
 - run another AI correction pass after manual edits or accepted changes,
-- enable Tavily or Firecrawl search validation when a correction needs external evidence.
+- enable Tavily, hosted Firecrawl, or self-hosted Firecrawl search validation when a correction needs external evidence.
 
 Accepted changes can be saved back to the main video workspace so the corrected subtitles become the active transcript.
 
