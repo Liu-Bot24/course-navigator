@@ -141,7 +141,7 @@ def test_long_transcript_provider_path_builds_layered_study_material(monkeypatch
     ]
 
 
-def test_anthropic_provider_base_url_adds_v1_for_minimax_compatible_endpoint(monkeypatch):
+def test_anthropic_provider_base_url_adds_v1_for_official_endpoint(monkeypatch):
     captured = {}
 
     class Response:
@@ -162,9 +162,9 @@ def test_anthropic_provider_base_url_adds_v1_for_minimax_compatible_endpoint(mon
 
     text = _chat_text(
         LlmProvider(
-            base_url="https://api.minimaxi.com/anthropic",
+            base_url="https://api.anthropic.com",
             api_key="sk-test",
-            model="MiniMax-M2.7",
+            model="LongContext-M2",
             provider_type="anthropic",
         ),
         [{"role": "system", "content": "Reply briefly."}, {"role": "user", "content": "Health check"}],
@@ -174,7 +174,7 @@ def test_anthropic_provider_base_url_adds_v1_for_minimax_compatible_endpoint(mon
     )
 
     assert text == "ok"
-    assert captured["url"] == "https://api.minimaxi.com/anthropic/v1/messages"
+    assert captured["url"] == "https://api.anthropic.com/v1/messages"
     assert captured["headers"]["x-api-key"] == "sk-test"
     assert captured["headers"]["anthropic-version"] == "2023-06-01"
 

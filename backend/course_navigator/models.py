@@ -9,7 +9,7 @@ JobStatusValue = Literal["queued", "running", "succeeded", "failed"]
 StudySection = Literal["all", "guide", "outline", "detailed", "high"]
 ModelProviderType = Literal["openai", "anthropic"]
 StudyDetailLevel = Literal["fast", "standard", "detailed", "faithful"]
-TranscriptSource = Literal["subtitles", "asr"]
+TranscriptSource = Literal["subtitles", "asr", "imported"]
 TaskParameterKey = Literal[
     "title_translation",
     "subtitle_translation",
@@ -273,6 +273,35 @@ class StudyMaterial(BaseModel):
     prerequisites: list[str] = Field(default_factory=list)
     thought_prompts: list[str] = Field(default_factory=list)
     review_suggestions: list[str] = Field(default_factory=list)
+
+
+class CourseShareItem(BaseModel):
+    id: str | None = Field(default=None, max_length=200)
+    source_url: str
+    title: str
+    custom_title: bool = False
+    collection_title: str | None = Field(default=None, max_length=200)
+    course_index: float | None = None
+    sort_order: float | None = None
+    duration: float | None = None
+    created_at: str | None = None
+    transcript: list[TranscriptSegment] = Field(default_factory=list)
+    transcript_source: TranscriptSource | None = None
+    metadata: VideoMetadata | None = None
+    study: StudyMaterial | None = None
+
+
+class CourseSharePackage(BaseModel):
+    format: Literal["course-navigator-share"] = "course-navigator-share"
+    version: int = 1
+    exported_at: str | None = None
+    message: str | None = Field(default=None, max_length=4000)
+    items: list[CourseShareItem]
+
+
+class CourseImportResponse(BaseModel):
+    items: list[CourseItem]
+    message: str | None = None
 
 
 CourseItem.model_rebuild()

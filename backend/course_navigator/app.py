@@ -24,7 +24,9 @@ from .config import AsrSearchServiceConfig, AsrSearchSettings, ModelProfileConfi
 from .library import CourseLibrary
 from .models import (
     CourseItem,
+    CourseImportResponse,
     CourseItemUpdate,
+    CourseSharePackage,
     AsrCorrectionRequest,
     AsrCorrectionResult,
     AsrCorrectionSearchConfig,
@@ -100,6 +102,41 @@ def create_app(
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
         return _normalize_item_for_response(item)
+
+    @app.post("/api/import")
+    def import_course_package(package: CourseSharePackage) -> CourseImportResponse:
+        if package.format != "course-navigator-share" or package.version != 1:
+            raise HTTPException(status_code=400, detail="Unsupported course package")
+        if not package.items:
+            raise HTTPException(status_code=400, detail="Course package is empty")
+        imported: list[CourseItem] = []
+        now = datetime.now(timezone.utc).isoformat()
+        for entry in package.items:
+            transcript = _validated_transcript(entry.transcript)
+            preferred_id = entry.id or (entry.metadata.id if entry.metadata else "") or entry.title or entry.source_url
+            item_id = _unique_import_item_id(library, preferred_id)
+            item = CourseItem(
+                id=item_id,
+                source_url=entry.source_url,
+                title=entry.title.strip() or (entry.metadata.title if entry.metadata else item_id),
+                custom_title=True,
+                collection_title=entry.collection_title.strip() if entry.collection_title else "",
+                course_index=entry.course_index,
+                sort_order=entry.sort_order,
+                duration=_best_duration(entry.duration, entry.metadata.duration if entry.metadata else None, _duration_from_transcript(transcript)),
+                created_at=entry.created_at or now,
+                transcript=transcript,
+                transcript_source="imported",
+                metadata=entry.metadata,
+                study=entry.study,
+                local_video_path=None,
+            )
+            library.save(item)
+            with deleted_items_lock:
+                deleted_items.discard(item.id)
+            imported.append(_normalize_item_for_response(item))
+        message = package.message.strip() if package.message else None
+        return CourseImportResponse(items=imported, message=message or None)
 
     @app.post("/api/preview")
     def preview(request: ExtractRequest) -> CourseItem:
@@ -805,6 +842,7 @@ def create_app(
                 message=message,
             )
 
+        video_path: Path | None = None
         try:
             item = library.get(item_id)
             if not item:
@@ -817,13 +855,18 @@ def create_app(
             )
             with deleted_items_lock:
                 if item_id in deleted_items:
+                    _delete_download_path(active_data_dir, video_path)
+                    _delete_download_files_for_item(active_data_dir, item_id)
                     raise ValueError("Course item was deleted")
             item = library.get(item_id)
             if not item:
+                _delete_download_path(active_data_dir, video_path)
                 raise ValueError("Course item not found")
             item.local_video_path = video_path
             library.save(item)
         except Exception as exc:
+            if video_path is not None:
+                _delete_download_path(active_data_dir, video_path)
             _set_job(
                 job_id,
                 status="failed",
@@ -916,6 +959,16 @@ def create_app(
 
 def _safe_item_id(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "_-" else "-" for ch in value) or "course"
+
+
+def _unique_import_item_id(library: CourseLibrary, preferred: str) -> str:
+    base = _safe_item_id(preferred).strip("-_") or "course"
+    candidates = [base, f"{base}-imported"]
+    candidates.extend(f"{base}-imported-{index}" for index in range(2, 10000))
+    for candidate in candidates:
+        if not library.get(candidate):
+            return candidate
+    return f"{base}-imported-{uuid4().hex[:8]}"
 
 
 def _same_transcript(left: list[TranscriptSegment], right: list[TranscriptSegment]) -> bool:
@@ -1269,6 +1322,7 @@ def _study_with_translation(
 
 def _delete_course_artifacts(data_dir: Path, item: CourseItem) -> None:
     _delete_local_video(data_dir, item)
+    _delete_download_files_for_item(data_dir, item.id)
     subtitle_dir = (data_dir / "subtitles" / item.id).resolve()
     subtitles_root = (data_dir / "subtitles").resolve()
     if subtitle_dir.exists() and subtitles_root in subtitle_dir.parents:
@@ -1278,10 +1332,24 @@ def _delete_course_artifacts(data_dir: Path, item: CourseItem) -> None:
 def _delete_local_video(data_dir: Path, item: CourseItem) -> None:
     if not item.local_video_path:
         return
-    video_path = Path(item.local_video_path).expanduser().resolve()
+    _delete_download_path(data_dir, Path(item.local_video_path))
+
+
+def _delete_download_path(data_dir: Path, path: Path) -> None:
+    video_path = path.expanduser().resolve()
     downloads_dir = (data_dir / "downloads").resolve()
     if video_path.exists() and downloads_dir in video_path.parents:
         video_path.unlink()
+
+
+def _delete_download_files_for_item(data_dir: Path, item_id: str) -> None:
+    downloads_dir = (data_dir / "downloads").resolve()
+    if not downloads_dir.exists():
+        return
+    prefix = f"{item_id}."
+    for path in downloads_dir.iterdir():
+        if path.is_file() and (path.name == item_id or path.name.startswith(prefix)):
+            _delete_download_path(data_dir, path)
 
 
 def _model_settings_response(settings: Settings) -> ModelSettingsResponse:

@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Callable
 from threading import Event, Thread
 from time import monotonic
@@ -26,6 +27,10 @@ DEFAULT_SCAN_CHUNKS = 5
 MAX_SCAN_CHUNKS = 12
 MAX_REVIEW_CANDIDATES_PER_CALL = 40
 ASR_MODEL_RESPONSE_TIMEOUT_SECONDS = 240
+SEARCH_QUERY_BUDGET_MIN = 6
+SEARCH_QUERY_BUDGET_MAX = 48
+SEARCH_RESULTS_PER_BACKGROUND_ITEM = 3
+SEARCH_BACKGROUND_MAX_CARDS = 24
 
 
 def suggest_asr_corrections(
@@ -56,13 +61,23 @@ def suggest_asr_corrections(
     if search_config.enabled:
         _report(progress, "search", 32, "正在搜索校验证据")
         evidence = _collect_search_evidence(candidates, search_config, progress)
-        _report(progress, "review", 68, "正在统一审核候选错误和搜索证据")
+        _report(progress, "background", 64, "正在归纳搜索背景信息")
+        background_cards = _synthesize_search_background_cards(
+            title,
+            candidates,
+            evidence,
+            provider,
+            context,
+            output_language,
+            progress,
+        )
+        _report(progress, "review", 68, "正在统一审核候选错误和搜索背景")
         raw_patches = _review_candidate_patches(
             title,
             transcript,
             provider,
             candidates,
-            evidence,
+            background_cards,
             context,
             output_language,
             progress,
@@ -145,29 +160,116 @@ def _collect_search_evidence(
     progress: ProgressCallback | None,
 ) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
-    planned_queries = [
-        (candidate, query)
+    query_plans = _search_query_plans(candidates)
+    if not query_plans:
+        return []
+    raw_query_count = sum(
+        len(_candidate_queries(candidate)) or (1 if _candidate_fallback_query(candidate) else 0)
         for candidate in candidates
-        for query in _candidate_queries(candidate)
-    ]
-    total_queries = max(1, len(planned_queries))
-    for query_index, (candidate, query) in enumerate(planned_queries, start=1):
-        _report(progress, "search", _scaled_progress(32, 64, query_index - 1, total_queries), f"正在搜索第 {query_index}/{total_queries} 个术语证据")
-        results = _search(query, config)
-        _report(progress, "search", _scaled_progress(32, 64, query_index, total_queries), f"已获取第 {query_index}/{total_queries} 个术语证据")
+    )
+    budget = _search_query_budget(len(candidates), len(query_plans))
+    selected_plans = query_plans[:budget]
+    _report(
+        progress,
+        "search",
+        32,
+        f"已将 {raw_query_count} 个候选查询归一化为 {len(query_plans)} 个唯一术语，准备搜索 {len(selected_plans)} 个",
+    )
+    total_queries = max(1, len(selected_plans))
+    for query_index, plan in enumerate(selected_plans, start=1):
+        _report(progress, "search", _scaled_progress(32, 64, query_index - 1, total_queries), f"正在搜索第 {query_index}/{total_queries} 个唯一术语背景")
+        results = _search(str(plan["query"]), config)
+        _report(progress, "search", _scaled_progress(32, 64, query_index, total_queries), f"已获取第 {query_index}/{total_queries} 个唯一术语背景")
         evidence.append(
             {
-                "candidate": {
-                    "segment_index": candidate.get("segment_index"),
-                    "asr_text": candidate.get("asr_text"),
-                    "category": candidate.get("category"),
-                    "risk_reason": candidate.get("risk_reason"),
-                },
-                "query": query,
+                "query": plan["query"],
+                "normalized_query": plan["normalized_query"],
+                "candidate_count": plan["candidate_count"],
+                "candidate_examples": plan["candidate_examples"],
                 "results": results,
             }
         )
     return evidence
+
+
+def _search_query_plans(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        queries = _candidate_queries(candidate)
+        if not queries:
+            fallback = _candidate_fallback_query(candidate)
+            queries = [fallback] if fallback else []
+        for query in queries:
+            normalized = _normalize_search_query(query)
+            if not normalized:
+                continue
+            plan = grouped.setdefault(
+                normalized,
+                {
+                    "query": query,
+                    "normalized_query": normalized,
+                    "score": 0.0,
+                    "candidates": [],
+                    "queries": set(),
+                },
+            )
+            plan["score"] += _search_query_score(candidate)
+            plan["candidates"].append(candidate)
+            plan["queries"].add(query)
+            if len(query) < len(str(plan["query"])):
+                plan["query"] = query
+    plans: list[dict[str, Any]] = []
+    for plan in grouped.values():
+        related = plan["candidates"]
+        plans.append(
+            {
+                "query": plan["query"],
+                "normalized_query": plan["normalized_query"],
+                "score": plan["score"],
+                "candidate_count": len(related),
+                "candidate_examples": _compact_candidates(related[:3]),
+            }
+        )
+    return sorted(
+        plans,
+        key=lambda plan: (
+            -float(plan["score"]),
+            -int(plan["candidate_count"]),
+            len(str(plan["query"])),
+            str(plan["query"]).casefold(),
+        ),
+    )
+
+
+def _candidate_fallback_query(candidate: dict[str, Any]) -> str:
+    suggested = str(candidate.get("suggested_correction") or candidate.get("corrected_text") or candidate.get("t") or "").strip()
+    asr_text = str(candidate.get("asr_text") or candidate.get("original_text") or candidate.get("f") or "").strip()
+    if suggested and suggested.casefold() != asr_text.casefold():
+        return suggested[:80]
+    return asr_text[:80]
+
+
+def _normalize_search_query(query: str) -> str:
+    value = unicodedata.normalize("NFKC", query).casefold()
+    value = re.sub(r"[\"'“”‘’`]+", "", value)
+    value = re.sub(r"[\s/_\\\-–—:：]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _search_query_score(candidate: dict[str, Any]) -> float:
+    priority = _coerce_int(candidate.get("priority", candidate.get("p"))) or 5
+    confidence = _coerce_confidence(candidate.get("confidence", candidate.get("c")))
+    category = str(candidate.get("category") or candidate.get("k") or "").casefold()
+    category_boost = 1.5 if any(token in category for token in ("model", "product", "term", "name", "person", "acronym")) else 0.0
+    return max(0.2, 7 - priority) + confidence * 2 + category_boost
+
+
+def _search_query_budget(candidate_count: int, unique_query_count: int) -> int:
+    if unique_query_count <= SEARCH_QUERY_BUDGET_MIN:
+        return unique_query_count
+    dynamic_budget = math.ceil(math.sqrt(max(1, candidate_count)) * 3)
+    return min(unique_query_count, SEARCH_QUERY_BUDGET_MAX, max(SEARCH_QUERY_BUDGET_MIN, dynamic_budget))
 
 
 def _review_candidate_patches(
@@ -175,7 +277,7 @@ def _review_candidate_patches(
     transcript: list[TranscriptSegment],
     provider: LlmProvider,
     candidates: list[dict[str, Any]],
-    evidence: list[dict[str, Any]],
+    search_background: list[dict[str, Any]],
     context: dict[str, object] | None,
     output_language: OutputLanguage,
     progress: ProgressCallback | None,
@@ -197,7 +299,7 @@ def _review_candidate_patches(
                 title,
                 candidates=group,
                 transcript_windows=_candidate_transcript_windows(group, transcript),
-                evidence=evidence,
+                search_background=search_background,
                 context=context,
                 output_language=output_language,
                 source=source,
@@ -217,6 +319,40 @@ def _review_candidate_patches(
     return {"patches": patches}
 
 
+def _synthesize_search_background_cards(
+    title: str,
+    candidates: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+    provider: LlmProvider,
+    context: dict[str, object] | None,
+    output_language: OutputLanguage,
+    progress: ProgressCallback | None,
+) -> list[dict[str, Any]]:
+    if not evidence:
+        return []
+    payload = _chat_json_with_progress(
+        provider,
+        _search_background_messages(
+            title,
+            candidates=candidates,
+            evidence=evidence,
+            context=context,
+            output_language=output_language,
+        ),
+        temperature=0.04,
+        max_tokens=7000,
+        timeout=ASR_MODEL_RESPONSE_TIMEOUT_SECONDS,
+        task_key="asr_correction",
+        progress=progress,
+        phase="model_wait",
+        base_progress=64,
+        max_progress=68,
+        message="正在等待大模型归纳搜索背景信息",
+    )
+    cards = [card for card in _payload_list(payload, "background") if isinstance(card, dict)]
+    return _normalize_search_background_cards(cards)[:SEARCH_BACKGROUND_MAX_CARDS]
+
+
 def _candidate_messages(
     title: str,
     transcript: list[TranscriptSegment],
@@ -226,7 +362,7 @@ def _candidate_messages(
     search_enabled: bool,
 ) -> list[dict[str, str]]:
     search_instruction = (
-        "For candidates that need search, q should contain 2-4 short queries that verify exact spelling or named entities."
+        "For candidates that need search, q should contain 1-2 normalized, reusable queries that verify exact spelling, named entities, product names, or model versions."
         if search_enabled
         else "q may be empty; include t only when local context or trusted reference strongly supports a likely correction."
     )
@@ -262,16 +398,18 @@ def _review_messages(
     *,
     candidates: list[dict[str, Any]],
     transcript_windows: str,
-    evidence: list[dict[str, Any]],
+    search_background: list[dict[str, Any]],
     context: dict[str, object] | None,
     output_language: OutputLanguage,
     source: str,
 ) -> list[dict[str, str]]:
-    evidence_text = _compact_jsonish(evidence, max_chars=18000) if evidence else "No external search evidence."
+    background_text = _search_background_cards_text(search_background, max_chars=18000) if search_background else "No synthesized search background."
     candidate_text = json.dumps(_compact_candidates(candidates), ensure_ascii=False, separators=(",", ":"))
     target_language = _output_language_name(output_language)
     source_rule = (
-        "Use external evidence only when it matches the local transcript context."
+        "Search background cards are additional trusted context, like metadata and user reference. "
+        "Use it to avoid outdated model-knowledge mistakes about current names, spelling, and version numbers. "
+        "It is not a separate correction path; candidates remain suspects, and local transcript context still decides the patch."
         if source == "search"
         else "No external search evidence is available; use trusted metadata, user reference, and cross-segment consistency conservatively."
     )
@@ -298,11 +436,131 @@ def _review_messages(
                 f"{source_rule}\n\n"
                 f"Course title: {title}\nTrusted metadata and user reference:\n{_context_text(context)}\n\n"
                 f"Candidate errors:\n{candidate_text}\n\n"
-                f"Evidence:\n{evidence_text}\n\n"
+                f"Search background cards:\n{background_text}\n\n"
                 f"Local transcript windows:\n{transcript_windows}"
             ),
         },
     ]
+
+
+def _search_background_messages(
+    title: str,
+    *,
+    candidates: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+    context: dict[str, object] | None,
+    output_language: OutputLanguage,
+) -> list[dict[str, str]]:
+    target_language = _output_language_name(output_language)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You synthesize search evidence into compact ASR correction background cards. "
+                "Group related aliases, names, products, works, versions, and domain terms into the same card when the evidence supports it. "
+                "Do not output ASR patches. Do not invent facts beyond search evidence, trusted metadata, or user reference. Return JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Return {\"background\":[...]} only.\n"
+                "Each card must include: topic, summary, aliases, key_facts, source_queries, confidence.\n"
+                "Rules: topic is the canonical entity or term; summary is 1-2 concise sentences; "
+                "aliases and key_facts are arrays of short strings; source_queries lists the queries that support the card; "
+                "confidence is 0..1; omit weak or irrelevant evidence; merge duplicate or overlapping cards; "
+                f"write summary and key_facts in {target_language}; preserve exact names, works, titles, and version strings.\n\n"
+                f"Course title: {title}\nTrusted metadata and user reference:\n{_context_text(context)}\n\n"
+                f"Candidate terms:\n{json.dumps(_compact_candidates(candidates), ensure_ascii=False, separators=(',', ':'))}\n\n"
+                f"Search evidence to synthesize:\n{_search_evidence_text(evidence, max_chars=22000)}"
+            ),
+        },
+    ]
+
+
+def _search_evidence_text(evidence: list[dict[str, Any]], *, max_chars: int) -> str:
+    background: list[dict[str, Any]] = []
+    for item in evidence:
+        results: list[dict[str, str]] = []
+        raw_results = item.get("results")
+        if isinstance(raw_results, list):
+            for result in raw_results[:SEARCH_RESULTS_PER_BACKGROUND_ITEM]:
+                if not isinstance(result, dict):
+                    continue
+                results.append(
+                    {
+                        "title": str(result.get("title") or "").strip(),
+                        "snippet": str(result.get("snippet") or "").strip()[:360],
+                        "url": str(result.get("url") or "").strip(),
+                    }
+                )
+        if not results:
+            continue
+        background.append(
+            {
+                "query": item.get("query"),
+                "candidate_count": item.get("candidate_count"),
+                "candidate_examples": item.get("candidate_examples"),
+                "facts": results,
+            }
+        )
+    if not background:
+        return "No useful external search background."
+    text = json.dumps(background, ensure_ascii=False, separators=(",", ":"))
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n...truncated..."
+
+
+def _normalize_search_background_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for card in cards:
+        topic = str(card.get("topic") or "").strip()
+        summary = str(card.get("summary") or "").strip()
+        if not topic or not summary:
+            continue
+        key = _normalize_search_query(topic)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "topic": topic[:120],
+                "summary": summary[:700],
+                "aliases": _short_string_list(card.get("aliases"), limit=12, item_limit=80),
+                "key_facts": _short_string_list(card.get("key_facts"), limit=12, item_limit=180),
+                "source_queries": _short_string_list(card.get("source_queries"), limit=12, item_limit=80),
+                "confidence": _coerce_confidence(card.get("confidence")),
+            }
+        )
+    return sorted(normalized, key=lambda item: (-float(item.get("confidence") or 0), str(item.get("topic") or "").casefold()))
+
+
+def _search_background_cards_text(cards: list[dict[str, Any]], *, max_chars: int) -> str:
+    text = json.dumps(cards, ensure_ascii=False, separators=(",", ":"))
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n...truncated..."
+
+
+def _short_string_list(value: object, *, limit: int, item_limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        item = str(raw).strip()
+        if not item:
+            continue
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item[:item_limit])
+        if len(items) >= limit:
+            break
+    return items
 
 
 def _search(query: str, config: AsrCorrectionSearchConfig) -> list[dict[str, Any]]:
@@ -601,6 +859,8 @@ def _repair_json_content(
 
 def _expected_payload_key(messages: list[dict[str, str]]) -> str:
     content = "\n".join(message["content"] for message in messages)
+    if "\"background\"" in content:
+        return "background"
     return "patches" if "\"patches\"" in content else "candidates"
 
 
@@ -701,13 +961,6 @@ def _normalize_for_format_check(value: str) -> str:
 def _patch_id(segment_index: int, original: str, corrected: str) -> str:
     digest = hashlib.sha1(f"{segment_index}\n{original}\n{corrected}".encode("utf-8")).hexdigest()[:10]
     return f"asr-{segment_index}-{digest}"
-
-
-def _compact_jsonish(value: object, *, max_chars: int) -> str:
-    text = repr(value)
-    if len(text) <= max_chars:
-        return text
-    return f"{text[:max_chars]}\n...truncated..."
 
 
 def _context_text(context: dict[str, object] | None) -> str:

@@ -38,7 +38,7 @@ export type StudyMaterial = {
 export type UiLanguage = "zh-CN" | "en";
 
 export type OutputLanguage = "zh-CN" | "en" | "ja";
-export type TranscriptSource = "subtitles" | "asr";
+export type TranscriptSource = "subtitles" | "asr" | "imported";
 export type StudySection = "all" | "guide" | "outline" | "detailed" | "high";
 export type ModelProviderType = "openai" | "anthropic";
 export type StudyDetailLevel = "fast" | "standard" | "detailed" | "faithful";
@@ -211,6 +211,35 @@ export type CourseItem = {
   metadata?: VideoMetadata | null;
   study: StudyMaterial | null;
   local_video_path?: string | null;
+};
+
+export type CourseShareItem = {
+  id?: string | null;
+  source_url: string;
+  title: string;
+  custom_title?: boolean;
+  collection_title?: string | null;
+  course_index?: number | null;
+  sort_order?: number | null;
+  duration?: number | null;
+  created_at?: string | null;
+  transcript: TranscriptSegment[];
+  transcript_source?: TranscriptSource | null;
+  metadata?: VideoMetadata | null;
+  study?: StudyMaterial | null;
+};
+
+export type CourseSharePackage = {
+  format: "course-navigator-share";
+  version: 1;
+  exported_at: string;
+  message?: string | null;
+  items: CourseShareItem[];
+};
+
+export type CourseImportResponse = {
+  items: CourseItem[];
+  message?: string | null;
 };
 
 export type ExtractMode = "normal" | "browser" | "cookies";

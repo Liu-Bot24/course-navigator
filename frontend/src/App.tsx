@@ -24,9 +24,11 @@ import {
   Settings as SettingsIcon,
   Sparkles,
   Trash2,
+  Upload,
   X,
 } from "lucide-react";
 import type {
+  ChangeEvent as ReactChangeEvent,
   CSSProperties,
   MouseEvent as ReactMouseEvent,
   MutableRefObject,
@@ -43,6 +45,7 @@ import {
   getAsrSearchSettings,
   getModelSettings,
   getStudyJob,
+  importCoursePackage,
   itemVideoPath,
   listItems,
   listAvailableModels,
@@ -74,6 +77,7 @@ import type {
   AsrSearchProvider,
   AsrSearchSettings,
   AsrSearchSettingsInput,
+  CourseSharePackage,
   CourseItem,
   ExtractMode,
   ModelProfile,
@@ -185,6 +189,9 @@ const COPY = {
     modeCookies: "Cookies 文件",
     openUrl: "打开视频并提取字幕",
     openUrlTitle: "打开视频，并自动提取原始字幕",
+    getSubtitles: "获取字幕",
+    getSubtitlesTitle: "为当前视频获取字幕",
+    getSubtitlesConfirm: "当前课程已经有字幕。继续获取会覆盖现有字幕和对应学习结果，确定继续吗？",
     extractSubtitles: "提取字幕",
     translateSubtitles: "翻译字幕",
     subtitleSource: "字幕来源",
@@ -247,6 +254,7 @@ const COPY = {
     apiKeyOptionalHint: "未配置，可留空",
     modelConfigured: "已配置",
     modelNotConfigured: "未配置",
+    closeDialog: "关闭",
     closeSettings: "关闭设置",
     saveSettings: "保存档案",
     settingsSaved: "档案已保存",
@@ -260,6 +268,20 @@ const COPY = {
     generating: "正在生成学习地图",
     caching: "正在缓存本地视频",
     library: "课程库",
+    importCourses: "导入课程",
+    exportCourses: "导出课程",
+    importCoursePackage: "导入课程包",
+    exportCoursePackage: "导出课程包",
+    exportCoursePackageTitle: "选择要导出的课程",
+    exportCoursePackageHelp: "完整选择某个专辑时会保留专辑名称和排序；单独选择课程会导入到未归档。",
+    exportSelected: "导出所选",
+    selectCoursesToExport: "选择课程",
+    shareMessage: "留言",
+    shareMessagePlaceholder: "可以写一句想留给导入者的话，也可以留空。",
+    noExportSelection: "请先选择至少一个课程。",
+    importPackageFailed: "课程包导入失败",
+    importMessageTitle: "来自分享者的留言",
+    closeImportMessage: "知道了",
     timeMap: "时间地图",
     collapseTimeMap: "收起时间地图",
     expandTimeMap: "展开时间地图",
@@ -276,7 +298,7 @@ const COPY = {
     openAsrCorrection: "打开 ASR 校正工作台",
     asrWorkbenchTitle: "ASR 校正工作台",
     asrWorkbenchSubtitle: "校正原字幕，保存后会刷新视频工作台的字幕。",
-    backToWorkspace: "返回工作台",
+    backToWorkspace: "返回主工作台",
     sourceTranscriptEditor: "原字幕编辑区",
     saveTranscript: "保存字幕",
     transcriptSaved: "字幕已保存",
@@ -297,6 +319,7 @@ const COPY = {
     asrPhasePreparing: "准备请求",
     asrPhaseCandidate: "提取可疑术语",
     asrPhaseSearch: "搜索证据",
+    asrPhaseBackground: "归纳搜索背景",
     asrPhaseReview: "生成建议",
     asrPhaseModelRequest: "发送模型请求",
     asrPhaseModelWait: "等待模型响应",
@@ -373,6 +396,8 @@ const COPY = {
     collapseCollection: "收起专辑",
     expandCollection: "展开专辑",
     editCollection: "编辑专辑",
+    deleteCollection: "删除专辑",
+    deleteCollectionConfirm: "删除这个专辑？课程不会被删除，会移动到未归档。",
     saveCollection: "保存专辑",
     cancelCollectionEdit: "取消编辑专辑",
     collectionTitle: "专辑名称",
@@ -381,6 +406,8 @@ const COPY = {
     courseTitleRequired: "课程标题不能为空。",
     moveCourseUp: "上移课程",
     moveCourseDown: "下移课程",
+    moveCollectionUp: "上移专辑",
+    moveCollectionDown: "下移专辑",
     removeLocalCache: "移除缓存",
     removeLocalCacheConfirm: "确定要删除这个课程的本地视频缓存吗？字幕和学习地图会保留。",
     regenerateStudy: "重新生成",
@@ -419,6 +446,9 @@ const COPY = {
     modeCookies: "Cookies file",
     openUrl: "Open and extract subtitles",
     openUrlTitle: "Open the video and extract source subtitles",
+    getSubtitles: "Get subtitles",
+    getSubtitlesTitle: "Get subtitles for the current video",
+    getSubtitlesConfirm: "This course already has subtitles. Getting subtitles again will overwrite the current transcript and related study results. Continue?",
     extractSubtitles: "Extract subtitles",
     translateSubtitles: "Translate subtitles",
     subtitleSource: "Subtitle source",
@@ -481,6 +511,7 @@ const COPY = {
     apiKeyOptionalHint: "Not configured, optional",
     modelConfigured: "Configured",
     modelNotConfigured: "Not configured",
+    closeDialog: "Close",
     closeSettings: "Close settings",
     saveSettings: "Save profile",
     settingsSaved: "Profile saved",
@@ -494,6 +525,20 @@ const COPY = {
     generating: "Generating study map",
     caching: "Caching video locally",
     library: "Library",
+    importCourses: "Import courses",
+    exportCourses: "Export courses",
+    importCoursePackage: "Import course package",
+    exportCoursePackage: "Export course package",
+    exportCoursePackageTitle: "Choose courses to export",
+    exportCoursePackageHelp: "Selecting a full collection preserves its name and order. Individually selected courses import as unfiled.",
+    exportSelected: "Export selected",
+    selectCoursesToExport: "Select courses",
+    shareMessage: "Message",
+    shareMessagePlaceholder: "Add an optional note for the person importing this package.",
+    noExportSelection: "Select at least one course first.",
+    importPackageFailed: "Failed to import course package",
+    importMessageTitle: "Message from the sharer",
+    closeImportMessage: "Got it",
     timeMap: "Time Map",
     collapseTimeMap: "Collapse time map",
     expandTimeMap: "Expand time map",
@@ -510,7 +555,7 @@ const COPY = {
     openAsrCorrection: "Open ASR correction workbench",
     asrWorkbenchTitle: "ASR correction workbench",
     asrWorkbenchSubtitle: "Correct source subtitles; saving refreshes captions in the video workspace.",
-    backToWorkspace: "Back to workspace",
+    backToWorkspace: "Back to main workspace",
     sourceTranscriptEditor: "Source transcript editor",
     saveTranscript: "Save transcript",
     transcriptSaved: "Transcript saved",
@@ -531,6 +576,7 @@ const COPY = {
     asrPhasePreparing: "Preparing request",
     asrPhaseCandidate: "Finding suspicious terms",
     asrPhaseSearch: "Searching evidence",
+    asrPhaseBackground: "Synthesizing search background",
     asrPhaseReview: "Generating suggestions",
     asrPhaseModelRequest: "Sending model request",
     asrPhaseModelWait: "Waiting for model",
@@ -607,6 +653,8 @@ const COPY = {
     collapseCollection: "Collapse collection",
     expandCollection: "Expand collection",
     editCollection: "Edit collection",
+    deleteCollection: "Delete collection",
+    deleteCollectionConfirm: "Delete this collection? Courses stay in the library and move to Unfiled.",
     saveCollection: "Save collection",
     cancelCollectionEdit: "Cancel collection edit",
     collectionTitle: "Collection name",
@@ -615,6 +663,8 @@ const COPY = {
     courseTitleRequired: "Course title is required.",
     moveCourseUp: "Move course up",
     moveCourseDown: "Move course down",
+    moveCollectionUp: "Move collection up",
+    moveCollectionDown: "Move collection down",
     removeLocalCache: "Remove cache",
     removeLocalCacheConfirm: "Remove this course's local video cache? Transcript and study map will stay.",
     regenerateStudy: "Regenerate",
@@ -664,6 +714,7 @@ const MIN_PLAYER_HEIGHT_OVERLAY = 390;
 const MIN_PLAYER_HEIGHT_PANEL = 500;
 const MANUAL_COLLECTIONS_STORAGE_KEY = "course-navigator-manual-collections";
 const COLLAPSED_COLLECTIONS_STORAGE_KEY = "course-navigator-collapsed-collections";
+const COLLECTION_ORDER_STORAGE_KEY = "course-navigator-collection-order";
 const TIME_MAP_AUTO_OPEN_STORAGE_KEY = "course-navigator-time-map-auto-open";
 const SELECTED_COURSE_STORAGE_KEY = "course-navigator-last-selected-course";
 const ASR_SAVE_ACCEPTED_CHANGES_STORAGE_KEY = "course-navigator-asr-save-accepted-changes";
@@ -734,6 +785,12 @@ export function App() {
   const [collapsedCollections, setCollapsedCollections] = useState<string[]>(() =>
     loadStoredStrings(COLLAPSED_COLLECTIONS_STORAGE_KEY),
   );
+  const [collectionOrder, setCollectionOrder] = useState<string[]>(() => loadStoredStrings(COLLECTION_ORDER_STORAGE_KEY));
+  const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [exportSelectedIds, setExportSelectedIds] = useState<string[]>([]);
+  const [exportMessage, setExportMessage] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+  const [importMessage, setImportMessage] = useState<string | null>(null);
   const [timeMapAutoOpen, setTimeMapAutoOpen] = useState(() =>
     loadBooleanPreference(TIME_MAP_AUTO_OPEN_STORAGE_KEY, true),
   );
@@ -745,6 +802,7 @@ export function App() {
   const workspaceRef = useRef<HTMLElement | null>(null);
   const mainColumnRef = useRef<HTMLElement | null>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
+  const importFileInputRef = useRef<HTMLInputElement | null>(null);
   const copy = COPY[uiLanguage];
 
   useEffect(() => {
@@ -802,8 +860,8 @@ export function App() {
     [items, manualCollections, copy.courseCollectionFallback],
   );
   const groupedItems = useMemo(
-    () => groupCourseItems(items, copy.courseCollectionFallback, manualCollections),
-    [items, copy.courseCollectionFallback, manualCollections],
+    () => groupCourseItems(items, copy.courseCollectionFallback, manualCollections, collectionOrder),
+    [items, copy.courseCollectionFallback, manualCollections, collectionOrder],
   );
   const collapsedCollectionKeys = useMemo(() => new Set(collapsedCollections), [collapsedCollections]);
 
@@ -865,6 +923,128 @@ export function App() {
       setBusy(null);
       setJobStatus(null);
       setActiveJobKind(null);
+    }
+  }
+
+  async function handleGetSubtitles() {
+    const normalizedUrl = url.trim() || selected?.source_url.trim() || "";
+    if (!normalizedUrl) return;
+    const existing = findExistingItemForUrl(items, normalizedUrl);
+    const selectedMatchesUrl = selected ? canonicalSourceKey(selected.source_url) === canonicalSourceKey(normalizedUrl) : false;
+    if ((existing?.transcript.length || (selectedMatchesUrl && selected?.transcript.length)) && !window.confirm(copy.getSubtitlesConfirm)) {
+      return;
+    }
+    setError(null);
+    setJobStatus(null);
+    setSourceMode("embed");
+    setSeekTime(0);
+    setPlayheadTime(0);
+    try {
+      await extractUrlToItem(normalizedUrl);
+    } catch (err) {
+      setError(extractionErrorMessage(err, mode, browser, copy.unknownError));
+    } finally {
+      setBusy(null);
+      setJobStatus(null);
+      setActiveJobKind(null);
+    }
+  }
+
+  function openExportModal() {
+    setExportSelectedIds(selected && !isPreviewItem(selected) ? [selected.id] : []);
+    setExportMessage("");
+    setExportModalOpen(true);
+  }
+
+  function toggleExportCourse(itemId: string) {
+    setExportSelectedIds((current) =>
+      current.includes(itemId) ? current.filter((id) => id !== itemId) : [...current, itemId],
+    );
+  }
+
+  function toggleExportGroup(group: LibraryCollectionGroup) {
+    const groupIds = group.items.map((item) => item.id);
+    if (!groupIds.length) return;
+    setExportSelectedIds((current) => {
+      const selectedSet = new Set(current);
+      const allSelected = groupIds.every((id) => selectedSet.has(id));
+      if (allSelected) {
+        return current.filter((id) => !groupIds.includes(id));
+      }
+      return mergeStringKeys([...current, ...groupIds]);
+    });
+  }
+
+  function handleExportCourses() {
+    const selectedSet = new Set(exportSelectedIds);
+    if (!selectedSet.size) {
+      setError(copy.noExportSelection);
+      return;
+    }
+    const selectedItems = items.filter((item) => selectedSet.has(item.id));
+    if (selectedItems.some((item) => !item.transcript.length)) {
+      setError(copy.noTranscript);
+      return;
+    }
+    const fullCollectionKeys = new Set(
+      groupedItems
+        .filter((group) => group.items.length > 0 && group.items.every((item) => selectedSet.has(item.id)))
+        .map((group) => group.key),
+    );
+    const unfiledKey = collectionStorageKey("");
+    const packageItems = sortCourseItems(selectedItems).map((item) => {
+      const itemCollectionKey = collectionStorageKey(item.collection_title);
+      const keepCollection = itemCollectionKey !== unfiledKey && fullCollectionKeys.has(itemCollectionKey);
+      return {
+        id: item.id,
+        source_url: item.source_url,
+        title: item.title,
+        custom_title: item.custom_title ?? false,
+        collection_title: keepCollection ? item.collection_title ?? "" : null,
+        course_index: keepCollection ? item.course_index ?? null : null,
+        sort_order: keepCollection ? item.sort_order ?? null : null,
+        duration: item.duration,
+        created_at: item.created_at,
+        transcript: item.transcript,
+        transcript_source: "imported" as const,
+        metadata: item.metadata ?? null,
+        study: item.study ?? null,
+      };
+    });
+    const packagePayload: CourseSharePackage = {
+      format: "course-navigator-share",
+      version: 1,
+      exported_at: new Date().toISOString(),
+      message: exportMessage.trim() || null,
+      items: packageItems,
+    };
+    downloadJsonFile(packagePayload, coursePackageFileName(packageItems));
+    setExportModalOpen(false);
+    setExportMessage("");
+    setExportSelectedIds([]);
+  }
+
+  async function handleImportPackageFile(event: ReactChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+    setImportBusy(true);
+    setError(null);
+    try {
+      const raw = await file.text();
+      const payload = JSON.parse(raw) as CourseSharePackage;
+      const response = await importCoursePackage(payload);
+      const loaded = await listItems();
+      setItems(loaded);
+      const firstImported = response.items[0];
+      selectCourse(firstImported ? loaded.find((item) => item.id === firstImported.id) ?? firstImported : initialSelectedCourse(loaded));
+      if (response.message?.trim()) {
+        setImportMessage(response.message.trim());
+      }
+    } catch (err) {
+      setError(`${copy.importPackageFailed}: ${errorMessage(err, copy.unknownError)}`);
+    } finally {
+      setImportBusy(false);
     }
   }
 
@@ -1040,6 +1220,11 @@ export function App() {
       saveStoredStrings(MANUAL_COLLECTIONS_STORAGE_KEY, next);
       return next;
     });
+    setCollectionOrder((current) => {
+      const next = mergeStringKeys([...current, collectionStorageKey(name)]);
+      saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, next);
+      return next;
+    });
   }
 
   function setTimeMapPreference(nextOpen: boolean) {
@@ -1058,6 +1243,22 @@ export function App() {
         ? current.filter((key) => key !== collectionKey)
         : [...current, collectionKey];
       saveStoredStrings(COLLAPSED_COLLECTIONS_STORAGE_KEY, next);
+      return next;
+    });
+  }
+
+  function handleMoveCollection(group: LibraryCollectionGroup, direction: -1 | 1) {
+    const visibleKeys = groupedItems.map((entry) => entry.key);
+    const index = visibleKeys.indexOf(group.key);
+    const targetIndex = index + direction;
+    if (index < 0 || targetIndex < 0 || targetIndex >= visibleKeys.length) return;
+    const nextVisibleKeys = [...visibleKeys];
+    [nextVisibleKeys[index], nextVisibleKeys[targetIndex]] = [nextVisibleKeys[targetIndex], nextVisibleKeys[index]];
+    setCollectionOrder((current) => {
+      const visibleSet = new Set(visibleKeys);
+      const hiddenKeys = current.filter((key) => !visibleSet.has(key));
+      const next = mergeStringKeys([...nextVisibleKeys, ...hiddenKeys]);
+      saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, next);
       return next;
     });
   }
@@ -1106,7 +1307,56 @@ export function App() {
         saveStoredStrings(COLLAPSED_COLLECTIONS_STORAGE_KEY, next);
         return next;
       });
+      setCollectionOrder((current) => {
+        const next = mergeStringKeys(current.map((key) => (key === group.key ? nextKey : key)));
+        saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, next);
+        return next;
+      });
       cancelEditingCollection();
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setSavingCollectionKey(null);
+    }
+  }
+
+  async function handleDeleteCollection(group: LibraryCollectionGroup) {
+    if (group.key === collectionStorageKey("")) return;
+    if (!window.confirm(copy.deleteCollectionConfirm)) return;
+    setError(null);
+    setSavingCollectionKey(group.key);
+    try {
+      const affectedItems = items.filter((item) => collectionStorageKey(item.collection_title) === group.key);
+      const updatedItems = await Promise.all(
+        affectedItems.map((item) =>
+          updateCourseItem(item.id, {
+            collection_title: null,
+            course_index: null,
+            sort_order: null,
+          }),
+        ),
+      );
+      const updatedById = new Map(updatedItems.map((item) => [item.id, item]));
+      setItems((current) => sortCourseItems(current.map((item) => updatedById.get(item.id) ?? item)));
+      setSelected((current) => (current ? updatedById.get(current.id) ?? current : current));
+      setManualCollections((current) => {
+        const next = current.filter((name) => collectionStorageKey(name) !== group.key);
+        saveStoredStrings(MANUAL_COLLECTIONS_STORAGE_KEY, next);
+        return next;
+      });
+      setCollapsedCollections((current) => {
+        const next = current.filter((key) => key !== group.key);
+        saveStoredStrings(COLLAPSED_COLLECTIONS_STORAGE_KEY, next);
+        return next;
+      });
+      setCollectionOrder((current) => {
+        const next = current.filter((key) => key !== group.key);
+        saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, next);
+        return next;
+      });
+      if (editingCollectionKey === group.key) {
+        cancelEditingCollection();
+      }
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
     } finally {
@@ -1621,6 +1871,16 @@ export function App() {
             </select>
           </label>
           <button
+            className="top-subtitle-button"
+            type="button"
+            title={copy.getSubtitlesTitle}
+            onClick={() => void handleGetSubtitles()}
+            disabled={Boolean(busy) || !(url.trim() || selected?.source_url)}
+          >
+            {busy === copy.extracting ? <Loader2 className="spin" size={16} /> : <Captions size={16} />}
+            {copy.getSubtitles}
+          </button>
+          <button
             className="top-translate-button"
             type="button"
             onClick={handleTranslate}
@@ -1656,6 +1916,24 @@ export function App() {
         />
       ) : null}
 
+      {exportModalOpen ? (
+        <CourseShareExportModal
+          copy={copy}
+          groups={groupedItems}
+          selectedIds={exportSelectedIds}
+          message={exportMessage}
+          onMessageChange={setExportMessage}
+          onToggleCourse={toggleExportCourse}
+          onToggleGroup={toggleExportGroup}
+          onExport={handleExportCourses}
+          onClose={() => setExportModalOpen(false)}
+        />
+      ) : null}
+
+      {importMessage ? (
+        <ImportMessageModal copy={copy} message={importMessage} onClose={() => setImportMessage(null)} />
+      ) : null}
+
       {error ? <div className="error-strip" role="alert" aria-live="polite">{error}</div> : null}
       {busy ? (
         <div className="status-strip">
@@ -1678,19 +1956,47 @@ export function App() {
           <section className="panel open-panel">
             <div className="panel-header library-panel-header">
               <h2>{copy.library}</h2>
-              <button
-                aria-label={copy.addCollection}
-                className="panel-icon-button"
-                title={copy.addCollection}
-                onClick={handleAddCollection}
-              >
-                <FolderPlus size={14} />
-              </button>
+              <div className="library-panel-actions">
+                <button
+                  aria-label={copy.importCourses}
+                  className="panel-icon-button"
+                  disabled={importBusy}
+                  title={copy.importCourses}
+                  onClick={() => importFileInputRef.current?.click()}
+                >
+                  {importBusy ? <Loader2 className="spin" size={14} /> : <Download size={14} />}
+                </button>
+                <button
+                  aria-label={copy.exportCourses}
+                  className="panel-icon-button"
+                  disabled={!items.length}
+                  title={copy.exportCourses}
+                  onClick={openExportModal}
+                >
+                  <Upload size={14} />
+                </button>
+                <button
+                  aria-label={copy.addCollection}
+                  className="panel-icon-button"
+                  title={copy.addCollection}
+                  onClick={handleAddCollection}
+                >
+                  <FolderPlus size={14} />
+                </button>
+                <input
+                  ref={importFileInputRef}
+                  className="visually-hidden"
+                  type="file"
+                  accept=".course-nav.json,application/json"
+                  onChange={(event) => void handleImportPackageFile(event)}
+                />
+              </div>
             </div>
             <div className="library-list">
-              {groupedItems.map((group) => {
+              {groupedItems.map((group, groupIndex) => {
                 const collectionCollapsed = collapsedCollectionKeys.has(group.key);
                 const collectionEditing = editingCollectionKey === group.key;
+                const canDeleteCollection = group.key !== collectionStorageKey("");
                 return (
                 <section
                   className={collectionCollapsed ? "library-collection collapsed" : "library-collection"}
@@ -1751,6 +2057,26 @@ export function App() {
                         />
                         <span>{group.title}</span>
                       </button>
+                      {groupIndex > 0 ? (
+                        <button
+                          aria-label={`${copy.moveCollectionUp} ${group.title}`}
+                          className="library-collection-move"
+                          title={copy.moveCollectionUp}
+                          onClick={() => handleMoveCollection(group, -1)}
+                        >
+                          <ArrowUp size={12} />
+                        </button>
+                      ) : <span className="library-collection-spacer" aria-hidden="true" />}
+                      {groupIndex < groupedItems.length - 1 ? (
+                        <button
+                          aria-label={`${copy.moveCollectionDown} ${group.title}`}
+                          className="library-collection-move"
+                          title={copy.moveCollectionDown}
+                          onClick={() => handleMoveCollection(group, 1)}
+                        >
+                          <ArrowDown size={12} />
+                        </button>
+                      ) : <span className="library-collection-spacer" aria-hidden="true" />}
                       <button
                         aria-label={`${copy.editCollection} ${group.title}`}
                         className="library-collection-edit"
@@ -1759,6 +2085,17 @@ export function App() {
                       >
                         <Pencil size={13} />
                       </button>
+                      {canDeleteCollection ? (
+                        <button
+                          aria-label={`${copy.deleteCollection} ${group.title}`}
+                          className="library-collection-delete"
+                          disabled={savingCollectionKey === group.key}
+                          title={copy.deleteCollection}
+                          onClick={() => void handleDeleteCollection(group)}
+                        >
+                          {savingCollectionKey === group.key ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
+                        </button>
+                      ) : <span className="library-collection-spacer" aria-hidden="true" />}
                       <small>{group.items.length}</small>
                     </div>
                   )}
@@ -2133,6 +2470,132 @@ export function App() {
         </aside>
       </section>
     </main>
+  );
+}
+
+function CourseShareExportModal({
+  copy,
+  groups,
+  selectedIds,
+  message,
+  onMessageChange,
+  onToggleCourse,
+  onToggleGroup,
+  onExport,
+  onClose,
+}: {
+  copy: (typeof COPY)[UiLanguage];
+  groups: LibraryCollectionGroup[];
+  selectedIds: string[];
+  message: string;
+  onMessageChange: (value: string) => void;
+  onToggleCourse: (itemId: string) => void;
+  onToggleGroup: (group: LibraryCollectionGroup) => void;
+  onExport: () => void;
+  onClose: () => void;
+}) {
+  const selectedSet = new Set(selectedIds);
+  const selectedCount = selectedIds.length;
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="settings-modal course-share-modal" role="dialog" aria-modal="true" aria-labelledby="course-share-title">
+        <div className="modal-head">
+          <div>
+            <h2 id="course-share-title">{copy.exportCoursePackage}</h2>
+            <p>{copy.exportCoursePackageHelp}</p>
+          </div>
+          <button className="icon-only" aria-label={copy.closeDialog} onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="course-share-body">
+          <section className="course-share-list" aria-label={copy.selectCoursesToExport}>
+            {groups.map((group) => {
+              const groupIds = group.items.map((item) => item.id);
+              const allChecked = groupIds.length > 0 && groupIds.every((id) => selectedSet.has(id));
+              const someChecked = groupIds.some((id) => selectedSet.has(id));
+              return (
+                <div className="course-share-group" key={group.key}>
+                  <label className="course-share-group-head">
+                    <input
+                      type="checkbox"
+                      checked={allChecked}
+                      ref={(element) => {
+                        if (element) element.indeterminate = someChecked && !allChecked;
+                      }}
+                      onChange={() => onToggleGroup(group)}
+                      disabled={!group.items.length}
+                    />
+                    <span>{group.title}</span>
+                    <small>{group.items.length}</small>
+                  </label>
+                  {group.items.length ? (
+                    <div className="course-share-courses">
+                      {group.items.map((item) => (
+                        <label className="course-share-course" key={item.id}>
+                          <input
+                            type="checkbox"
+                            checked={selectedSet.has(item.id)}
+                            onChange={() => onToggleCourse(item.id)}
+                          />
+                          <span>{displayCourseNumber(item) ? `${displayCourseNumber(item)}. ${item.title}` : item.title}</span>
+                        </label>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </section>
+          <label className="settings-field course-share-message">
+            <span>{copy.shareMessage}</span>
+            <textarea
+              value={message}
+              onChange={(event) => onMessageChange(event.target.value)}
+              placeholder={copy.shareMessagePlaceholder}
+              maxLength={4000}
+            />
+          </label>
+        </div>
+        <div className="modal-actions">
+          <span>{selectedCount ? `${copy.selectCoursesToExport} · ${selectedCount}` : copy.noExportSelection}</span>
+          <button className="secondary-modal-action" type="button" onClick={onClose}>
+            {copy.closeDialog}
+          </button>
+          <button type="button" onClick={onExport} disabled={!selectedCount}>
+            <Download size={15} />
+            {copy.exportSelected}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ImportMessageModal({
+  copy,
+  message,
+  onClose,
+}: {
+  copy: (typeof COPY)[UiLanguage];
+  message: string;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop import-message-backdrop" role="presentation">
+      <section className="settings-modal import-message-modal" role="dialog" aria-modal="true" aria-labelledby="import-message-title">
+        <div className="modal-head">
+          <h2 id="import-message-title">{copy.importMessageTitle}</h2>
+          <button className="icon-only" aria-label={copy.closeDialog} onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <p>{message}</p>
+        <div className="modal-actions">
+          <button type="button" onClick={onClose}>{copy.closeImportMessage}</button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -4799,6 +5262,7 @@ function groupCourseItems(
   items: CourseItem[],
   fallbackTitle: string,
   extraCollections: string[] = [],
+  collectionOrder: string[] = [],
 ): LibraryCollectionGroup[] {
   const groups = new Map<string, LibraryCollectionGroup>();
   for (const item of sortCourseItems(items)) {
@@ -4823,7 +5287,17 @@ function groupCourseItems(
       groups.set(key, { key, title: value, value, items: [] });
     }
   }
-  return [...groups.values()];
+  const orderIndex = new Map(collectionOrder.map((key, index) => [key, index]));
+  return [...groups.values()].sort((left, right) => {
+    const leftIndex = orderIndex.get(left.key);
+    const rightIndex = orderIndex.get(right.key);
+    if (leftIndex !== undefined || rightIndex !== undefined) {
+      if (leftIndex === undefined) return 1;
+      if (rightIndex === undefined) return -1;
+      return leftIndex - rightIndex;
+    }
+    return left.title.localeCompare(right.title, undefined, { sensitivity: "base", numeric: true });
+  });
 }
 
 function collectionNames(
@@ -4894,6 +5368,29 @@ function saveBooleanPreference(key: string, value: boolean) {
   } catch {
     // Local storage is optional; the in-memory state already changed.
   }
+}
+
+function downloadJsonFile(payload: unknown, fileName: string) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function coursePackageFileName(items: CourseSharePackage["items"]): string {
+  const firstTitle = items[0]?.title ?? "course-navigator";
+  const slug = firstTitle
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return `${slug || "course-navigator"}${items.length > 1 ? `-${items.length}` : ""}.course-nav.json`;
 }
 
 function initialSelectedCourse(items: CourseItem[]): CourseItem | null {
@@ -5151,6 +5648,7 @@ function asrPhaseLabel(phase: string, copy: (typeof COPY)[UiLanguage]): string {
     preparing: copy.asrPhasePreparing,
     candidate: copy.asrPhaseCandidate,
     search: copy.asrPhaseSearch,
+    background: copy.asrPhaseBackground,
     review: copy.asrPhaseReview,
     model_request: copy.asrPhaseModelRequest,
     model_wait: copy.asrPhaseModelWait,

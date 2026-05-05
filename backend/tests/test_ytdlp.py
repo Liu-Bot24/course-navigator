@@ -178,7 +178,7 @@ def test_choose_source_subtitle_language_prefers_chinese_for_bilibili_without_me
         language=None,
         subtitles=["ai-ar", "ai-en", "ai-es", "ai-ja", "ai-pt", "ai-zh", "danmaku"],
         automatic_captions=[],
-        title="【毕导】光一直在欺骗你",
+        title="【示例作者】这节课解释视觉现象",
         extractor="BiliBili",
     )
 

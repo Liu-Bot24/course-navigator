@@ -135,6 +135,97 @@ def test_new_lessons_receive_next_course_index_in_collection(tmp_path):
     assert [item["course_index"] for item in listed] == [1, 2]
 
 
+def test_import_course_package_saves_finished_course_without_local_artifacts(tmp_path):
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/import",
+        json={
+            "format": "course-navigator-share",
+            "version": 1,
+            "message": "请从第三段开始复习。",
+            "items": [
+                {
+                    "id": "abc123",
+                    "source_url": "https://example.com/shared-course",
+                    "title": "Shared lesson",
+                    "collection_title": "Shared collection",
+                    "course_index": 3,
+                    "sort_order": 3,
+                    "duration": 12,
+                    "transcript": [
+                        {"start": 0, "end": 2, "text": "Corrected opening."},
+                        {"start": 2, "end": 5, "text": "Corrected detail."},
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    imported = payload["items"][0]
+    assert payload["message"] == "请从第三段开始复习。"
+    assert imported["id"] == "abc123-imported"
+    assert imported["title"] == "Shared lesson"
+    assert imported["custom_title"] is True
+    assert imported["collection_title"] == "Shared collection"
+    assert imported["course_index"] == 3
+    assert imported["transcript_source"] == "imported"
+    assert imported["transcript"][0]["text"] == "Corrected opening."
+    assert imported["local_video_path"] is None
+    assert client.get("/api/items/abc123-imported").json()["transcript"][1]["text"] == "Corrected detail."
+    assert not (tmp_path / "subtitles" / "abc123-imported").exists()
+    assert not (tmp_path / "downloads").exists()
+
+
+def test_imported_course_can_cache_video_after_reusing_deleted_id(tmp_path):
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    assert client.delete("/api/items/abc123").status_code == 200
+
+    imported = client.post(
+        "/api/import",
+        json={
+            "format": "course-navigator-share",
+            "version": 1,
+            "items": [
+                {
+                    "id": "abc123",
+                    "source_url": "https://www.youtube.com/watch?v=abc123",
+                    "title": "Imported lesson",
+                    "transcript": [{"start": 0, "end": 2, "text": "Corrected opening."}],
+                }
+            ],
+        },
+    )
+    assert imported.status_code == 200
+    assert imported.json()["items"][0]["id"] == "abc123"
+
+    response = client.post(
+        "/api/items/abc123/download-jobs",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    assert client.get("/api/items/abc123").json()["local_video_path"].endswith("abc123.mp4")
+
+
 def test_youtube_url_keeps_extractor_title_instead_of_guessing_from_url(tmp_path):
     client = make_client(tmp_path)
 
@@ -657,7 +748,7 @@ def test_asr_correction_job_uses_selected_profile_and_exposes_suggestions(tmp_pa
     response = client.post(
         "/api/items/abc123/asr-correction-jobs",
         json={
-            "user_context": "OpenClaw 常被误转为 open cloud；Claude 常被误转为 Cloud。",
+            "user_context": "NovaDeck 常被误转为 noba dek；VectorRay 常被误转为 vector ray。",
             "output_language": "zh-CN",
             "search": {"enabled": False},
         },
@@ -685,7 +776,7 @@ def test_asr_correction_job_uses_selected_profile_and_exposes_suggestions(tmp_pa
     assert captured["context"]["channel"] == "Sample Channel"
     assert captured["context"]["creator"] == "Sample Creator"
     assert captured["context"]["description"] == "A course summary mentioning D-tail terminology."
-    assert captured["context"]["user_context"] == "OpenClaw 常被误转为 open cloud；Claude 常被误转为 Cloud。"
+    assert captured["context"]["user_context"] == "NovaDeck 常被误转为 noba dek；VectorRay 常被误转为 vector ray。"
     assert captured["context"]["extractor"] == "youtube"
     assert captured["context"]["webpage_url"] == "https://www.youtube.com/watch?v=abc123"
     assert result.status_code == 200
@@ -754,8 +845,8 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
         env_path=env_path,
         settings=Settings(
             data_dir=tmp_path,
-            llm_base_url="https://api.siliconflow.cn/v1",
-            llm_model="deepseek-ai/DeepSeek-V3.2",
+            llm_base_url="https://api.primary.example/v1",
+            llm_model="provider/Primary-Chat-V2",
             llm_api_key="sk-test-secret-value",
         ),
     )
@@ -763,7 +854,7 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
     initial = client.get("/api/settings/model")
 
     assert initial.status_code == 200
-    assert initial.json()["profiles"][0]["name"] == "DeepSeek V3.2"
+    assert initial.json()["profiles"][0]["name"] == "Primary Chat V2"
     assert initial.json()["translation_model_id"] == "default"
 
     updated = client.put(
@@ -772,20 +863,20 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
             "profiles": [
                 {
                     "id": "fast",
-                    "name": "Hunyuan Fast",
+                    "name": "Fast Model",
                     "provider_type": "openai",
                     "base_url": "https://api.example.com/v1",
-                    "model": "hunyuan-lite",
+                    "model": "fast-chat",
                     "context_window": 64000,
                     "max_tokens": 4096,
                     "api_key": "sk-fast-secret",
                 },
                 {
                     "id": "long",
-                    "name": "Mimo Long",
+                    "name": "Long Model",
                     "provider_type": "anthropic",
                     "base_url": "https://api.example.com/v1",
-                    "model": "mimo-v2.5-pro",
+                    "model": "long-context-chat",
                     "context_window": 1000000,
                     "max_tokens": 32000,
                     "api_key": "sk-long-secret",
@@ -881,7 +972,7 @@ def test_model_list_endpoint_uses_saved_profile_key(tmp_path, monkeypatch):
             return None
 
         def json(self):
-            return {"data": [{"id": "deepseek-ai/DeepSeek-V3.2"}, {"id": "Qwen/Qwen3"}]}
+            return {"data": [{"id": "provider/Primary-Chat-V2"}, {"id": "provider/Reasoner-V1"}]}
 
     def fake_get(url, headers, timeout):
         captured["url"] = url
@@ -897,9 +988,9 @@ def test_model_list_endpoint_uses_saved_profile_key(tmp_path, monkeypatch):
             model_profiles=[
                 {
                     "id": "default",
-                    "name": "DeepSeek",
+                    "name": "Primary",
                     "base_url": "https://api.example.com/v1/chat/completions",
-                    "model": "deepseek-ai/DeepSeek-V3.2",
+                    "model": "provider/Primary-Chat-V2",
                     "api_key": "sk-saved",
                 }
             ],
@@ -916,12 +1007,12 @@ def test_model_list_endpoint_uses_saved_profile_key(tmp_path, monkeypatch):
     )
 
     assert response.status_code == 200
-    assert response.json()["models"] == ["deepseek-ai/DeepSeek-V3.2", "Qwen/Qwen3"]
+    assert response.json()["models"] == ["provider/Primary-Chat-V2", "provider/Reasoner-V1"]
     assert captured["url"] == "https://api.example.com/v1/models"
     assert captured["headers"]["Authorization"] == "Bearer sk-saved"
 
 
-def test_model_list_endpoint_adds_v1_for_minimax_anthropic_base(tmp_path, monkeypatch):
+def test_model_list_endpoint_adds_v1_for_anthropic_base(tmp_path, monkeypatch):
     captured = {}
 
     class Response:
@@ -929,7 +1020,7 @@ def test_model_list_endpoint_adds_v1_for_minimax_anthropic_base(tmp_path, monkey
             return None
 
         def json(self):
-            return {"data": [{"id": "MiniMax-M2.7"}]}
+            return {"data": [{"id": "LongContext-M2"}]}
 
     def fake_get(url, headers, timeout):
         captured["url"] = url
@@ -942,16 +1033,16 @@ def test_model_list_endpoint_adds_v1_for_minimax_anthropic_base(tmp_path, monkey
 
     response = client.post(
         "/api/settings/models",
-        json={
-            "provider_type": "anthropic",
-            "base_url": "https://api.minimaxi.com/anthropic",
-            "api_key": "sk-request",
-        },
-    )
+            json={
+                "provider_type": "anthropic",
+                "base_url": "https://api.anthropic.com",
+                "api_key": "sk-request",
+            },
+        )
 
     assert response.status_code == 200
-    assert response.json()["models"] == ["MiniMax-M2.7"]
-    assert captured["url"] == "https://api.minimaxi.com/anthropic/v1/models"
+    assert response.json()["models"] == ["LongContext-M2"]
+    assert captured["url"] == "https://api.anthropic.com/v1/models"
     assert captured["headers"]["x-api-key"] == "sk-request"
     assert captured["headers"]["anthropic-version"] == "2023-06-01"
 
@@ -1063,6 +1154,65 @@ def test_delete_item_removes_record_and_artifacts(tmp_path):
     assert not (tmp_path / "items" / "abc123.json").exists()
     assert not list((tmp_path / "downloads").glob("abc123.*"))
     assert not subtitle_dir.exists()
+
+
+def test_delete_item_removes_stale_download_files_even_without_local_video_path(tmp_path):
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    (downloads_dir / "abc123.mp4").write_text("video", encoding="utf-8")
+    (downloads_dir / "abc123.f399.mp4").write_text("video part", encoding="utf-8")
+    (downloads_dir / "abc1234.mp4").write_text("other video", encoding="utf-8")
+
+    response = client.delete("/api/items/abc123")
+
+    assert response.status_code == 200
+    assert not list(downloads_dir.glob("abc123.*"))
+    assert (downloads_dir / "abc1234.mp4").exists()
+
+
+def test_download_job_cleans_file_when_course_is_deleted_during_download(tmp_path):
+    class SlowDownloadRunner(FakeRunner):
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if progress:
+                progress(42, "正在缓存视频")
+            sleep(0.08)
+            path = target_dir / f"{item_id}.mp4"
+            path.write_text("video", encoding="utf-8")
+            return path
+
+    client = make_client(tmp_path, runner=SlowDownloadRunner())
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    response = client.post(
+        "/api/items/abc123/download-jobs",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["progress"] == 42:
+            break
+        sleep(0.01)
+
+    assert client.delete("/api/items/abc123").status_code == 200
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "failed"
+    assert payload["error"] == "Course item was deleted"
+    assert not list((tmp_path / "downloads").glob("abc123.*"))
 
 
 def test_delete_local_video_keeps_course_item(tmp_path):

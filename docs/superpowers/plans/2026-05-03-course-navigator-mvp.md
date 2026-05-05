@@ -4,7 +4,7 @@
 
 **Goal:** Build a usable local Course Navigator MVP with URL extraction, transcript normalization, AI study material generation, YouTube embed playback, transcript seeking, and timestamp-linked AI views.
 
-**Architecture:** Use a FastAPI backend for local media extraction, persistence, and AI calls. Use a React + Vite frontend for the study workspace. Keep the backend independent from Hermes/OpenClaw and communicate through JSON APIs.
+**Architecture:** Use a FastAPI backend for local media extraction, persistence, and AI calls. Use a React + Vite frontend for the study workspace. Keep the backend independent from external orchestration services and communicate through JSON APIs.
 
 **Tech Stack:** Python 3.11+ via uv, FastAPI, pydantic, pytest, React, TypeScript, Vite, Vitest, CSS modules/plain CSS, yt-dlp, ffmpeg.
 
@@ -95,4 +95,3 @@
 - [ ] Use a sample transcript or extracted subtitles to generate study material.
 - [ ] Verify transcript and AI nodes seek the player.
 - [ ] Run backend tests, frontend tests, and frontend build.
-

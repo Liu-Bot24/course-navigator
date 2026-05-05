@@ -4,7 +4,7 @@
 
 Course Navigator is a local-first video course study workspace. It turns video lessons into scannable, collapsible, timestamp-linked learning material so a working learner can quickly decide what to watch, what to skip, and where to return later.
 
-The first version is for personal local use. It does not depend on Hermes or OpenClaw, does not provide cloud accounts, and does not proxy video traffic. It may reuse the same category of external tools already proven elsewhere: yt-dlp, ffmpeg, local ASR, browser cookies, and model APIs.
+The first version is for personal local use. It does not depend on external orchestration services, does not provide cloud accounts, and does not proxy video traffic. It may reuse common local tools such as yt-dlp, ffmpeg, local ASR, browser cookies, and model APIs.
 
 ## Core Principles
 

@@ -208,7 +208,5 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
 
 
 def _profile_name_from_model(model: str) -> str:
-    if model == "deepseek-ai/DeepSeek-V3.2":
-        return "DeepSeek V3.2"
     name = model.rsplit("/", 1)[-1].replace("-", " ").replace("_", " ").strip()
     return name or "Default Model"

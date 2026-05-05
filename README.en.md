@@ -2,6 +2,8 @@
 
 [中文说明](README.md)
 
+![Course Navigator banner](docs/images/course-navigator-banner-en.jpg)
+
 Course Navigator is a video course workspace that turns subtitles into a navigable study experience. Paste a supported video URL, extract subtitles, review the transcript beside the video, organize lessons into collections, and use AI to translate, analyze, and correct ASR text.
 
 It is built for learners, researchers, and course-heavy teams who need to understand long videos quickly, keep courses organized, and jump back to the right moment without scrubbing through hours of playback.
@@ -13,6 +15,7 @@ It is built for learners, researchers, and course-heavy teams who need to unders
 ## Highlights
 
 - Build a course library with collections, lesson titles, ordering, and local video cache controls.
+- Import and export lightweight course packages for sharing organized courses, corrected subtitles, translated subtitles, and AI study material.
 - Extract subtitles from supported video pages with `yt-dlp`.
 - Use direct access, browser login, or a cookies file for videos that require authentication.
 - Watch supported videos with clickable transcripts, bilingual subtitle views, and timestamp navigation.
@@ -23,6 +26,13 @@ It is built for learners, researchers, and course-heavy teams who need to unders
 - Add your own reference terms, names, product names, and common recognition errors before ASR correction.
 - Optionally validate ASR correction candidates with Tavily or Firecrawl.
 - Use one shared model profile library for translation, study generation, and ASR correction, with OpenAI-compatible and Anthropic formats.
+
+## What's New
+
+- Course package sharing: choose individual courses or full collections from the library and export a lightweight share package. Packages include video links, corrected subtitles, translated subtitles, AI study material, and an optional note. They do not include local video caches or model profiles. Full collections keep their collection name and lesson order when imported.
+- Better ASR search validation: search results are first synthesized into background information, then used together with video metadata and user reference text for the final correction pass. This helps reduce incorrect edits caused by outdated model knowledge.
+- Improved ASR review flow: suggestion navigation, linked before/after scrolling, hover review cards, confidence sorting, threshold acceptance, and optional auto-save after accepting suggestions.
+- Library refinements: collection ordering and collection deletion are supported; deleting a course also cleans up related local cache files.
 
 ## Requirements
 

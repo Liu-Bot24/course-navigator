@@ -3,7 +3,9 @@ import type {
   AsrCorrectionSearchConfig,
   AsrSearchSettings,
   AsrSearchSettingsInput,
+  CourseImportResponse,
   CourseItem,
+  CourseSharePackage,
   ExtractMode,
   ModelSettings,
   ModelSettingsInput,
@@ -25,6 +27,13 @@ export function apiPath(path: string): string {
 
 export async function listItems(): Promise<CourseItem[]> {
   return requestJson<CourseItem[]>("/items");
+}
+
+export async function importCoursePackage(input: CourseSharePackage): Promise<CourseImportResponse> {
+  return requestJson<CourseImportResponse>("/import", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
 
 export async function extractCourse(input: {

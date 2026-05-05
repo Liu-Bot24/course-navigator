@@ -23,10 +23,10 @@ vi.mock("./api", () => ({
     profiles: [
       {
         id: "default",
-        name: "DeepSeek V3.2",
+        name: "Primary Chat Model",
         provider_type: "openai",
-        base_url: "https://api.siliconflow.cn/v1",
-        model: "deepseek-ai/DeepSeek-V3.2",
+        base_url: "https://api.primary.example/v1",
+        model: "provider/primary-chat",
         context_window: null,
         max_tokens: null,
         has_api_key: true,
@@ -42,6 +42,7 @@ vi.mock("./api", () => ({
   }),
   getStudyJob: vi.fn(),
   getAsrCorrectionResult: vi.fn(),
+  importCoursePackage: vi.fn(),
   itemVideoPath: (itemId: string) => `/api/items/${itemId}/video`,
   listAvailableModels: vi.fn(),
   listItems: vi.fn().mockResolvedValue([]),
@@ -60,6 +61,7 @@ describe("App language defaults", () => {
     installTestLocalStorage();
     window.localStorage.removeItem("course-navigator-manual-collections");
     window.localStorage.removeItem("course-navigator-collapsed-collections");
+    window.localStorage.removeItem("course-navigator-collection-order");
     window.localStorage.removeItem("course-navigator-time-map-auto-open");
     window.localStorage.removeItem("course-navigator-last-selected-course");
     window.localStorage.removeItem("course-navigator-asr-save-accepted-changes");
@@ -429,10 +431,10 @@ describe("App language defaults", () => {
       profiles: [
         {
           id: "default",
-          name: "DeepSeek V3.2",
+          name: "Primary Chat Model",
           provider_type: "openai" as const,
-          base_url: "https://api.siliconflow.cn/v1",
-          model: "deepseek-ai/DeepSeek-V3.2",
+          base_url: "https://api.primary.example/v1",
+          model: "provider/primary-chat",
           context_window: null,
           max_tokens: null,
           has_api_key: true,
@@ -440,10 +442,10 @@ describe("App language defaults", () => {
         },
         {
           id: "mimo",
-          name: "mimo-v2.5-pro",
+          name: "Secondary Chat Model",
           provider_type: "anthropic" as const,
-          base_url: "https://api.minimaxi.com/anthropic/v1",
-          model: "MiniMax-M2.7",
+          base_url: "https://api.secondary.example/anthropic/v1",
+          model: "provider/secondary-chat",
           context_window: null,
           max_tokens: null,
           has_api_key: true,
@@ -484,7 +486,7 @@ describe("App language defaults", () => {
       );
     });
     const payload = vi.mocked(saveModelSettings).mock.calls[0][0];
-    expect(payload.profiles.map((profile) => profile.name)).toEqual(["DeepSeek V3.2", "mimo-v2.5-pro"]);
+    expect(payload.profiles.map((profile) => profile.name)).toEqual(["Primary Chat Model", "Secondary Chat Model"]);
     expect(await screen.findByText("模型选择已保存")).toBeTruthy();
   });
 
@@ -531,10 +533,10 @@ describe("App language defaults", () => {
       profiles: [
         {
           id: "default",
-          name: "DeepSeek V3.2",
+          name: "Primary Chat Model",
           provider_type: "openai",
-          base_url: "https://api.siliconflow.cn/v1",
-          model: "deepseek-ai/DeepSeek-V3.2",
+          base_url: "https://api.primary.example/v1",
+          model: "provider/primary-chat",
           context_window: 160000,
           max_tokens: 24000,
           has_api_key: true,
@@ -568,9 +570,9 @@ describe("App language defaults", () => {
     const providerType = screen.getByRole("combobox", { name: "接口格式" }) as HTMLSelectElement;
 
     expect(providerType.value).toBe("openai");
-    expect((screen.getByLabelText("档案名称") as HTMLInputElement).value).toBe("DeepSeek V3.2");
-    expect(baseUrl.value).toBe("https://api.siliconflow.cn/v1");
-    expect(model.value).toBe("deepseek-ai/DeepSeek-V3.2");
+    expect((screen.getByLabelText("档案名称") as HTMLInputElement).value).toBe("Primary Chat Model");
+    expect(baseUrl.value).toBe("https://api.primary.example/v1");
+    expect(model.value).toBe("provider/primary-chat");
     expect(contextWindow.value).toBe("160000");
     expect(maxTokens.value).toBe("24000");
     expect(titleTemperature.value).toBe("0.3");
@@ -579,10 +581,10 @@ describe("App language defaults", () => {
     fireEvent.change(providerType, { target: { value: "anthropic" } });
 
     expect(providerType.value).toBe("anthropic");
-    expect((screen.getByLabelText("档案名称") as HTMLInputElement).value).toBe("DeepSeek V3.2");
-    expect(baseUrl.value).toBe("https://api.siliconflow.cn/v1");
+    expect((screen.getByLabelText("档案名称") as HTMLInputElement).value).toBe("Primary Chat Model");
+    expect(baseUrl.value).toBe("https://api.primary.example/v1");
     expect(baseUrl.placeholder).toBe("https://api.anthropic.com/v1");
-    expect(model.value).toBe("deepseek-ai/DeepSeek-V3.2");
+    expect(model.value).toBe("provider/primary-chat");
     expect(contextWindow.value).toBe("160000");
     expect(maxTokens.value).toBe("24000");
     expect(titleTemperature.value).toBe("0.3");
@@ -730,6 +732,59 @@ describe("App language defaults", () => {
       );
     });
     expect(await screen.findByText("AI Prompting Updated")).toBeTruthy();
+  });
+
+  it("deletes a collection without deleting its courses", async () => {
+    const first = {
+      id: "lesson-1",
+      source_url: "https://example.com/lesson-1",
+      title: "Lesson One",
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+      collection_title: "AI Prompting",
+      course_index: 1,
+      sort_order: 1,
+    };
+    const second = {
+      ...first,
+      id: "lesson-2",
+      source_url: "https://example.com/lesson-2",
+      title: "Lesson Two",
+      course_index: 2,
+      sort_order: 2,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([first, second]);
+    vi.mocked(updateCourseItem).mockImplementation(async (itemId, input) => ({
+      ...(itemId === "lesson-1" ? first : second),
+      collection_title: input.collection_title ?? "",
+      course_index: input.course_index ?? null,
+      sort_order: input.sort_order ?? null,
+    }));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+
+    await waitFor(() => expect(getLibraryCourseButtons("Lesson One").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "删除专辑 AI Prompting" }));
+
+    await waitFor(() => {
+      expect(updateCourseItem).toHaveBeenCalledWith(
+        "lesson-1",
+        expect.objectContaining({ collection_title: null, course_index: null, sort_order: null }),
+      );
+      expect(updateCourseItem).toHaveBeenCalledWith(
+        "lesson-2",
+        expect.objectContaining({ collection_title: null, course_index: null, sort_order: null }),
+      );
+    });
+    expect(screen.queryByText("AI Prompting")).toBeNull();
+    expect(getLibraryCourseButtons("Lesson One").length).toBeGreaterThan(0);
+    expect(getLibraryCourseButtons("Lesson Two").length).toBeGreaterThan(0);
+    confirmSpy.mockRestore();
   });
 
   it("remembers manual time-map collapse preference", async () => {
