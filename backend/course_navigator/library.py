@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -20,10 +21,15 @@ class CourseLibrary:
         path = self._item_path(item.id)
         if not path:
             raise ValueError("Invalid course item id")
-        path.write_text(
-            item.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp_path.write_text(
+                item.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     def get(self, item_id: str) -> CourseItem | None:
         path = self._item_path(item_id)

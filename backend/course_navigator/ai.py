@@ -1135,6 +1135,28 @@ def _looks_like_short_latin_text(value: str) -> bool:
     return False
 
 
+def _text_needs_output_language_repair(value: str, output_language: OutputLanguage) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    if output_language == "zh-CN":
+        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+        latin_count = len(re.findall(r"[A-Za-z]", text))
+        if cjk_count >= 2 or not latin_count:
+            return False
+        return _looks_like_short_latin_text(text)
+    if output_language == "ja":
+        kana_count = len(re.findall(r"[\u3040-\u30ff]", text))
+        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+        latin_count = len(re.findall(r"[A-Za-z]", text))
+        if kana_count >= 2 or cjk_count >= 2 or not latin_count:
+            return False
+        return _looks_like_short_latin_text(text)
+    cjk_or_kana_count = len(re.findall(r"[\u3040-\u30ff\u4e00-\u9fff]", text))
+    latin_word_count = len(re.findall(r"[A-Za-z][A-Za-z']+", text))
+    return cjk_or_kana_count >= 4 and latin_word_count < 4
+
+
 def _chunk_indices(indices: list[int], target_size: int) -> list[list[int]]:
     chunks: list[list[int]] = []
     current: list[int] = []
@@ -1381,6 +1403,8 @@ def _generate_semantic_ranges_with_provider(
                             "Return strict JSON only: {\"blocks\":[{\"start\":number,\"end\":number,"
                             "\"title\":string,\"summary\":string,\"priority\":\"focus|skim|skip|review\","
                             "\"boundary_reason\":string,\"confidence\":number}]}. "
+                            f"All user-visible strings except proper nouns, product names, code identifiers, and "
+                            f"short abbreviations must be written in {target_language}. "
                             f"Target block duration is about {_duration_label(strategy.target_block_seconds)}; "
                             f"acceptable range is {_duration_label(strategy.min_block_seconds)} to "
                             f"{_duration_label(strategy.max_block_seconds)} unless the course structure strongly "
@@ -2038,6 +2062,17 @@ def _generate_learning_block_with_provider(
             "terms": [],
             "open_questions": [],
         }
+    else:
+        structure = _repair_learning_block_structure_language_if_needed(
+            title=title,
+            index=index,
+            source_chunk=source_chunk,
+            translated_chunk=translated_chunk,
+            context_summary=context_summary,
+            structure=structure,
+            provider=provider,
+            output_language=output_language,
+        )
 
     try:
         detailed_notes = _generate_learning_block_interpretation_with_provider(
@@ -2111,7 +2146,9 @@ def _generate_learning_block_structure_with_provider(
                     "Return strict JSON only: {\"title\":string,\"summary\":string,"
                     "\"priority\":\"focus|skim|skip|review\",\"key_points\":[{\"type\":string,"
                     "\"text\":string,\"evidence\":string}],\"terms\":[string],\"open_questions\":[string]}. "
-                    "The title should be short. The summary should explain the block in one or two sentences. "
+                    f"All user-visible strings except proper nouns, product names, code identifiers, and short "
+                    f"abbreviations must be written in {target_language}. The title should be short. "
+                    "The summary should explain the block in one or two sentences. "
                     "key_points must extract concrete concepts, claims, methods, examples, steps, warnings, "
                     "definitions, comparisons, transitions, or uncertainties rather than generic topic names. "
                     "Use evidence to briefly identify what transcript content supports each point. "
@@ -2139,6 +2176,69 @@ def _generate_learning_block_structure_with_provider(
     if not isinstance(payload, dict):
         raise TypeError("Learning block structure payload must be an object")
     return payload
+
+
+def _repair_learning_block_structure_language_if_needed(
+    title: str,
+    index: int,
+    source_chunk: list[TranscriptSegment],
+    translated_chunk: list[TranscriptSegment],
+    context_summary: str,
+    structure: dict,
+    provider: LlmProvider,
+    output_language: OutputLanguage,
+) -> dict:
+    visible_fields = [
+        str(structure.get("title") or ""),
+        str(structure.get("summary") or ""),
+        *[str(point) for point in _normalize_key_points(structure.get("key_points"))],
+    ]
+    if not any(_text_needs_output_language_repair(text, output_language) for text in visible_fields):
+        return structure
+
+    target_language = _target_language_name(output_language)
+    try:
+        payload = _chat_json(
+            provider,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        f"Translate only the user-visible structure fields into natural {target_language}. "
+                        "Return strict JSON only: {\"title\":string,\"summary\":string,\"key_points\":[string]}. "
+                        "Preserve the meaning, priority, proper names, product names, code identifiers, "
+                        "acronyms, and short quoted phrases. Do not expand abbreviations into full names unless "
+                        "the original field already did so. Do not add facts, remove facts, or write interpretation."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        _learning_block_user_context(title, index, source_chunk, translated_chunk, context_summary)
+                        + "\n\nLearning block structure to repair:\n"
+                        + json.dumps(_serializable_learning_block_structure(structure), ensure_ascii=False)
+                    ),
+                },
+            ],
+            temperature=0.1,
+            max_tokens=1200,
+            timeout=90,
+            task_key="interpretation",
+        )
+    except Exception:
+        return structure
+    if not isinstance(payload, dict):
+        return structure
+
+    repaired = dict(structure)
+    for field_name in ("title", "summary"):
+        value = str(payload.get(field_name) or "").strip()
+        if value:
+            repaired[field_name] = value
+    key_points = _normalize_key_points(payload.get("key_points"))
+    if key_points:
+        repaired["key_points"] = key_points
+    return repaired
 
 
 def _generate_learning_block_interpretation_with_provider(

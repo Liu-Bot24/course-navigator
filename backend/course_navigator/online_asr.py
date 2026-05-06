@@ -12,7 +12,7 @@ import httpx
 from .config import OnlineAsrServiceConfig, OnlineAsrSettings
 from .models import ExtractRequest, OnlineAsrProvider, TranscriptSegment
 from .subtitles import parse_subtitle_text
-from .ytdlp import YtDlpError, build_auth_args
+from .ytdlp import YtDlpError, build_auth_args, build_runtime_args
 
 
 DEFAULT_CHUNK_LIMIT_BYTES = 20 * 1024 * 1024
@@ -68,6 +68,7 @@ def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_d
         "wav",
         "--output",
         output_template,
+        *build_runtime_args(),
         *build_auth_args(request),
         str(request.url),
     ]

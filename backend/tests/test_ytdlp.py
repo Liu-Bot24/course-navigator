@@ -129,6 +129,82 @@ def test_fetch_metadata_parses_ytdlp_json(monkeypatch):
     assert metadata.automatic_captions == ["zh-Hans"]
 
 
+def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(monkeypatch, tmp_path):
+    run_calls = []
+    popen_calls = []
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {"en": [{"ext": "vtt"}]},
+                "automatic_captions": {},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        run_calls.append(cmd)
+        if "--write-subs" in cmd and "--dump-json" not in cmd:
+            Path(tmp_path, "abc.en.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi\n",
+                encoding="utf-8",
+            )
+        if "--extract-audio" in cmd:
+            Path(tmp_path, "abc.wav").write_text("audio", encoding="utf-8")
+        return Result()
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, cmd, stdout, stderr, text):
+            popen_calls.append(cmd)
+            self.stdout = iter([])
+
+        def wait(self):
+            Path(tmp_path, "abc.mp4").write_text("video", encoding="utf-8")
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            Path(tmp_path, "abc.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi\n",
+                encoding="utf-8",
+            )
+            return "", ""
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/whisper" if name == "whisper" else None)
+    runner = YtDlpRunner(binary="yt-dlp")
+    extract_request = ExtractRequest(
+        url="https://www.youtube.com/watch?v=abc&list=PL123",
+        mode="browser",
+        browser="chrome",
+        language="en",
+    )
+    download_request = DownloadRequest(
+        url="https://www.youtube.com/watch?v=abc&list=PL123",
+        mode="browser",
+        browser="chrome",
+    )
+
+    runner.fetch_metadata(extract_request)
+    runner.extract_subtitles(extract_request, tmp_path, make_metadata(language="en", subtitles=["en"], automatic_captions=[]))
+    runner.download_video(download_request, tmp_path, "abc")
+    runner.extract_asr(extract_request, tmp_path, "abc")
+
+    yt_dlp_commands = [cmd for cmd in [*run_calls, *popen_calls] if cmd[0] == "yt-dlp"]
+    assert len(yt_dlp_commands) == 4
+    for cmd in yt_dlp_commands:
+        assert "--remote-components" in cmd
+        assert cmd[cmd.index("--remote-components") + 1] == "ejs:github"
+        assert "--no-playlist" in cmd
+
+
 def test_fetch_metadata_keeps_bilibili_subtitles_visible(monkeypatch):
     calls = []
 
@@ -498,6 +574,10 @@ def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypat
         OnlineAsrSettings(provider="xai", xai={"api_key": "xai-test"}),
     )
 
+    yt_dlp_cmd = next(cmd for cmd in calls if cmd[0] == "yt-dlp")
+    assert "--remote-components" in yt_dlp_cmd
+    assert yt_dlp_cmd[yt_dlp_cmd.index("--remote-components") + 1] == "ejs:github"
+    assert "--no-playlist" in yt_dlp_cmd
     ffmpeg_cmd = next(cmd for cmd in calls if cmd[0] == "ffmpeg")
     assert "-b:a" in ffmpeg_cmd
     assert ffmpeg_cmd[ffmpeg_cmd.index("-b:a") + 1] == "64k"

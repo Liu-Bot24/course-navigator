@@ -34,6 +34,11 @@ DEFAULT_SUBTITLE_LANGUAGE_PRIORITY = (
     "en",
     "ja",
 )
+YTDLP_RUNTIME_ARGS = ("--remote-components", "ejs:github", "--no-playlist")
+
+
+def build_runtime_args() -> list[str]:
+    return list(YTDLP_RUNTIME_ARGS)
 
 
 def build_auth_args(request: ExtractRequest | DownloadRequest) -> list[str]:
@@ -59,6 +64,7 @@ class YtDlpRunner:
             "--skip-download",
             "--dump-json",
             "--no-warnings",
+            *build_runtime_args(),
             "--write-subs",
             "--write-auto-subs",
             "--sub-langs",
@@ -119,6 +125,7 @@ class YtDlpRunner:
             "vtt",
             "--output",
             output_template,
+            *build_runtime_args(),
             *build_auth_args(request),
             str(request.url),
         ]
@@ -157,6 +164,7 @@ class YtDlpRunner:
             "mp4",
             "--output",
             output_template,
+            *build_runtime_args(),
             *build_auth_args(request),
             str(request.url),
         ]
@@ -204,6 +212,7 @@ class YtDlpRunner:
             "wav",
             "--output",
             audio_template,
+            *build_runtime_args(),
             *build_auth_args(request),
             str(request.url),
         ]

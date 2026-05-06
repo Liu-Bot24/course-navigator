@@ -1255,6 +1255,58 @@ def test_learning_block_generation_splits_structure_interpretation_and_high_fide
     assert block["high_fidelity_text"] == "详解层保留两个版本的铺垫、比较和结论。"
 
 
+def test_learning_block_structure_repairs_visible_fields_to_output_language(monkeypatch):
+    source_chunk = [
+        TranscriptSegment(start=0, end=5, text="AI prompting has changed since ChatGPT first came out."),
+        TranscriptSegment(start=5, end=10, text="The goal is to become an expert prompter."),
+    ]
+    translated_chunk = [
+        TranscriptSegment(start=0, end=5, text="自 ChatGPT 首次出现以来，AI 提示方式已经发生变化。"),
+        TranscriptSegment(start=5, end=10, text="目标是成为专家级提示者。"),
+    ]
+    calls: list[tuple[str | None, str, str]] = []
+
+    def fake_chat_json(provider, messages, temperature, max_tokens, timeout, task_key=None):
+        calls.append((task_key, messages[0]["content"], messages[1]["content"]))
+        if len(calls) == 1:
+            return {
+                "title": "AI Prompting Evolution",
+                "summary": "The speaker sets the context and introduces expert prompting.",
+                "priority": "focus",
+                "key_points": ["AI prompting changed after ChatGPT."],
+                "terms": ["ChatGPT"],
+                "open_questions": [],
+            }
+        if len(calls) == 2:
+            return {
+                "title": "AI 提示方式的演进",
+                "summary": "讲者设定课程背景，并引出成为专家级提示者的目标。",
+                "key_points": ["AI 提示方式在 ChatGPT 之后发生变化。"],
+            }
+        if len(calls) == 3:
+            return {"detailed_notes": "解读层说明课程导入为什么重要。"}
+        return {"high_fidelity_text": "详解层保留提示方式变化和课程目标。"}
+
+    monkeypatch.setattr(ai, "_chat_json", fake_chat_json)
+
+    block = ai._generate_learning_block_with_provider(
+        title="The AI Novice and the AI Power User",
+        index=0,
+        source_chunk=source_chunk,
+        translated_chunk=translated_chunk,
+        context_summary="课程讨论 AI 使用能力的差异。",
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="learning"),
+        output_language="zh-CN",
+        detail_level="standard",
+    )
+
+    assert [call[0] for call in calls] == ["interpretation", "interpretation", "interpretation", "high_fidelity"]
+    assert "Translate only the user-visible structure fields" in calls[1][1]
+    assert block["title"] == "AI 提示方式的演进"
+    assert block["summary"] == "讲者设定课程背景，并引出成为专家级提示者的目标。"
+    assert block["key_points"] == ["AI 提示方式在 ChatGPT 之后发生变化。"]
+
+
 def test_fallback_outline_has_three_visible_levels():
     blocks = [
         {
