@@ -1062,7 +1062,8 @@ describe("App language defaults", () => {
 
     expect(screen.queryByRole("button", { name: "全部重新生成" })).toBeNull();
     const settingsToggle = await screen.findByRole("button", { name: "展开学习地图设置" });
-    expect(settingsToggle.closest(".ai-tabs")).toBeTruthy();
+    expect(settingsToggle.closest(".ai-tab-strip")).toBeTruthy();
+    expect(settingsToggle.closest(".ai-tabs")).toBeNull();
     fireEvent.click(settingsToggle);
 
     const fullRegenerateButton = await screen.findByRole("button", { name: "全部重新生成" });

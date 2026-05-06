@@ -2933,35 +2933,42 @@ body.is-resizing-layout {
   line-height: 1.45;
 }
 
+.ai-tab-strip {
+  position: relative;
+  border-bottom: 1px solid #d8dde6;
+  background: #ffffff;
+}
+
 .ai-tabs {
   display: grid;
-  position: relative;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px;
   align-items: center;
-  border-bottom: 1px solid #d8dde6;
-  padding: 12px 10px 11px;
+  padding: 8px 10px;
 }
 
 .study-settings-toggle {
   position: absolute;
   left: 50%;
-  bottom: 6px;
+  bottom: -13px;
   display: grid;
-  width: 28px;
-  height: 18px;
+  width: 34px;
+  height: 14px;
   place-items: center;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: #98a2b3;
+  border: 1px solid #d8dde6;
+  border-top: 0;
+  border-radius: 0 0 8px 8px;
+  background: #f7f9fc;
+  color: #667085;
   padding: 0;
   transform: translateX(-50%);
+  z-index: 2;
 }
 
 .study-settings-toggle:hover,
 .study-settings-toggle.open {
-  background: #eef1f6;
+  border-color: #cbd3df;
+  background: #f7f9fc;
   color: #475467;
 }
 

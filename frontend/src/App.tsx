@@ -2780,19 +2780,21 @@ export function App() {
         />
 
         <aside className={rightRailClassName}>
-          <div className="ai-tabs">
-            <TabButton active={activeTab === "guide"} onClick={() => setActiveTab("guide")}>
-              {copy.guide}
-            </TabButton>
-            <TabButton active={activeTab === "outline"} onClick={() => setActiveTab("outline")}>
-              {copy.outline}
-            </TabButton>
-            <TabButton active={activeTab === "detailed"} onClick={() => setActiveTab("detailed")}>
-              {copy.detailed}
-            </TabButton>
-            <TabButton active={activeTab === "high"} onClick={() => setActiveTab("high")}>
-              {copy.high}
-            </TabButton>
+          <div className="ai-tab-strip">
+            <div className="ai-tabs">
+              <TabButton active={activeTab === "guide"} onClick={() => setActiveTab("guide")}>
+                {copy.guide}
+              </TabButton>
+              <TabButton active={activeTab === "outline"} onClick={() => setActiveTab("outline")}>
+                {copy.outline}
+              </TabButton>
+              <TabButton active={activeTab === "detailed"} onClick={() => setActiveTab("detailed")}>
+                {copy.detailed}
+              </TabButton>
+              <TabButton active={activeTab === "high"} onClick={() => setActiveTab("high")}>
+                {copy.high}
+              </TabButton>
+            </div>
             <button
               className={studySettingsOpen ? "study-settings-toggle open" : "study-settings-toggle"}
               type="button"
