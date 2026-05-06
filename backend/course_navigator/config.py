@@ -84,6 +84,7 @@ class OnlineAsrSettings(BaseModel):
 
 class Settings(BaseModel):
     data_dir: Path = Path(".course-navigator")
+    workspace_dir: Path | None = None
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
@@ -157,6 +158,7 @@ def load_settings() -> Settings:
         ]
     return Settings(
         data_dir=Path(os.getenv("COURSE_NAVIGATOR_DATA_DIR", ".course-navigator")),
+        workspace_dir=Path(os.getenv("COURSE_NAVIGATOR_WORKSPACE_DIR", "course-navigator-workspace")),
         llm_base_url=os.getenv("COURSE_NAVIGATOR_LLM_BASE_URL"),
         llm_api_key=os.getenv("COURSE_NAVIGATOR_LLM_API_KEY"),
         llm_model=legacy_model,

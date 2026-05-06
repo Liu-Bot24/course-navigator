@@ -2,6 +2,7 @@
 name = "course-navigator"
 version = "0.1.0"
 description = "Video course study workspace"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0",
@@ -9,6 +10,7 @@ dependencies = [
   "opencc-python-reimplemented>=0.1.7",
   "pydantic>=2.7.0",
   "python-dotenv>=1.0.1",
+  "python-multipart>=0.0.20",
   "uvicorn[standard]>=0.30.0",
   "yt-dlp>=2024.12.0",
 ]

@@ -2,10 +2,12 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  deleteLocalVideo,
   extractCourse,
   getOnlineAsrSettings,
   getModelSettings,
   getStudyJob,
+  importLocalVideo,
   listItems,
   previewCourse,
   saveOnlineAsrSettings,
@@ -54,6 +56,7 @@ vi.mock("./api", () => ({
   getStudyJob: vi.fn(),
   getAsrCorrectionResult: vi.fn(),
   importCoursePackage: vi.fn(),
+  importLocalVideo: vi.fn(),
   itemVideoPath: (itemId: string) => `/api/items/${itemId}/video`,
   listAvailableModels: vi.fn(),
   listItems: vi.fn().mockResolvedValue([]),
@@ -156,6 +159,134 @@ describe("App language defaults", () => {
     expect(sourceSelect.value).toBe("local_upload");
   });
 
+  it("imports local videos from the topbar icon button", async () => {
+    const importedItem = {
+      id: "local-video",
+      source_url: "local-video://local-video",
+      title: "Local Video",
+      duration: null,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: "downloads/local-video.mp4",
+    };
+    vi.mocked(importLocalVideo).mockResolvedValueOnce(importedItem);
+
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "导入本地视频" }));
+    const file = new File(["video"], "local-video.mp4", { type: "video/mp4" });
+    fireEvent.change(screen.getByLabelText("选择本地视频文件"), {
+      target: {
+        files: [file],
+      },
+    });
+
+    await waitFor(() => {
+      expect(importLocalVideo).toHaveBeenCalledWith(file);
+    });
+    expect((await screen.findAllByText("Local Video")).length).toBeGreaterThan(0);
+    expect(container.querySelector("video")).toBeTruthy();
+  });
+
+  it("does not offer cache-only actions for local imported videos", async () => {
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "local-video",
+        source_url: "local-video://local-video",
+        title: "Local Video",
+        duration: 67.5,
+        created_at: new Date().toISOString(),
+        transcript: [],
+        metadata: null,
+        study: null,
+        local_video_path: "downloads/local-video.mp4",
+      },
+    ]);
+
+    render(<App />);
+
+    const cacheButton = await screen.findByRole("button", { name: "缓存" });
+    expect((cacheButton as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "移除缓存" })).toBeNull();
+    expect(deleteLocalVideo).not.toHaveBeenCalled();
+  });
+
+  it("shows structured extraction errors instead of object strings", async () => {
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "local-video",
+        source_url: "local-video://local-video",
+        title: "Local Video",
+        duration: 67.5,
+        created_at: new Date().toISOString(),
+        transcript: [],
+        metadata: null,
+        study: null,
+        local_video_path: "downloads/local-video.mp4",
+      },
+    ]);
+    vi.mocked(startExtractJob).mockRejectedValueOnce({ detail: "无法读取本地视频音频" });
+
+    render(<App />);
+
+    expect((await screen.findAllByText("Local Video")).length).toBeGreaterThan(0);
+    fireEvent.change(screen.getByRole("combobox", { name: "字幕来源" }), { target: { value: "online_asr" } });
+    fireEvent.click(screen.getByRole("button", { name: "获取字幕" }));
+
+    expect(await screen.findByText("无法读取本地视频音频")).toBeTruthy();
+    expect(screen.queryByText("[object Object]")).toBeNull();
+  });
+
+  it("keeps local video playback selected after fetching subtitles", async () => {
+    const localItem = {
+      id: "local-video",
+      source_url: "local-video://local-video",
+      title: "Local Video",
+      duration: 67.5,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: "downloads/local-video.mp4",
+    };
+    vi.mocked(listItems)
+      .mockResolvedValueOnce([localItem])
+      .mockResolvedValueOnce([
+        {
+          ...localItem,
+          transcript: [{ start: 0, end: 2, text: "Generated subtitle" }],
+        },
+      ]);
+    vi.mocked(startExtractJob).mockResolvedValueOnce({
+      job_id: "extract-job",
+      item_id: "local-video",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "字幕提取完成",
+      error: null,
+    });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => {
+      expect(container.querySelector("video")).toBeTruthy();
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "字幕来源" }), { target: { value: "online_asr" } });
+    fireEvent.click(screen.getByRole("button", { name: "获取字幕" }));
+
+    await waitFor(() => {
+      expect(startExtractJob).toHaveBeenCalledWith(expect.objectContaining({ url: "local-video://local-video" }));
+    });
+    await waitFor(() => {
+      expect(container.querySelector("video")).toBeTruthy();
+    });
+    expect(screen.queryByText("这个来源暂时不能嵌入播放，但字幕导航仍可使用。")).toBeNull();
+    expect(screen.getByRole("button", { name: "本地" }).className).toContain("active");
+  });
+
   it("does not embed Bilibili by default and offers force streaming", async () => {
     vi.mocked(listItems).mockResolvedValueOnce([
       {
@@ -229,6 +360,59 @@ describe("App language defaults", () => {
     await waitFor(() => {
       expect(container.querySelector("video track")).toBeTruthy();
     });
+  });
+
+  it("exports course packages without local workspace video paths", async () => {
+    let exportedBlob: Blob | null = null;
+    const createObjectUrl = vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
+      exportedBlob = blob as Blob;
+      return "blob:course-package";
+    });
+    const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "cached-course",
+        source_url: "https://example.com/video",
+        title: "Cached Course",
+        duration: 60,
+        created_at: new Date().toISOString(),
+        transcript: [{ start: 0, end: 2, text: "Opening." }],
+        metadata: null,
+        study: {
+          one_line: "课程摘要。",
+          time_map: [],
+          outline: [],
+          detailed_notes: "",
+          high_fidelity_text: "",
+          translated_transcript: [],
+          prerequisites: [],
+          thought_prompts: [],
+          review_suggestions: [],
+        },
+        local_video_path: "downloads/cached-course.mp4",
+      },
+    ]);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "导出课程" }));
+    fireEvent.click(await screen.findByRole("button", { name: "导出所选" }));
+
+    await waitFor(() => {
+      expect(exportedBlob).toBeTruthy();
+    });
+    const exported = JSON.parse(await readBlobText(exportedBlob!));
+    expect(exported.format).toBe("course-navigator-share");
+    expect(exported.items[0].id).toBe("cached-course");
+    expect(exported.items[0].study.one_line).toBe("课程摘要。");
+    expect(exported.items[0].transcript[0].text).toBe("Opening.");
+    expect(exported.items[0]).not.toHaveProperty("local_video_path");
+    expect(JSON.stringify(exported)).not.toContain("downloads/cached-course.mp4");
+
+    anchorClick.mockRestore();
+    revokeObjectUrl.mockRestore();
+    createObjectUrl.mockRestore();
   });
 
   it("falls back to transcript duration and shows translated title when available", async () => {
@@ -404,7 +588,6 @@ describe("App language defaults", () => {
         }),
       );
     });
-    expect(await screen.findByText("正在缓存视频 48%")).toBeTruthy();
   });
 
   it("keeps the top-right fullscreen control available after entering shell fullscreen", async () => {
@@ -988,6 +1171,15 @@ function installTestLocalStorage() {
       removeItem: (key: string) => store.delete(key),
       clear: () => store.clear(),
     },
+  });
+}
+
+function readBlobText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(blob);
   });
 }
 

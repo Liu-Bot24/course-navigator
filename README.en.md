@@ -4,7 +4,7 @@
 
 ![Course Navigator banner](docs/images/course-navigator-banner-en.jpg)
 
-Course Navigator is a video course workspace that turns subtitles into a navigable study experience. Paste a supported video URL, extract subtitles, review the transcript beside the video, organize lessons into collections, and use AI to translate, analyze, and correct ASR text.
+Course Navigator is a video course workspace that turns subtitles into a navigable study experience. Paste a supported video URL or import a local video, extract subtitles, review the transcript beside the video, organize lessons into collections, and use AI to translate, analyze, and correct ASR text.
 
 It is built for learners, researchers, and course-heavy teams who need to understand long videos quickly, keep courses organized, and jump back to the right moment without scrubbing through hours of playback.
 
@@ -14,9 +14,10 @@ It is built for learners, researchers, and course-heavy teams who need to unders
 
 ## Highlights
 
-- Build a course library with collections, lesson titles, ordering, and local video cache controls.
+- Build a course library with collections, lesson titles, ordering, local video imports, and local video cache controls.
 - Import and export lightweight course packages for sharing organized courses, corrected subtitles, translated subtitles, and AI study material.
 - Extract subtitles from supported video pages with `yt-dlp`, or use local ASR, online ASR, or a local subtitle upload.
+- Manage active course material in a dedicated workspace, including course records, AI study material, and local video files; runtime extraction files and settings stay in the local runtime directory.
 - Online ASR supports xAI, OpenAI Whisper, Groq Whisper, and custom compatible endpoints.
 - Use direct access, browser login, or a cookies file for videos that require authentication.
 - Watch supported videos with clickable transcripts, bilingual subtitle views, and timestamp navigation.
@@ -30,6 +31,9 @@ It is built for learners, researchers, and course-heavy teams who need to unders
 
 ## What's New
 
+- Local video import: import local videos from the top toolbar, keep them in the course workspace, and play them immediately in local mode. Imported videos can use local ASR or online ASR for subtitle generation.
+- Workspace management: active course material now lives in a dedicated workspace. Course records, AI study material, and active video files are managed with the course, while extraction work files and app settings stay in the runtime data directory.
+- Local video cleanup: local imported courses no longer expose a separate cache-removal action. Deleting the course removes both the course record and the imported video file; downloaded caches for online courses can still be removed independently.
 - Subtitle sources: local subtitle upload and online ASR are now supported. Online ASR extracts audio, compresses it, splits it when needed, and returns timestamped subtitles for videos without platform captions.
 - Online ASR setup: choose xAI, OpenAI Whisper, Groq Whisper, a custom endpoint, or “Do not use online ASR.” Provider changes are saved immediately, and ASR prefers the source video language when it is available.
 - Local ASR improvements: extraction now shows progress, and Chinese output is normalized to Simplified Chinese.
@@ -103,7 +107,8 @@ The app also reads optional environment settings:
 
 | Setting | Controls | Default |
 | --- | --- | --- |
-| `COURSE_NAVIGATOR_DATA_DIR` | Local app data directory | `.course-navigator` |
+| `COURSE_NAVIGATOR_WORKSPACE_DIR` | Course workspace for records, AI study material, imported videos, and local video caches | `course-navigator-workspace` |
+| `COURSE_NAVIGATOR_DATA_DIR` | Local runtime data for subtitle extraction and ASR work files | `.course-navigator` |
 | `COURSE_NAVIGATOR_LLM_BASE_URL` | Optional single-profile API address | Empty |
 | `COURSE_NAVIGATOR_LLM_API_KEY` | Optional single-profile API key | Empty |
 | `COURSE_NAVIGATOR_LLM_MODEL` | Optional single-profile model name | Empty |
@@ -164,7 +169,7 @@ Supported sites, subtitle languages, and automatic captions depend on `yt-dlp` a
 
 ## Course Management
 
-The library can group videos into collections, edit course and collection names, adjust lesson order, copy source links, remove records, and manage local video caches. Collections are useful for playlists, lecture series, interviews, or any long-running learning project.
+The library can group videos into collections, edit course and collection names, adjust lesson order, copy source links, remove records, and manage downloaded caches for online courses. For imported local videos, the video file is part of the course material; deleting the course also deletes that imported video file. Collections are useful for playlists, lecture series, interviews, or any long-running learning project.
 
 ## AI Study Material
 
@@ -217,6 +222,12 @@ npm run dev
 
 ## Privacy And Data
 
-Course Navigator stores course records, generated study material, local settings, and cached media on your machine.
+Course Navigator stores course records, generated study material, imported videos, and local video caches in your course workspace. Subtitle extraction files, ASR work files, and local settings are kept in the local runtime data directory. The first time the new workspace is used, Course Navigator copies course records and local video caches from the old data directory into the workspace.
 
 When you use AI translation, study generation, or ASR correction, the relevant transcript text and context are sent to the model provider you configured. When search-assisted ASR correction is enabled, search queries are sent to the search provider you configured. Keep API keys on your own machine and use providers you trust.
+
+See [PRIVACY.md](PRIVACY.md) for the full privacy notes.
+
+## License And Security
+
+Course Navigator is released under the [MIT License](LICENSE). See [SECURITY.md](SECURITY.md) for security reporting and responsible disclosure.

@@ -24,8 +24,9 @@ def extract_online_asr_transcript(
     request: ExtractRequest,
     target_dir: Path,
     item_id: str,
-    yt_dlp_binary: str,
+    yt_dlp_binary: str | None,
     settings: OnlineAsrSettings,
+    source_video_path: Path | None = None,
     progress: Callable[[int, str], None] | None = None,
 ) -> list[TranscriptSegment]:
     if settings.provider == "none":
@@ -38,7 +39,11 @@ def extract_online_asr_transcript(
 
     target_dir.mkdir(parents=True, exist_ok=True)
     _report(progress, 5, "正在为在线 ASR 抽取音频")
-    source_audio = _extract_audio(request, target_dir, item_id, yt_dlp_binary)
+    source_audio = (
+        _extract_audio_from_file(source_video_path, target_dir, item_id)
+        if source_video_path
+        else _extract_audio(request, target_dir, item_id, yt_dlp_binary or "yt-dlp")
+    )
     _report(progress, 28, "音频已抽取，正在压缩为在线 ASR 音频")
     compressed_audio = _compress_audio(source_audio, target_dir / f"{item_id}.online-asr.mp3")
     _report(progress, 38, "正在检查在线 ASR 音频分块")
@@ -73,6 +78,28 @@ def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_d
     if not candidates:
         raise YtDlpError("yt-dlp did not produce an audio file for online ASR")
     return candidates[-1]
+
+
+def _extract_audio_from_file(source_video_path: Path, target_dir: Path, item_id: str) -> Path:
+    if not shutil.which("ffmpeg"):
+        raise YtDlpError("在线 ASR 需要 ffmpeg 来抽取并压缩音频")
+    target = target_dir / f"{item_id}.online-source.wav"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source_video_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(target),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0 or not target.exists():
+        raise YtDlpError(result.stderr.strip() or "ffmpeg failed to extract audio from local video")
+    return target
 
 
 def _compress_audio(source: Path, target: Path) -> Path:

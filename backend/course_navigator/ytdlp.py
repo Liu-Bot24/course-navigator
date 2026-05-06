@@ -217,49 +217,26 @@ class YtDlpRunner:
         if not audio_file:
             raise YtDlpError("yt-dlp did not produce an audio file for ASR")
 
-        whisper_binary = "whisper"
-        resolved_whisper = shutil.which(whisper_binary)
-        if not resolved_whisper:
-            raise YtDlpError("Local ASR requires the whisper command, but it was not found in PATH")
+        return _run_whisper_asr(audio_file, target_dir, request.language, progress)
 
-        asr_cmd = [
-            resolved_whisper,
-            str(audio_file),
-            "--model",
-            "base",
-            "--output_format",
-            "vtt",
-            "--output_dir",
-            str(target_dir),
-        ]
-        if request.language and request.language != "auto":
-            asr_cmd.extend(["--language", _whisper_language(request.language)])
+    def extract_asr_from_file(
+        self,
+        video_path: Path,
+        target_dir: Path,
+        item_id: str,
+        language: str = "auto",
+        progress: Callable[[int, str], None] | None = None,
+    ) -> list[TranscriptSegment]:
         if progress:
-            progress(40, "本地 ASR 正在转写音频")
-        asr_process = subprocess.Popen(asr_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        started_at = time.monotonic()
-        stdout = ""
-        stderr = ""
-        while True:
-            try:
-                stdout, stderr = asr_process.communicate(timeout=2)
-                break
-            except subprocess.TimeoutExpired:
-                if progress:
-                    elapsed = time.monotonic() - started_at
-                    progress(min(88, 40 + int(elapsed * 1.8)), f"本地 ASR 正在转写音频，已用时 {int(elapsed)}s")
-        if asr_process.returncode != 0:
-            raise YtDlpError(stderr.strip() or stdout.strip() or "Local ASR failed")
+            progress(3, "正在准备本地视频 ASR 音频")
+        audio_file = _extract_audio_file(video_path, target_dir, item_id)
         if progress:
-            progress(92, "本地 ASR 已生成字幕，正在整理文本")
+            progress(32, "音频已抽取，正在启动本地 ASR")
+        return _run_whisper_asr(audio_file, target_dir, language, progress)
 
-        subtitle_file = _find_newest_subtitle(target_dir)
-        if not subtitle_file:
-            raise YtDlpError("Local ASR did not produce a subtitle file")
-        return _simplify_chinese_segments(parse_subtitle_text(
-            subtitle_file.read_text(encoding="utf-8", errors="replace"),
-            subtitle_file.suffix.lstrip("."),
-        ))
+    def probe_local_video_duration(self, path: Path) -> float | None:
+        duration = _media_duration(path)
+        return duration if duration > 0 else None
 
 
 def choose_source_subtitle_language(metadata: VideoMetadata | None, requested: str = "auto") -> str:
@@ -542,6 +519,100 @@ def _find_newest_audio(target_dir: Path, item_id: str) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _extract_audio_file(video_path: Path, target_dir: Path, item_id: str) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if not shutil.which("ffmpeg"):
+        raise YtDlpError("本地视频 ASR 需要 ffmpeg 来抽取音频")
+    audio_file = target_dir / f"{item_id}.wav"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(audio_file),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0 or not audio_file.exists():
+        raise YtDlpError(result.stderr.strip() or "ffmpeg failed to extract local video audio")
+    return audio_file
+
+
+def _run_whisper_asr(
+    audio_file: Path,
+    target_dir: Path,
+    language: str = "auto",
+    progress: Callable[[int, str], None] | None = None,
+) -> list[TranscriptSegment]:
+    whisper_binary = "whisper"
+    resolved_whisper = shutil.which(whisper_binary)
+    if not resolved_whisper:
+        raise YtDlpError("Local ASR requires the whisper command, but it was not found in PATH")
+
+    asr_cmd = [
+        resolved_whisper,
+        str(audio_file),
+        "--model",
+        "base",
+        "--output_format",
+        "vtt",
+        "--output_dir",
+        str(target_dir),
+    ]
+    if language and language != "auto":
+        asr_cmd.extend(["--language", _whisper_language(language)])
+    if progress:
+        progress(40, "本地 ASR 正在转写音频")
+    asr_process = subprocess.Popen(asr_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    started_at = time.monotonic()
+    stdout = ""
+    stderr = ""
+    while True:
+        try:
+            stdout, stderr = asr_process.communicate(timeout=2)
+            break
+        except subprocess.TimeoutExpired:
+            if progress:
+                elapsed = time.monotonic() - started_at
+                progress(min(88, 40 + int(elapsed * 1.8)), f"本地 ASR 正在转写音频，已用时 {int(elapsed)}s")
+    if asr_process.returncode != 0:
+        raise YtDlpError(stderr.strip() or stdout.strip() or "Local ASR failed")
+    if progress:
+        progress(92, "本地 ASR 已生成字幕，正在整理文本")
+
+    subtitle_file = _find_newest_subtitle(target_dir)
+    if not subtitle_file:
+        raise YtDlpError("Local ASR did not produce a subtitle file")
+    return _simplify_chinese_segments(parse_subtitle_text(
+        subtitle_file.read_text(encoding="utf-8", errors="replace"),
+        subtitle_file.suffix.lstrip("."),
+    ))
+
+
+def _media_duration(path: Path) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return 0.0
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
 
 
 def _whisper_language(language: str) -> str:

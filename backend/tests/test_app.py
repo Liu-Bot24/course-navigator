@@ -3,9 +3,11 @@ from time import sleep
 
 from fastapi.testclient import TestClient
 
+import course_navigator.app as app_module
 from course_navigator.app import create_app
 from course_navigator.config import OnlineAsrSettings, Settings
-from course_navigator.models import TranscriptSegment, VideoMetadata
+from course_navigator.library import CourseLibrary
+from course_navigator.models import CourseItem, TranscriptSegment, VideoMetadata
 from course_navigator.ytdlp import YtDlpError
 
 
@@ -40,6 +42,17 @@ class FakeRunner:
         path = target_dir / f"{item_id}.mp4"
         path.write_text("video", encoding="utf-8")
         return path
+
+
+class FakeLocalVideoRunner(FakeRunner):
+    def probe_local_video_duration(self, path: Path):
+        return 67.5
+
+    def extract_asr_from_file(self, video_path: Path, target_dir: Path, item_id: str, language: str = "auto", progress=None):
+        if progress:
+            progress(45, "正在转写本地视频")
+        assert video_path.name == "Local-Lesson.mp4"
+        return [TranscriptSegment(start=0, end=2, text="Local transcript")]
 
 
 def test_health_route(tmp_path):
@@ -183,6 +196,43 @@ def test_import_course_package_saves_finished_course_without_local_artifacts(tmp
     assert not (tmp_path / "downloads").exists()
 
 
+def test_import_course_package_writes_course_record_to_workspace_only(tmp_path):
+    process_dir = tmp_path / "process-data"
+    workspace_dir = tmp_path / "course-workspace"
+    client = make_client(
+        process_dir,
+        settings=Settings(data_dir=process_dir, workspace_dir=workspace_dir),
+    )
+
+    response = client.post(
+        "/api/import",
+        json={
+            "format": "course-navigator-share",
+            "version": 1,
+            "items": [
+                {
+                    "id": "shared-course",
+                    "source_url": "https://example.com/shared-course",
+                    "title": "Shared lesson",
+                    "duration": 12,
+                    "transcript": [{"start": 0, "end": 2, "text": "Corrected opening."}],
+                    "local_video_path": "downloads/should-not-be-imported.mp4",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    imported = response.json()["items"][0]
+    assert imported["id"] == "shared-course"
+    assert imported["local_video_path"] is None
+    assert (workspace_dir / "items" / "shared-course.json").exists()
+    assert not (process_dir / "items" / "shared-course.json").exists()
+    assert not (workspace_dir / "downloads").exists()
+    assert not (workspace_dir / "subtitles").exists()
+    assert not (process_dir / "subtitles").exists()
+
+
 def test_imported_course_can_cache_video_after_reusing_deleted_id(tmp_path):
     client = make_client(tmp_path)
     client.post(
@@ -224,6 +274,79 @@ def test_imported_course_can_cache_video_after_reusing_deleted_id(tmp_path):
 
     assert payload["status"] == "succeeded"
     assert client.get("/api/items/abc123").json()["local_video_path"].endswith("abc123.mp4")
+
+
+def test_workspace_keeps_course_records_and_downloads_separate_from_process_files(tmp_path):
+    process_dir = tmp_path / "process-data"
+    workspace_dir = tmp_path / "course-workspace"
+    captured = {}
+
+    class WorkspaceRunner(FakeRunner):
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            captured["subtitle_dir"] = target_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "abc123.en.vtt").write_text("WEBVTT", encoding="utf-8")
+            return super().extract_subtitles(request, target_dir, metadata)
+
+    client = make_client(
+        process_dir,
+        runner=WorkspaceRunner(),
+        settings=Settings(data_dir=process_dir, workspace_dir=workspace_dir),
+    )
+
+    extract_response = client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    download_response = client.post(
+        "/api/items/abc123/download",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    assert extract_response.status_code == 200
+    assert download_response.status_code == 200
+    assert captured["subtitle_dir"].resolve().is_relative_to((process_dir / "subtitles").resolve())
+    assert (workspace_dir / "items" / "abc123.json").exists()
+    assert not (process_dir / "items" / "abc123.json").exists()
+    assert (workspace_dir / "downloads" / "abc123.mp4").exists()
+    assert not (process_dir / "downloads" / "abc123.mp4").exists()
+    assert client.get("/api/items/abc123").json()["local_video_path"] == "downloads/abc123.mp4"
+    assert client.get("/api/items/abc123/video").content == b"video"
+
+
+def test_workspace_copies_legacy_course_records_and_downloads_once(tmp_path):
+    legacy_dir = tmp_path / "legacy-data"
+    workspace_dir = tmp_path / "course-workspace"
+    legacy_library = CourseLibrary(legacy_dir)
+    legacy_library.save(
+        CourseItem(
+            id="abc123",
+            source_url="https://example.com/video",
+            title="Legacy lesson",
+            created_at="2026-05-03T00:00:00Z",
+            transcript=[TranscriptSegment(start=0, end=2, text="Hello")],
+            local_video_path=legacy_dir / "downloads" / "abc123.mp4",
+        )
+    )
+    (legacy_dir / "downloads").mkdir(parents=True, exist_ok=True)
+    (legacy_dir / "downloads" / "abc123.mp4").write_text("video", encoding="utf-8")
+    (legacy_dir / "subtitles" / "abc123").mkdir(parents=True, exist_ok=True)
+    (legacy_dir / "subtitles" / "abc123" / "abc123.en.vtt").write_text("WEBVTT", encoding="utf-8")
+
+    client = make_client(
+        legacy_dir,
+        settings=Settings(data_dir=legacy_dir, workspace_dir=workspace_dir),
+    )
+
+    response = client.get("/api/items")
+
+    assert response.status_code == 200
+    assert response.json()[0]["id"] == "abc123"
+    assert response.json()[0]["local_video_path"] == "downloads/abc123.mp4"
+    assert (workspace_dir / "items" / "abc123.json").exists()
+    assert (workspace_dir / "downloads" / "abc123.mp4").exists()
+    assert not (workspace_dir / "subtitles").exists()
+    assert client.get("/api/items/abc123/video").content == b"video"
 
 
 def test_youtube_url_keeps_extractor_title_instead_of_guessing_from_url(tmp_path):
@@ -1250,6 +1373,218 @@ def test_download_job_reports_progress_and_updates_local_video_path(tmp_path):
     assert item_response.json()["local_video_path"].endswith("abc123.mp4")
 
 
+def test_import_local_video_copies_file_to_workspace_downloads_and_creates_course_item(tmp_path):
+    process_dir = tmp_path / "process"
+    workspace_dir = tmp_path / "workspace"
+    client = make_client(process_dir, runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+
+    response = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "Local-Lesson"
+    assert payload["title"] == "Local Lesson"
+    assert payload["source_url"] == "local-video://Local-Lesson"
+    assert payload["duration"] == 67.5
+    assert payload["course_index"] == 1
+    assert payload["sort_order"] == 1
+    assert payload["local_video_path"] == "downloads/Local-Lesson.mp4"
+    assert (workspace_dir / "items" / "Local-Lesson.json").exists()
+    assert (workspace_dir / "downloads" / "Local-Lesson.mp4").read_bytes() == b"local video"
+    assert not (process_dir / "downloads").exists()
+    assert client.get("/api/items/Local-Lesson/video").content == b"local video"
+
+
+def test_delete_local_video_rejects_local_imports_without_removing_file(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+    client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    )
+
+    response = client.delete("/api/items/Local-Lesson/local-video")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Local video imports must be deleted from the course library"
+    assert client.get("/api/items/Local-Lesson").status_code == 200
+    assert (workspace_dir / "downloads" / "Local-Lesson.mp4").exists()
+
+
+def test_delete_local_import_course_removes_imported_video_file(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+    client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    )
+
+    response = client.delete("/api/items/Local-Lesson")
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+    assert client.get("/api/items/Local-Lesson").status_code == 404
+    assert not (workspace_dir / "items" / "Local-Lesson.json").exists()
+    assert not (workspace_dir / "downloads" / "Local-Lesson.mp4").exists()
+
+
+def test_import_local_video_assigns_next_index_in_unfiled_collection(tmp_path):
+    client = make_client(tmp_path, runner=FakeLocalVideoRunner())
+    first = client.post(
+        "/api/local-videos",
+        files={"file": ("First.mp4", b"first", "video/mp4")},
+    ).json()
+
+    second = client.post(
+        "/api/local-videos",
+        files={"file": ("Second.mp4", b"second", "video/mp4")},
+    ).json()
+
+    assert first["course_index"] == 1
+    assert second["course_index"] == 2
+    assert second["sort_order"] == 2
+
+
+def test_existing_local_video_backfills_duration_and_course_index(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    downloads_dir = workspace_dir / "downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    (downloads_dir / "existing.mp4").write_bytes(b"video")
+    library = CourseLibrary(workspace_dir)
+    library.save(
+        CourseItem(
+            id="existing",
+            source_url="local-video://existing",
+            title="Existing local video",
+            created_at="2026-01-01T00:00:00+00:00",
+            duration=None,
+            course_index=None,
+            sort_order=None,
+            local_video_path=Path("downloads/existing.mp4"),
+        )
+    )
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+
+    item = client.get("/api/items/existing").json()
+
+    assert item["duration"] == 67.5
+    assert item["course_index"] == 1
+    assert item["sort_order"] == 1
+    saved = CourseLibrary(workspace_dir).get("existing")
+    assert saved.duration == 67.5
+    assert saved.course_index == 1
+
+
+def test_import_local_video_keeps_title_and_uses_safe_id_for_non_ascii_filename(tmp_path):
+    client = make_client(tmp_path)
+
+    response = client.post(
+        "/api/local-videos",
+        files={"file": ("本地课程.mp4", b"local video", "video/mp4")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "course"
+    assert payload["title"] == "本地课程"
+    assert payload["local_video_path"] == "downloads/course.mp4"
+    assert client.get("/api/items/course/video").content == b"local video"
+
+
+def test_local_video_extract_job_runs_asr_from_workspace_file(tmp_path):
+    client = make_client(tmp_path, runner=FakeLocalVideoRunner())
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    ).json()
+
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": imported["source_url"],
+            "mode": "normal",
+            "subtitle_source": "asr",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    assert payload["item_id"] == "Local-Lesson"
+    item = client.get("/api/items/Local-Lesson").json()
+    assert item["transcript_source"] == "asr"
+    assert item["transcript"][0]["text"] == "Local transcript"
+
+
+def test_local_video_extract_job_supports_online_asr_from_workspace_file(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_online_asr(request, transcript_dir, item_id, yt_dlp_binary, settings, source_video_path=None, progress=None):
+        captured["source_video_path"] = source_video_path
+        captured["yt_dlp_binary"] = yt_dlp_binary
+        if progress:
+            progress(45, "正在请求在线 ASR")
+        return [TranscriptSegment(start=0, end=2, text="Online transcript")]
+
+    monkeypatch.setattr(app_module, "extract_online_asr_transcript", fake_online_asr)
+    client = make_client(tmp_path, runner=FakeLocalVideoRunner())
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    ).json()
+
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": imported["source_url"],
+            "mode": "normal",
+            "subtitle_source": "online_asr",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    item = client.get("/api/items/Local-Lesson").json()
+    assert item["transcript_source"] == "online_asr"
+    assert item["transcript"][0]["text"] == "Online transcript"
+    assert captured["source_video_path"].name == "Local-Lesson.mp4"
+    assert captured["yt_dlp_binary"] is None
+
+
+def test_local_video_download_route_rejects_recaching(tmp_path):
+    client = make_client(tmp_path, runner=FakeLocalVideoRunner())
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    ).json()
+
+    response = client.post(
+        "/api/items/Local-Lesson/download",
+        json={"url": imported["source_url"], "mode": "normal"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "本地视频已经在 Workspace 中，无需再次缓存。"
+
+
 def test_extract_route_preserves_local_cache_when_refreshing_subtitles(tmp_path):
     client = make_client(tmp_path)
     client.post(
@@ -1394,12 +1729,14 @@ def make_client(
     runner=None,
     env_path: Path | None = None,
     settings: Settings | None = None,
+    workspace_dir: Path | None = None,
 ) -> TestClient:
     return TestClient(
         create_app(
             data_dir=tmp_path,
+            workspace_dir=workspace_dir,
             runner=runner or FakeRunner(),
-            settings=settings or Settings(data_dir=tmp_path),
+            settings=settings or Settings(data_dir=tmp_path, workspace_dir=workspace_dir),
             env_path=env_path,
         )
     )

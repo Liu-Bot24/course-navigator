@@ -38,6 +38,20 @@ export async function importCoursePackage(input: CourseSharePackage): Promise<Co
   });
 }
 
+export async function importLocalVideo(file: File): Promise<CourseItem> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(apiPath("/local-videos"), {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail ?? `Request failed: ${response.status}`);
+  }
+  return response.json() as Promise<CourseItem>;
+}
+
 export async function extractCourse(input: {
   url: string;
   mode: ExtractMode;
@@ -240,7 +254,28 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? `Request failed: ${response.status}`);
+    throw new Error(readErrorDetail(payload) ?? `Request failed: ${response.status}`);
   }
   return response.json() as Promise<T>;
+}
+
+function readErrorDetail(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const record = payload as Record<string, unknown>;
+  const detail = record.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const message = detail
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return "";
+        const item = entry as Record<string, unknown>;
+        return typeof item.msg === "string" ? item.msg : "";
+      })
+      .filter(Boolean)
+      .join(", ");
+    if (message) return message;
+  }
+  if (typeof record.message === "string") return record.message;
+  if (typeof record.error === "string") return record.error;
+  return null;
 }

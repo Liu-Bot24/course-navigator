@@ -32,7 +32,7 @@ class TranscriptSegment(BaseModel):
 
 
 class ExtractRequest(BaseModel):
-    url: HttpUrl
+    url: str
     mode: Literal["normal", "browser", "cookies"] = "normal"
     browser: str = "chrome"
     cookies_path: str | None = None
@@ -41,7 +41,7 @@ class ExtractRequest(BaseModel):
 
 
 class DownloadRequest(BaseModel):
-    url: HttpUrl
+    url: str
     mode: Literal["normal", "browser", "cookies"] = "normal"
     browser: str = "chrome"
     cookies_path: str | None = None

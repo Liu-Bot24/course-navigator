@@ -11,6 +11,7 @@ import {
   ChevronUp,
   Copy,
   Download,
+  FileInput,
   FileText,
   FolderPlus,
   GitCompare,
@@ -47,6 +48,7 @@ import {
   getOnlineAsrSettings,
   getStudyJob,
   importCoursePackage,
+  importLocalVideo,
   itemVideoPath,
   listItems,
   listAvailableModels,
@@ -230,6 +232,10 @@ const COPY = {
     subtitleSourceLocalUpload: "本地上传",
     uploadSubtitleFile: "上传字幕文件",
     importingLocalSubtitle: "正在导入本地字幕",
+    importLocalVideo: "导入本地视频",
+    importLocalVideoFile: "选择本地视频文件",
+    importingLocalVideo: "正在导入本地视频",
+    localVideoAlreadyCached: "本地视频已经在 Workspace 中",
     localSubtitleNoTarget: "请先打开或选择一个课程，再上传本地字幕。",
     localSubtitleEmpty: "没有解析到可用字幕。",
     subtitlesReady: "已有字幕",
@@ -507,6 +513,10 @@ const COPY = {
     subtitleSourceLocalUpload: "Local upload",
     uploadSubtitleFile: "Upload subtitle file",
     importingLocalSubtitle: "Importing local subtitles",
+    importLocalVideo: "Import local video",
+    importLocalVideoFile: "Choose local video file",
+    importingLocalVideo: "Importing local video",
+    localVideoAlreadyCached: "This local video is already in the Workspace",
     localSubtitleNoTarget: "Open or select a course before uploading local subtitles.",
     localSubtitleEmpty: "No usable subtitles were found in this file.",
     subtitlesReady: "Transcript ready",
@@ -874,6 +884,7 @@ export function App() {
   const [exportSelectedIds, setExportSelectedIds] = useState<string[]>([]);
   const [exportMessage, setExportMessage] = useState("");
   const [importBusy, setImportBusy] = useState(false);
+  const [localVideoBusy, setLocalVideoBusy] = useState(false);
   const [importMessage, setImportMessage] = useState<string | null>(null);
   const [timeMapAutoOpen, setTimeMapAutoOpen] = useState(() =>
     loadBooleanPreference(TIME_MAP_AUTO_OPEN_STORAGE_KEY, true),
@@ -887,6 +898,7 @@ export function App() {
   const mainColumnRef = useRef<HTMLElement | null>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
   const importFileInputRef = useRef<HTMLInputElement | null>(null);
+  const localVideoInputRef = useRef<HTMLInputElement | null>(null);
   const subtitleUploadInputRef = useRef<HTMLInputElement | null>(null);
   const copy = COPY[uiLanguage];
 
@@ -915,7 +927,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    setSourceMode(selected?.local_video_path ? "local" : "embed");
+    setSourceMode(preferredSourceModeForItem(selected));
     setSeekTime(0);
     setPlayheadTime(0);
   }, [selected?.id, selected?.local_video_path]);
@@ -937,6 +949,7 @@ export function App() {
   const translatedTranscript = selectedStudy?.translated_transcript ?? [];
   const selectedHasStudy = hasStudyMaterial(selectedStudy);
   const selectedIsBilibili = selected ? isBilibiliItem(selected) : false;
+  const selectedIsLocalVideo = selected ? isLocalVideoItem(selected) : false;
   const forcedBilibiliEmbed = selected ? forcedBilibiliEmbedIds.includes(selected.id) : false;
   const showVideoCaptionDock = Boolean(selected) && (!selectedIsBilibili || sourceMode === "local" || forcedBilibiliEmbed);
   const videoCaptionControlsAvailable = !(selectedIsBilibili && sourceMode === "embed");
@@ -990,12 +1003,13 @@ export function App() {
       openLocalSubtitlePicker();
       return;
     }
+    const existing = findExistingItemForUrl(items, normalizedUrl);
+    const nextSourceMode = preferredSourceModeForSource(normalizedUrl, existing);
     setError(null);
     setJobStatus(null);
-    setSourceMode("embed");
+    setSourceMode(nextSourceMode);
     setSeekTime(0);
     setPlayheadTime(0);
-    const existing = findExistingItemForUrl(items, normalizedUrl);
     if (existing?.transcript.length) {
       selectCourse(existing);
       return;
@@ -1012,7 +1026,7 @@ export function App() {
         return;
       }
       if (usesBackgroundSubtitleExtraction(subtitleSource)) {
-        await runExtractJob(normalizedUrl);
+        await runExtractJob(normalizedUrl, nextSourceMode);
       } else {
         await extractUrlToItem(normalizedUrl);
       }
@@ -1034,17 +1048,19 @@ export function App() {
     if (!normalizedUrl) return;
     const existing = findExistingItemForUrl(items, normalizedUrl);
     const selectedMatchesUrl = selected ? canonicalSourceKey(selected.source_url) === canonicalSourceKey(normalizedUrl) : false;
+    const targetItem = selectedMatchesUrl && selected ? selected : existing;
+    const nextSourceMode = preferredSourceModeForSource(normalizedUrl, targetItem);
     if ((existing?.transcript.length || (selectedMatchesUrl && selected?.transcript.length)) && !window.confirm(copy.getSubtitlesConfirm)) {
       return;
     }
     setError(null);
     setJobStatus(null);
-    setSourceMode("embed");
+    setSourceMode(nextSourceMode);
     setSeekTime(0);
     setPlayheadTime(0);
     try {
       if (usesBackgroundSubtitleExtraction(subtitleSource)) {
-        await runExtractJob(normalizedUrl);
+        await runExtractJob(normalizedUrl, nextSourceMode);
       } else {
         await extractUrlToItem(normalizedUrl);
       }
@@ -1096,6 +1112,28 @@ export function App() {
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
     } finally {
+      setBusy(null);
+      setActiveJobKind(null);
+    }
+  }
+
+  async function handleLocalVideoFile(event: ReactChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0] ?? null;
+    event.currentTarget.value = "";
+    if (!file) return;
+    setError(null);
+    setJobStatus(null);
+    setLocalVideoBusy(true);
+    setBusy(copy.importingLocalVideo);
+    try {
+      const item = await importLocalVideo(file);
+      setItems((current) => sortCourseItems([item, ...current.filter((entry) => entry.id !== item.id)]));
+      selectCourse(item);
+      setSourceMode("local");
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setLocalVideoBusy(false);
       setBusy(null);
       setActiveJobKind(null);
     }
@@ -1275,6 +1313,7 @@ export function App() {
   async function runDownloadJob(itemId: string) {
     const item = items.find((entry) => entry.id === itemId);
     if (!item) return;
+    if (isLocalVideoItem(item)) return;
     setActiveJobKind("download");
     setBusy(`${copy.caching} 0%`);
     const firstStatus = await startDownloadJob(itemId, {
@@ -1298,7 +1337,7 @@ export function App() {
     setSourceMode("local");
   }
 
-  async function runExtractJob(sourceUrl: string) {
+  async function runExtractJob(sourceUrl: string, nextSourceMode?: SourceMode) {
     setActiveJobKind("extract");
     setBusy(`${copy.extracting} 0%`);
     const firstStatus = await startExtractJob({
@@ -1320,10 +1359,13 @@ export function App() {
       throw new Error(current.error ?? current.message);
     }
     await refreshItems(current.item_id || undefined);
+    if (nextSourceMode) {
+      setSourceMode(nextSourceMode);
+    }
   }
 
   async function handleDownload() {
-    if (!selected || isPreviewItem(selected)) return;
+    if (!selected || isPreviewItem(selected) || isLocalVideoItem(selected)) return;
     setError(null);
     try {
       await runDownloadJob(selected.id);
@@ -1337,7 +1379,7 @@ export function App() {
   }
 
   async function handleRemoveLocalCache() {
-    if (!selected?.local_video_path) return;
+    if (!selected?.local_video_path || isLocalVideoItem(selected)) return;
     if (!window.confirm(copy.removeLocalCacheConfirm)) return;
     setError(null);
     try {
@@ -1959,7 +2001,9 @@ export function App() {
       <header className="topbar">
         <div className="brand-cluster">
           <div className="brand">
-            <div className="brand-mark">CN</div>
+            <div className="brand-mark" aria-hidden="true">
+              <img src="/brand/course-navigator-learning-icon.png" alt="" />
+            </div>
             <div>
               <h1>Course Navigator</h1>
               <p>{copy.subtitle}</p>
@@ -1980,6 +2024,24 @@ export function App() {
             void handleOpenUrl();
           }}
         >
+          <button
+            aria-label={copy.importLocalVideo}
+            className="top-icon-button local-video-import-button"
+            title={copy.importLocalVideo}
+            type="button"
+            disabled={Boolean(busy) || localVideoBusy}
+            onClick={() => localVideoInputRef.current?.click()}
+          >
+            {localVideoBusy ? <Loader2 className="spin" size={17} /> : <FileInput size={18} />}
+          </button>
+          <input
+            ref={localVideoInputRef}
+            aria-label={copy.importLocalVideoFile}
+            className="visually-hidden"
+            type="file"
+            accept="video/*,.mp4,.m4v,.mov,.webm,.mkv,.avi,.wmv"
+            onChange={(event) => void handleLocalVideoFile(event)}
+          />
           <input
             value={url}
             onChange={(event) => setUrl(event.target.value)}
@@ -2549,13 +2611,19 @@ export function App() {
                 <button
                   className="icon-button"
                   onClick={handleDownload}
-                  disabled={!selected || isPreviewItem(selected) || Boolean(busy)}
+                  disabled={!selected || isPreviewItem(selected) || selectedIsLocalVideo || Boolean(busy)}
+                  title={selectedIsLocalVideo ? copy.localVideoAlreadyCached : copy.cache}
                 >
                   {activeJobKind === "download" ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
                   {copy.cache}
                 </button>
-                {selected?.local_video_path ? (
-                  <button className="icon-button subtle-danger" onClick={handleRemoveLocalCache} disabled={Boolean(busy)}>
+                {selected?.local_video_path && !selectedIsLocalVideo ? (
+                  <button
+                    className="icon-button subtle-danger"
+                    onClick={handleRemoveLocalCache}
+                    disabled={Boolean(busy)}
+                    title={copy.removeLocalCache}
+                  >
                     <Trash2 size={15} />
                     {copy.removeLocalCache}
                   </button>
@@ -5574,6 +5642,18 @@ function isBilibiliItem(item: CourseItem): boolean {
   );
 }
 
+function isLocalVideoItem(item: CourseItem): boolean {
+  return item.source_url.startsWith("local-video://");
+}
+
+function preferredSourceModeForItem(item: CourseItem | null | undefined): SourceMode {
+  return item?.local_video_path || (item && isLocalVideoItem(item)) ? "local" : "embed";
+}
+
+function preferredSourceModeForSource(sourceUrl: string, item?: CourseItem | null): SourceMode {
+  return sourceUrl.trim().startsWith("local-video://") ? "local" : preferredSourceModeForItem(item);
+}
+
 function formatCourseDuration(item: CourseItem): string | null {
   const duration =
     item.duration ??
@@ -5982,6 +6062,27 @@ function TabButton({
 function errorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) {
     return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  if (error && typeof error === "object") {
+    const payload = error as Record<string, unknown>;
+    const detail = payload.detail;
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      const message = detail
+        .map((entry) => {
+          if (!entry || typeof entry !== "object") return "";
+          const item = entry as Record<string, unknown>;
+          return typeof item.msg === "string" ? item.msg : "";
+        })
+        .filter(Boolean)
+        .join(", ");
+      if (message) return message;
+    }
+    if (typeof payload.message === "string") return payload.message;
+    if (typeof payload.error === "string") return payload.error;
   }
   return fallback;
 }
