@@ -135,6 +135,28 @@ describe("App language defaults", () => {
     expect(screen.queryByPlaceholderText("en")).toBeNull();
   });
 
+  it("shows app captions on YouTube embeds without adding a native caption shield", async () => {
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "youtube-captions",
+        source_url: "https://www.youtube.com/watch?v=abc123",
+        title: "YouTube caption lesson",
+        duration: 42,
+        created_at: new Date().toISOString(),
+        transcript: [{ start: 0, end: 4, text: "Opening idea." }],
+        metadata: null,
+        study: null,
+        local_video_path: null,
+      },
+    ]);
+
+    const { container } = render(<App />);
+
+    expect(await screen.findByTitle("YouTube caption lesson")).toBeTruthy();
+    expect(container.querySelector(".caption-overlay")).toBeTruthy();
+    expect(container.querySelector(".caption-native-shield")).toBeNull();
+  });
+
   it("imports local subtitle files from the subtitle source menu", async () => {
     const item: CourseItem = {
       id: "local-upload-course",

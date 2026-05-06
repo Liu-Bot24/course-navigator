@@ -2697,23 +2697,6 @@ body.is-resizing-layout {
   pointer-events: none;
 }
 
-.caption-native-shield {
-  position: absolute;
-  right: 11%;
-  bottom: 34px;
-  left: 11%;
-  z-index: 8;
-  height: 120px;
-  border-radius: 8px;
-  background: linear-gradient(
-    to top,
-    rgb(0 0 0 / 0.86),
-    rgb(0 0 0 / 0.64) 48%,
-    rgb(0 0 0 / 0)
-  );
-  pointer-events: none;
-}
-
 .caption-overlay span {
   max-width: min(760px, 92%);
   border-radius: 5px;

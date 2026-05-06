@@ -5118,7 +5118,6 @@ function Player({
             currentTime={embedTime}
             mode={textDisplayMode}
             copy={copy}
-            shieldNative={Boolean(youtubeEmbedSrc)}
           />
         ) : null}
       </div>
@@ -5139,31 +5138,26 @@ function CaptionOverlay({
   currentTime,
   mode,
   copy,
-  shieldNative = false,
 }: {
   sourceSegments: TranscriptSegment[];
   translatedSegments: TranscriptSegment[];
   currentTime: number;
   mode: CaptionDisplayMode;
   copy: (typeof COPY)[UiLanguage];
-  shieldNative?: boolean;
 }) {
   const source = findActiveSegment(sourceSegments, currentTime);
   const translated = findActiveSegment(translatedSegments, currentTime);
   const lines = composeSegmentLines(source, translated, mode);
   if (!lines.length) return null;
   return (
-    <>
-      {shieldNative ? <div className="caption-native-shield" /> : null}
-      <div className="caption-overlay">
-        {lines.map((line) => (
-          <span className={line.kind === "target" ? "caption-target" : "caption-source"} key={line.key}>
-            {mode === "bilingual" ? <small>{line.kind === "target" ? copy.targetLabel : copy.sourceLabel}</small> : null}
-            {line.text}
-          </span>
-        ))}
-      </div>
-    </>
+    <div className="caption-overlay">
+      {lines.map((line) => (
+        <span className={line.kind === "target" ? "caption-target" : "caption-source"} key={line.key}>
+          {mode === "bilingual" ? <small>{line.kind === "target" ? copy.targetLabel : copy.sourceLabel}</small> : null}
+          {line.text}
+        </span>
+      ))}
+    </div>
   );
 }
 
