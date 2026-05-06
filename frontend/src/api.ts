@@ -14,6 +14,7 @@ import type {
   OnlineAsrSettingsInput,
   OutputLanguage,
   StudySection,
+  StudyDetailLevel,
   StudyJobStatus,
   StudyMaterial,
   TranscriptSource,
@@ -94,10 +95,14 @@ export async function previewCourse(input: {
   });
 }
 
-export async function generateStudy(itemId: string, outputLanguage: OutputLanguage): Promise<StudyMaterial> {
+export async function generateStudy(
+  itemId: string,
+  outputLanguage: OutputLanguage,
+  detailLevel?: StudyDetailLevel,
+): Promise<StudyMaterial> {
   return requestJson<StudyMaterial>(`/items/${itemId}/study`, {
     method: "POST",
-    body: JSON.stringify({ output_language: outputLanguage }),
+    body: JSON.stringify({ output_language: outputLanguage, detail_level: detailLevel }),
   });
 }
 
@@ -105,10 +110,11 @@ export async function startStudyJob(
   itemId: string,
   outputLanguage: OutputLanguage,
   section: StudySection = "all",
+  detailLevel?: StudyDetailLevel,
 ): Promise<StudyJobStatus> {
   return requestJson<StudyJobStatus>(`/items/${itemId}/study-jobs`, {
     method: "POST",
-    body: JSON.stringify({ output_language: outputLanguage, section }),
+    body: JSON.stringify({ output_language: outputLanguage, section, detail_level: detailLevel }),
   });
 }
 

@@ -4,20 +4,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   deleteLocalVideo,
   extractCourse,
-  getOnlineAsrSettings,
   getModelSettings,
+  getAsrCorrectionResult,
   getStudyJob,
   importLocalVideo,
   listItems,
   previewCourse,
+  saveAsrSearchSettings,
   saveOnlineAsrSettings,
   saveModelSettings,
   saveTranscript,
+  startAsrCorrectionJob,
   startExtractJob,
   startDownloadJob,
+  startStudyJob,
   updateCourseItem,
 } from "./api";
 import { App } from "./App";
+import type { CourseItem, StudyJobStatus } from "./types";
 
 vi.mock("./api", () => ({
   deleteCourse: vi.fn(),
@@ -55,12 +59,20 @@ vi.mock("./api", () => ({
   }),
   getStudyJob: vi.fn(),
   getAsrCorrectionResult: vi.fn(),
+  getAsrSearchSettings: vi.fn().mockResolvedValue({
+    enabled: false,
+    provider: "tavily",
+    result_limit: 5,
+    tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
+    firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
+  }),
   importCoursePackage: vi.fn(),
   importLocalVideo: vi.fn(),
   itemVideoPath: (itemId: string) => `/api/items/${itemId}/video`,
   listAvailableModels: vi.fn(),
   listItems: vi.fn().mockResolvedValue([]),
   saveModelSettings: vi.fn(),
+  saveAsrSearchSettings: vi.fn(),
   saveOnlineAsrSettings: vi.fn().mockResolvedValue({
     provider: "xai",
     openai: { has_api_key: false, api_key_preview: null },
@@ -87,6 +99,8 @@ describe("App language defaults", () => {
     window.localStorage.removeItem("course-navigator-time-map-auto-open");
     window.localStorage.removeItem("course-navigator-last-selected-course");
     window.localStorage.removeItem("course-navigator-asr-save-accepted-changes");
+    window.localStorage.removeItem("course-navigator-asr-sort-by-confidence");
+    window.localStorage.removeItem("course-navigator-study-detail-level");
   });
 
   it("uses Chinese UI and a language menu by default", async () => {
@@ -122,7 +136,7 @@ describe("App language defaults", () => {
   });
 
   it("imports local subtitle files from the subtitle source menu", async () => {
-    const item = {
+    const item: CourseItem = {
       id: "local-upload-course",
       source_url: "https://example.com/video",
       title: "Local upload demo",
@@ -287,6 +301,101 @@ describe("App language defaults", () => {
     expect(screen.getByRole("button", { name: "本地" }).className).toContain("active");
   });
 
+  it("supports keyboard review shortcuts for ASR suggestions", async () => {
+    const item: CourseItem = {
+      id: "asr-lesson",
+      source_url: "https://example.com/asr-lesson",
+      title: "ASR Lesson",
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [
+        { start: 0, end: 2, text: "我是林毅" },
+        { start: 2, end: 4, text: "Deep Seek V4 很强" },
+      ],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveAsrSearchSettings).mockResolvedValue({
+      enabled: false,
+      provider: "tavily",
+      result_limit: 5,
+      tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
+      firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
+    });
+    vi.mocked(startAsrCorrectionJob).mockResolvedValueOnce({
+      job_id: "asr-job",
+      item_id: "asr-lesson",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "完成",
+      error: null,
+    });
+    vi.mocked(getAsrCorrectionResult).mockResolvedValueOnce({
+      job_id: "asr-job",
+      item_id: "asr-lesson",
+      generated_at: new Date().toISOString(),
+      search_enabled: false,
+      search_provider: null,
+      suggestions: [
+        {
+          id: "name-fix",
+          segment_index: 0,
+          start: 0,
+          end: 2,
+          original_text: "林毅",
+          corrected_text: "林亦LYi",
+          confidence: 0.91,
+          reason: "人名校正",
+          evidence: null,
+          status: "pending",
+          source: "model",
+        },
+        {
+          id: "term-fix",
+          segment_index: 1,
+          start: 2,
+          end: 4,
+          original_text: "Deep Seek",
+          corrected_text: "DeepSeek",
+          confidence: 0.99,
+          reason: "术语校正",
+          evidence: null,
+          status: "pending",
+          source: "model",
+        },
+      ],
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getAllByText("ASR Lesson").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "ASR 校正" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成校正建议" }));
+
+    await screen.findByText("1/2");
+    expect(screen.getByRole("button", { name: "再次生成校正建议" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "再次校正" })).toBeNull();
+    const sourceEditor = document.querySelector(".asr-transcript-pane.source textarea") as HTMLTextAreaElement;
+    sourceEditor.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.getByText("1/2")).toBeTruthy();
+
+    sourceEditor.blur();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(await screen.findByText("2/2")).toBeTruthy();
+    expect(await screen.findByText("术语校正")).toBeTruthy();
+    expect(await screen.findByRole("dialog", { name: "理由 / 证据" })).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "Enter" });
+    await waitFor(() => {
+      expect(screen.getByText("待处理 1 · 已接受 1 · 已拒绝 0")).toBeTruthy();
+    });
+    expect(screen.getByText("1/1")).toBeTruthy();
+  });
+
   it("does not embed Bilibili by default and offers force streaming", async () => {
     vi.mocked(listItems).mockResolvedValueOnce([
       {
@@ -315,7 +424,7 @@ describe("App language defaults", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("bilibili站外播放不提供字幕时间轴功能，建议缓存后观看。")).toBeTruthy();
+    expect(await screen.findAllByText("bilibili站外播放不提供字幕时间轴功能，建议缓存后观看。")).not.toHaveLength(0);
     expect(screen.queryByTitle("Bilibili lesson")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "强制在线播放" }));
@@ -904,6 +1013,288 @@ describe("App language defaults", () => {
     const generateButton = await screen.findByRole("button", { name: "生成学习地图" });
     expect(generateButton.closest(".study-actions")).toBeNull();
     expect(generateButton.closest(".empty-state")).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    expect(await screen.findByText("详细程度")).toBeTruthy();
+    const regenerateAllButton = screen.getByRole("button", { name: "全部重新生成" }) as HTMLButtonElement;
+    expect(regenerateAllButton.closest(".study-settings-panel")).toBeTruthy();
+    expect(regenerateAllButton.disabled).toBe(true);
+  });
+
+  it("can regenerate the full study map from the right-rail settings panel", async () => {
+    const item: CourseItem = {
+      id: "abc123",
+      source_url: "https://www.youtube.com/watch?v=abc123",
+      title: "Sample Lesson",
+      duration: 42,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "Opening idea corrected." }],
+      metadata: null,
+      study: {
+        one_line: "课程摘要。",
+        translated_title: null,
+        time_map: [{ start: 0, end: 4, title: "开场", summary: "开场观点。", priority: "focus" }],
+        outline: [],
+        detailed_notes: "旧解读",
+        high_fidelity_text: "旧详解",
+        translated_transcript: [],
+        prerequisites: [],
+        thought_prompts: [],
+        review_suggestions: [],
+      },
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValue([item]);
+    const completedJob: StudyJobStatus = {
+      job_id: "study-job-1",
+      item_id: "abc123",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    vi.mocked(startStudyJob).mockResolvedValue(completedJob);
+
+    render(<App />);
+
+    expect(screen.queryByRole("button", { name: "全部重新生成" })).toBeNull();
+    const settingsToggle = await screen.findByRole("button", { name: "展开学习地图设置" });
+    expect(settingsToggle.closest(".ai-tabs")).toBeTruthy();
+    fireEvent.click(settingsToggle);
+
+    const fullRegenerateButton = await screen.findByRole("button", { name: "全部重新生成" });
+    expect(fullRegenerateButton.closest(".study-settings-panel")).toBeTruthy();
+    expect(fullRegenerateButton.closest(".video-caption-toolbar")).toBeNull();
+    expect(fullRegenerateButton.compareDocumentPosition(screen.getByText("详细程度")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(fullRegenerateButton);
+
+    await waitFor(() => {
+      expect(startStudyJob).toHaveBeenCalledWith("abc123", "zh-CN", "all", "standard");
+    });
+  });
+
+  it("shows beginner and experienced guide suggestions as additional guide modules", async () => {
+    const item: CourseItem = {
+      id: "abc123",
+      source_url: "https://www.youtube.com/watch?v=abc123",
+      title: "Sample Lesson",
+      duration: 42,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "Opening idea corrected." }],
+      metadata: null,
+      study: {
+        one_line: "这节课帮助学习者判断基础概念和实践应用的学习重点。",
+        translated_title: null,
+        time_map: [{ start: 0, end: 4, title: "开场", summary: "开场观点。", priority: "focus" }],
+        outline: [],
+        detailed_notes: "旧解读",
+        high_fidelity_text: "旧详解",
+        translated_transcript: [],
+        prerequisites: ["先了解基本术语。"],
+        thought_prompts: ["这个概念能用在哪里？"],
+        review_suggestions: ["看完后复盘一次关键判断。"],
+        beginner_focus: ["刚接触这个领域的人，建议重点听基础概念。"],
+        experienced_guidance: ["有经验的人可以略过定义，复习实践判断。"],
+      },
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValue([item]);
+
+    render(<App />);
+
+    expect(await screen.findByText("这节课帮助学习者判断基础概念和实践应用的学习重点。")).toBeTruthy();
+    expect(screen.getByText("已整理为 1 个学习块")).toBeTruthy();
+    expect(await screen.findByText("初学学习建议")).toBeTruthy();
+    expect(screen.getByText("刚接触这个领域的人，建议重点听基础概念。")).toBeTruthy();
+    expect(screen.getByText("进阶学习建议")).toBeTruthy();
+    expect(screen.getByText("有经验的人可以略过定义，复习实践判断。")).toBeTruthy();
+    expect(screen.getByText("预备知识")).toBeTruthy();
+    expect(screen.getByText("思考提示")).toBeTruthy();
+    expect(screen.getByText("复习建议")).toBeTruthy();
+  });
+
+  it("persists the study detail mode and sends high fidelity to study jobs", async () => {
+    const item: CourseItem = {
+      id: "abc123",
+      source_url: "https://www.youtube.com/watch?v=abc123",
+      title: "Sample Lesson",
+      duration: 42,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "Opening idea." }],
+      metadata: null,
+      study: {
+        one_line: "课程摘要。",
+        translated_title: null,
+        time_map: [{ start: 0, end: 4, title: "开场", summary: "开场观点。", priority: "focus" }],
+        outline: [],
+        detailed_notes: "旧解读",
+        high_fidelity_text: "旧详解",
+        translated_transcript: [],
+        prerequisites: [],
+        thought_prompts: [],
+        review_suggestions: [],
+      },
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValue([item]);
+    vi.mocked(startStudyJob).mockResolvedValue({
+      job_id: "study-job-1",
+      item_id: "abc123",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "高保真" }));
+    fireEvent.click(screen.getByRole("button", { name: "全部重新生成" }));
+
+    await waitFor(() => {
+      expect(startStudyJob).toHaveBeenCalledWith("abc123", "zh-CN", "all", "faithful");
+    });
+    expect(window.localStorage.getItem("course-navigator-study-detail-level")).toBe("faithful");
+  });
+
+  it("keeps the player action bar visible for Bilibili embed without subtitle timeline controls", async () => {
+    const item: CourseItem = {
+      id: "bili-lesson",
+      source_url: "https://www.bilibili.com/video/BV1iVoVBgERD/",
+      title: "Bilibili lesson",
+      duration: 120,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "Hello" }],
+      metadata: {
+        id: "BV1iVoVBgERD",
+        title: "Bilibili lesson",
+        duration: 120,
+        webpage_url: "https://www.bilibili.com/video/BV1iVoVBgERD/",
+        extractor: "BiliBili",
+        stream_url: null,
+        hls_manifest_url: null,
+        language: "zh-CN",
+        subtitles: [],
+        automatic_captions: [],
+      },
+      study: {
+        one_line: "课程摘要。",
+        translated_title: null,
+        time_map: [{ start: 0, end: 2, title: "开场", summary: "开场观点。", priority: "focus" }],
+        outline: [],
+        detailed_notes: "旧解读",
+        high_fidelity_text: "旧详解",
+        translated_transcript: [],
+        prerequisites: [],
+        thought_prompts: [],
+        review_suggestions: [],
+      },
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValue([item]);
+    vi.mocked(startStudyJob).mockResolvedValue({
+      job_id: "study-job-1",
+      item_id: "bili-lesson",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    render(<App />);
+
+    expect(await screen.findAllByText("bilibili站外播放不提供字幕时间轴功能，建议缓存后观看。")).not.toHaveLength(0);
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    const fullRegenerateButton = await screen.findByRole("button", { name: "全部重新生成" });
+    expect(fullRegenerateButton.closest(".study-settings-panel")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "浮动字幕" })).toBeNull();
+
+    fireEvent.click(fullRegenerateButton);
+
+    await waitFor(() => {
+      expect(startStudyJob).toHaveBeenCalledWith("bili-lesson", "zh-CN", "all", "standard");
+    });
+  });
+
+  it("refreshes study material while a study job is still running", async () => {
+    const item: CourseItem = {
+      id: "abc123",
+      source_url: "https://www.youtube.com/watch?v=abc123",
+      title: "Sample Lesson",
+      duration: 42,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "Opening idea." }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    const partialItem: CourseItem = {
+      ...item,
+      study: {
+        one_line: "先出的导览。",
+        translated_title: null,
+        time_map: [],
+        outline: [],
+        detailed_notes: "",
+        high_fidelity_text: "",
+        translated_transcript: [],
+        prerequisites: ["先出的预备知识"],
+        thought_prompts: [],
+        review_suggestions: [],
+      },
+    };
+    let resolveSecondStatus: ((value: StudyJobStatus) => void) | undefined;
+    vi.mocked(listItems).mockResolvedValueOnce([item]).mockResolvedValue([partialItem]);
+    vi.mocked(startStudyJob).mockResolvedValue({
+      job_id: "study-job-1",
+      item_id: "abc123",
+      status: "running",
+      progress: 12,
+      phase: "guide",
+      message: "正在生成学习导览",
+      error: null,
+    });
+    vi.mocked(getStudyJob)
+      .mockResolvedValueOnce({
+        job_id: "study-job-1",
+        item_id: "abc123",
+        status: "running",
+        progress: 18,
+        phase: "guide",
+        message: "正在生成学习导览",
+        error: null,
+      })
+      .mockImplementationOnce(
+        () =>
+          new Promise<StudyJobStatus>((resolve) => {
+            resolveSecondStatus = resolve;
+          }),
+      );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "生成学习地图" }));
+
+    expect(await screen.findByText("先出的预备知识", {}, { timeout: 2500 })).toBeTruthy();
+    resolveSecondStatus?.({
+      job_id: "study-job-1",
+      item_id: "abc123",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+    });
   });
 
   it("renames a course title from the library", async () => {

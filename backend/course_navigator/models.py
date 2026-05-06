@@ -22,7 +22,7 @@ TaskParameterKey = Literal[
     "high_fidelity",
 ]
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class TranscriptSegment(BaseModel):
@@ -50,6 +50,7 @@ class DownloadRequest(BaseModel):
 class StudyRequest(BaseModel):
     output_language: OutputLanguage = "zh-CN"
     section: StudySection = "all"
+    detail_level: StudyDetailLevel | None = None
 
 
 class TranscriptUpdateRequest(BaseModel):
@@ -312,6 +313,8 @@ class StudyMaterial(BaseModel):
     prerequisites: list[str] = Field(default_factory=list)
     thought_prompts: list[str] = Field(default_factory=list)
     review_suggestions: list[str] = Field(default_factory=list)
+    beginner_focus: list[str] = Field(default_factory=list)
+    experienced_guidance: list[str] = Field(default_factory=list)
 
 
 class CourseShareItem(BaseModel):

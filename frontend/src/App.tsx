@@ -21,6 +21,7 @@ import {
   Minimize2,
   Pencil,
   Play,
+  RefreshCcw,
   Save,
   Settings as SettingsIcon,
   Sparkles,
@@ -73,6 +74,7 @@ import {
   filterAsrSuggestionsByConfidence,
   previewTextToEditorText,
   reconcilePreviewEditedSuggestions,
+  sortAsrNavigationSuggestions,
   sortAsrReviewSuggestions,
   transcriptToEditorText,
 } from "./asrWorkbench";
@@ -116,6 +118,7 @@ type CaptionPlacement = "overlay" | "panel";
 type LayoutDragKind = "left" | "right" | "player";
 type AsrSuggestionDirection = -1 | 1;
 type SubtitleSourceChoice = TranscriptSource | "local_upload";
+type StudyMapDetailMode = Extract<StudyDetailLevel, "standard" | "faithful">;
 
 function requestTranscriptSource(source: SubtitleSourceChoice): TranscriptSource {
   return source === "local_upload" ? "subtitles" : source;
@@ -223,7 +226,6 @@ const COPY = {
     getSubtitles: "获取字幕",
     getSubtitlesTitle: "为当前视频获取字幕",
     getSubtitlesConfirm: "当前课程已经有字幕。继续获取会覆盖现有字幕和对应学习结果，确定继续吗？",
-    extractSubtitles: "提取字幕",
     translateSubtitles: "翻译字幕",
     subtitleSource: "字幕来源",
     subtitleSourceOriginal: "原字幕优先",
@@ -243,7 +245,6 @@ const COPY = {
     extractAuth: "提取登录",
     cookieSource: "Cookie 来源",
     cookieFile: "Cookie 文件",
-    previewTitle: "待分析视频",
     browserCookieHint: "chrome 或 chrome:Default",
     interfaceLanguage: "界面",
     outputLanguage: "输出",
@@ -391,13 +392,14 @@ const COPY = {
     searchResultLimit: "结果数",
     correctionSuggestions: "修改建议",
     noCorrectionSuggestions: "还没有修改建议。",
+    rerunAsrCorrection: "再次生成校正建议",
     asrBeforeTranscript: "修改前",
     asrAfterTranscript: "修改后预览",
     expandSuggestions: "展开",
     collapseSuggestions: "收起",
     previousSuggestion: "上一个",
     nextSuggestion: "下一个",
-    rerunAsrCorrection: "再次校正",
+    acceptCurrentSuggestionShortcut: "接受当前建议",
     saveAcceptedChanges: "接受后自动保存字幕",
     sortSuggestionsByConfidence: "按置信度从高到低排序",
     acceptConfidencePrefix: "一键接受置信度",
@@ -436,6 +438,12 @@ const COPY = {
     regenerateOutline: "重新生成大纲",
     regenerateDetailed: "重新生成解读",
     regenerateHigh: "重新生成详解",
+    regenerateFullStudy: "全部重新生成",
+    studyMapDetailLevel: "详细程度",
+    studyMapDetailStandard: "标准",
+    studyMapDetailFaithful: "高保真",
+    expandStudySettings: "展开学习地图设置",
+    collapseStudySettings: "收起学习地图设置",
     studyActionHint: "学习内容按当前输出语言生成；更改输出语言后需要重新生成。",
     deleteCourse: "删除课程",
     deleteCourseConfirm: "确定要从课程库删除这个课程吗？本地缓存和字幕文件也会一起移除。",
@@ -465,13 +473,17 @@ const COPY = {
     moveCollectionDown: "下移专辑",
     removeLocalCache: "移除缓存",
     removeLocalCacheConfirm: "确定要删除这个课程的本地视频缓存吗？字幕和学习地图会保留。",
-    regenerateStudy: "重新生成",
     prerequisites: "预备知识",
     thoughtPrompts: "思考提示",
     reviewSuggestions: "复习建议",
+    beginnerFocus: "初学学习建议",
+    experiencedGuidance: "进阶学习建议",
+    studyBlockCount: "已整理为 {count} 个学习块",
     noPrerequisites: "暂未标记预备知识。",
     noPrompts: "暂未生成思考提示。",
     noReviews: "暂未生成复习建议。",
+    noBeginnerFocus: "暂未生成初学学习建议。",
+    noExperiencedGuidance: "暂未生成进阶学习建议。",
     unknownError: "未知错误",
     outputZh: "中文",
     outputEn: "English",
@@ -504,7 +516,6 @@ const COPY = {
     getSubtitles: "Get subtitles",
     getSubtitlesTitle: "Get subtitles for the current video",
     getSubtitlesConfirm: "This course already has subtitles. Getting subtitles again will overwrite the current transcript and related study results. Continue?",
-    extractSubtitles: "Extract subtitles",
     translateSubtitles: "Translate subtitles",
     subtitleSource: "Subtitle source",
     subtitleSourceOriginal: "Source first",
@@ -524,7 +535,6 @@ const COPY = {
     extractAuth: "Auth",
     cookieSource: "Cookie source",
     cookieFile: "Cookie file",
-    previewTitle: "Video preview",
     browserCookieHint: "chrome or chrome:Default",
     interfaceLanguage: "Interface",
     outputLanguage: "Output",
@@ -672,13 +682,14 @@ const COPY = {
     searchResultLimit: "Results",
     correctionSuggestions: "Change suggestions",
     noCorrectionSuggestions: "No suggestions yet.",
+    rerunAsrCorrection: "Regenerate suggestions",
     asrBeforeTranscript: "Before",
     asrAfterTranscript: "After preview",
     expandSuggestions: "Expand",
     collapseSuggestions: "Collapse",
     previousSuggestion: "Previous",
     nextSuggestion: "Next",
-    rerunAsrCorrection: "Run again",
+    acceptCurrentSuggestionShortcut: "Accept current suggestion",
     saveAcceptedChanges: "Auto-save subtitles after accept",
     sortSuggestionsByConfidence: "Sort by confidence, high to low",
     acceptConfidencePrefix: "Accept suggestions at",
@@ -717,6 +728,12 @@ const COPY = {
     regenerateOutline: "Regenerate outline",
     regenerateDetailed: "Regenerate interpretation",
     regenerateHigh: "Regenerate detailed",
+    regenerateFullStudy: "Regenerate all",
+    studyMapDetailLevel: "Detail level",
+    studyMapDetailStandard: "Standard",
+    studyMapDetailFaithful: "High fidelity",
+    expandStudySettings: "Expand study map settings",
+    collapseStudySettings: "Collapse study map settings",
     studyActionHint: "Study content uses the current output language. Regenerate after changing it.",
     deleteCourse: "Delete course",
     deleteCourseConfirm: "Delete this course from the library? Local cache and subtitle files will be removed too.",
@@ -746,13 +763,17 @@ const COPY = {
     moveCollectionDown: "Move collection down",
     removeLocalCache: "Remove cache",
     removeLocalCacheConfirm: "Remove this course's local video cache? Transcript and study map will stay.",
-    regenerateStudy: "Regenerate",
     prerequisites: "Prerequisites",
     thoughtPrompts: "Thought prompts",
     reviewSuggestions: "Review suggestions",
+    beginnerFocus: "Beginner Learning Guidance",
+    experiencedGuidance: "Advanced Learner Guidance",
+    studyBlockCount: "{count} learning blocks",
     noPrerequisites: "No prerequisites flagged.",
     noPrompts: "No prompts generated.",
     noReviews: "No review suggestions.",
+    noBeginnerFocus: "No beginner focus suggestions yet.",
+    noExperiencedGuidance: "No experienced learner guidance yet.",
     unknownError: "Unknown error",
     outputZh: "中文",
     outputEn: "English",
@@ -798,6 +819,7 @@ const TIME_MAP_AUTO_OPEN_STORAGE_KEY = "course-navigator-time-map-auto-open";
 const SELECTED_COURSE_STORAGE_KEY = "course-navigator-last-selected-course";
 const ASR_SAVE_ACCEPTED_CHANGES_STORAGE_KEY = "course-navigator-asr-save-accepted-changes";
 const ASR_SORT_BY_CONFIDENCE_STORAGE_KEY = "course-navigator-asr-sort-by-confidence";
+const STUDY_DETAIL_LEVEL_STORAGE_KEY = "course-navigator-study-detail-level";
 const TASK_PARAMETER_KEYS: TaskParameterKey[] = [
   "title_translation",
   "subtitle_translation",
@@ -889,6 +911,8 @@ export function App() {
   const [timeMapAutoOpen, setTimeMapAutoOpen] = useState(() =>
     loadBooleanPreference(TIME_MAP_AUTO_OPEN_STORAGE_KEY, true),
   );
+  const [studyMapDetailMode, setStudyMapDetailMode] = useState<StudyMapDetailMode>(() => loadStudyDetailModePreference());
+  const [studySettingsOpen, setStudySettingsOpen] = useState(false);
   const [editingCollectionKey, setEditingCollectionKey] = useState<string | null>(null);
   const [editingCollectionDraft, setEditingCollectionDraft] = useState("");
   const [savingCollectionKey, setSavingCollectionKey] = useState<string | null>(null);
@@ -945,14 +969,25 @@ export function App() {
 
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
+  useEffect(() => {
+    saveStudyDetailModePreference(studyMapDetailMode);
+  }, [studyMapDetailMode]);
+
   const selectedStudy = selected?.study ?? null;
   const translatedTranscript = selectedStudy?.translated_transcript ?? [];
   const selectedHasStudy = hasStudyMaterial(selectedStudy);
   const selectedIsBilibili = selected ? isBilibiliItem(selected) : false;
   const selectedIsLocalVideo = selected ? isLocalVideoItem(selected) : false;
   const forcedBilibiliEmbed = selected ? forcedBilibiliEmbedIds.includes(selected.id) : false;
-  const showVideoCaptionDock = Boolean(selected) && (!selectedIsBilibili || sourceMode === "local" || forcedBilibiliEmbed);
+  const showVideoCaptionDock = Boolean(selected);
   const videoCaptionControlsAvailable = !(selectedIsBilibili && sourceMode === "embed");
+  const rightRailClassName = [
+    "right-rail",
+    selectedHasStudy ? "" : "no-study-actions",
+    studySettingsOpen ? "study-settings-open" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   const timeMapVisible = selectedHasStudy && timeMapOpen;
   const leftRailClassName = timeMapVisible
     ? "left-rail"
@@ -1268,10 +1303,27 @@ export function App() {
     }
   }
 
+  async function handleRegenerateFullStudy() {
+    if (!selected?.transcript.length) {
+      setError(copy.noTranscriptForStudy);
+      return;
+    }
+    setError(null);
+    try {
+      await runStudyJob(selected.id, "all");
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setBusy(null);
+      setJobStatus(null);
+      setActiveJobKind(null);
+    }
+  }
+
   async function runStudyJob(itemId: string, section: StudySection = "all") {
     setActiveJobKind("study");
     setBusy(section === "all" ? copy.generating : regenerateLabelForTab(section, copy));
-    const firstStatus = await startStudyJob(itemId, outputLanguage, section);
+    const firstStatus = await startStudyJob(itemId, outputLanguage, section, studyMapDetailMode);
     setJobStatus(firstStatus);
     let current = firstStatus;
     while (current.status === "queued" || current.status === "running") {
@@ -1279,7 +1331,7 @@ export function App() {
       current = await getStudyJob(firstStatus.job_id);
       setJobStatus(current);
       setBusy(`${current.message} ${current.progress}%`);
-      if (current.status === "running" && current.phase === "translation") {
+      if (current.status === "running") {
         await refreshItems(itemId);
       }
     }
@@ -1789,7 +1841,7 @@ export function App() {
         learning_model_id: settingsDraft.learning_model_id,
         global_model_id: settingsDraft.global_model_id,
         asr_model_id: settingsDraft.asr_model_id,
-        study_detail_level: "faithful",
+        study_detail_level: settingsDraft.study_detail_level,
         task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
       });
       const nextOnlineAsr = await saveOnlineAsrSettings(onlineAsrDraftToInput(onlineAsrDraft));
@@ -1832,7 +1884,7 @@ export function App() {
             learning_model_id: settingsDraft.learning_model_id,
             global_model_id: settingsDraft.global_model_id,
             asr_model_id: settingsDraft.asr_model_id,
-            study_detail_level: "faithful",
+            study_detail_level: settingsDraft.study_detail_level,
             task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
           };
       const next = await saveModelSettings({ ...source, [role]: profileId });
@@ -1843,7 +1895,7 @@ export function App() {
         learning_model_id: next.learning_model_id,
         global_model_id: next.global_model_id,
         asr_model_id: next.asr_model_id,
-        study_detail_level: "faithful",
+        study_detail_level: next.study_detail_level,
         task_parameters: taskParametersToDraft(next.task_parameters),
       }));
       setRoleSettingsMessage(copy.modelRolesSaved);
@@ -1870,7 +1922,7 @@ export function App() {
             learning_model_id: settingsDraft.learning_model_id,
             global_model_id: settingsDraft.global_model_id,
             asr_model_id: settingsDraft.asr_model_id,
-            study_detail_level: "faithful",
+            study_detail_level: settingsDraft.study_detail_level,
             task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
           };
       const next = await saveModelSettings({ ...source, asr_model_id: profileId });
@@ -1913,7 +1965,7 @@ export function App() {
         learning_model_id: current.learning_model_id || id,
         global_model_id: current.global_model_id || id,
         asr_model_id: current.asr_model_id || id,
-        study_detail_level: "faithful",
+        study_detail_level: current.study_detail_level,
         task_parameters: current.task_parameters,
       };
     });
@@ -1941,7 +1993,7 @@ export function App() {
         learning_model_id: current.learning_model_id || id,
         global_model_id: current.global_model_id || id,
         asr_model_id: id,
-        study_detail_level: "faithful",
+        study_detail_level: current.study_detail_level,
         task_parameters: current.task_parameters,
       };
     });
@@ -2009,6 +2061,21 @@ export function App() {
               <p>{copy.subtitle}</p>
             </div>
           </div>
+          <a
+            className="topbar-icon-link"
+            href="https://github.com/Liu-Bot24/course-navigator"
+            target="_blank"
+            rel="noreferrer"
+            aria-label="GitHub"
+            title="GitHub"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18">
+              <path
+                fill="currentColor"
+                d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.88-.01-1.73-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.36-2.22-.26-4.56-1.14-4.56-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.31.1-2.71 0 0 .84-.28 2.75 1.05A9.32 9.32 0 0 1 12 7.01c.85 0 1.71.12 2.51.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.4.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.81-4.57 5.07.36.32.68.95.68 1.92 0 1.39-.01 2.5-.01 2.84 0 .27.18.59.69.49A10.2 10.2 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"
+              />
+            </svg>
+          </a>
           <button
             className="settings-trigger"
             aria-label={copy.modelSettings}
@@ -2332,45 +2399,47 @@ export function App() {
                         />
                         <span>{group.title}</span>
                       </button>
-                      {groupIndex > 0 ? (
+                      <div className="library-collection-actions">
+                        {groupIndex > 0 ? (
+                          <button
+                            aria-label={`${copy.moveCollectionUp} ${group.title}`}
+                            className="library-collection-move"
+                            title={copy.moveCollectionUp}
+                            onClick={() => handleMoveCollection(group, -1)}
+                          >
+                            <ArrowUp size={12} />
+                          </button>
+                        ) : <span className="library-collection-spacer" aria-hidden="true" />}
+                        {groupIndex < groupedItems.length - 1 ? (
+                          <button
+                            aria-label={`${copy.moveCollectionDown} ${group.title}`}
+                            className="library-collection-move"
+                            title={copy.moveCollectionDown}
+                            onClick={() => handleMoveCollection(group, 1)}
+                          >
+                            <ArrowDown size={12} />
+                          </button>
+                        ) : <span className="library-collection-spacer" aria-hidden="true" />}
                         <button
-                          aria-label={`${copy.moveCollectionUp} ${group.title}`}
-                          className="library-collection-move"
-                          title={copy.moveCollectionUp}
-                          onClick={() => handleMoveCollection(group, -1)}
+                          aria-label={`${copy.editCollection} ${group.title}`}
+                          className="library-collection-edit"
+                          title={copy.editCollection}
+                          onClick={() => startEditingCollection(group)}
                         >
-                          <ArrowUp size={12} />
+                          <Pencil size={13} />
                         </button>
-                      ) : <span className="library-collection-spacer" aria-hidden="true" />}
-                      {groupIndex < groupedItems.length - 1 ? (
-                        <button
-                          aria-label={`${copy.moveCollectionDown} ${group.title}`}
-                          className="library-collection-move"
-                          title={copy.moveCollectionDown}
-                          onClick={() => handleMoveCollection(group, 1)}
-                        >
-                          <ArrowDown size={12} />
-                        </button>
-                      ) : <span className="library-collection-spacer" aria-hidden="true" />}
-                      <button
-                        aria-label={`${copy.editCollection} ${group.title}`}
-                        className="library-collection-edit"
-                        title={copy.editCollection}
-                        onClick={() => startEditingCollection(group)}
-                      >
-                        <Pencil size={13} />
-                      </button>
-                      {canDeleteCollection ? (
-                        <button
-                          aria-label={`${copy.deleteCollection} ${group.title}`}
-                          className="library-collection-delete"
-                          disabled={savingCollectionKey === group.key}
-                          title={copy.deleteCollection}
-                          onClick={() => void handleDeleteCollection(group)}
-                        >
-                          {savingCollectionKey === group.key ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
-                        </button>
-                      ) : <span className="library-collection-spacer" aria-hidden="true" />}
+                        {canDeleteCollection ? (
+                          <button
+                            aria-label={`${copy.deleteCollection} ${group.title}`}
+                            className="library-collection-delete"
+                            disabled={savingCollectionKey === group.key}
+                            title={copy.deleteCollection}
+                            onClick={() => void handleDeleteCollection(group)}
+                          >
+                            {savingCollectionKey === group.key ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
+                          </button>
+                        ) : <span className="library-collection-spacer" aria-hidden="true" />}
+                      </div>
                       <small>{group.items.length}</small>
                     </div>
                   )}
@@ -2710,7 +2779,7 @@ export function App() {
           onPointerDown={(event) => startLayoutDrag("right", event)}
         />
 
-        <aside className={selectedHasStudy ? "right-rail" : "right-rail no-study-actions"}>
+        <aside className={rightRailClassName}>
           <div className="ai-tabs">
             <TabButton active={activeTab === "guide"} onClick={() => setActiveTab("guide")}>
               {copy.guide}
@@ -2724,7 +2793,52 @@ export function App() {
             <TabButton active={activeTab === "high"} onClick={() => setActiveTab("high")}>
               {copy.high}
             </TabButton>
+            <button
+              className={studySettingsOpen ? "study-settings-toggle open" : "study-settings-toggle"}
+              type="button"
+              aria-label={studySettingsOpen ? copy.collapseStudySettings : copy.expandStudySettings}
+              title={studySettingsOpen ? copy.collapseStudySettings : copy.expandStudySettings}
+              aria-expanded={studySettingsOpen}
+              onClick={() => setStudySettingsOpen((value) => !value)}
+            >
+              {studySettingsOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            </button>
           </div>
+          {studySettingsOpen ? (
+            <div className="study-settings-panel">
+              <button
+                className="player-subtle-action study-full-regenerate-action"
+                type="button"
+                onClick={handleRegenerateFullStudy}
+                disabled={Boolean(busy) || !selectedHasStudy || !selected?.transcript.length}
+                title={copy.regenerateFullStudy}
+              >
+                <RefreshCcw size={13} />
+                <span>{copy.regenerateFullStudy}</span>
+              </button>
+              <div className="study-detail-control" aria-label={copy.studyMapDetailLevel}>
+                <span>{copy.studyMapDetailLevel}</span>
+                <div className="study-detail-segment">
+                  <button
+                    type="button"
+                    className={studyMapDetailMode === "standard" ? "active" : ""}
+                    aria-pressed={studyMapDetailMode === "standard"}
+                    onClick={() => setStudyMapDetailMode("standard")}
+                  >
+                    {copy.studyMapDetailStandard}
+                  </button>
+                  <button
+                    type="button"
+                    className={studyMapDetailMode === "faithful" ? "active" : ""}
+                    aria-pressed={studyMapDetailMode === "faithful"}
+                    onClick={() => setStudyMapDetailMode("faithful")}
+                  >
+                    {copy.studyMapDetailFaithful}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
           {selectedHasStudy ? (
             <div className="study-actions">
               <button
@@ -3061,6 +3175,10 @@ function AsrWorkbench({
     () => sortAsrReviewSuggestions(pendingSuggestions, sortSuggestionsByConfidence),
     [pendingSuggestions, sortSuggestionsByConfidence],
   );
+  const navigationSuggestions = useMemo(
+    () => sortAsrNavigationSuggestions(pendingSuggestions),
+    [pendingSuggestions],
+  );
   const suggestionById = useMemo(
     () => new Map(suggestions.map((suggestion) => [suggestion.id, suggestion])),
     [suggestions],
@@ -3068,10 +3186,10 @@ function AsrWorkbench({
   const hasCorrectionSuggestions = pendingSuggestions.length > 0;
   const effectiveSuggestionsExpanded = suggestionsExpanded && hasCorrectionSuggestions;
   const activeSuggestionIndex = activeSuggestionId
-    ? reviewSuggestions.findIndex((suggestion) => suggestion.id === activeSuggestionId)
+    ? navigationSuggestions.findIndex((suggestion) => suggestion.id === activeSuggestionId)
     : -1;
   const activeSuggestion =
-    reviewSuggestions[activeSuggestionIndex >= 0 ? activeSuggestionIndex : 0] ?? null;
+    navigationSuggestions[activeSuggestionIndex >= 0 ? activeSuggestionIndex : 0] ?? null;
   const displaySuggestionIndex = activeSuggestion ? Math.max(0, activeSuggestionIndex) + 1 : 0;
   const hoverSuggestion = hoverCard ? suggestionById.get(hoverCard.suggestionId) ?? null : null;
   const progressInfo = jobStatus && busy ? asrProgressInfo(jobStatus, copy) : null;
@@ -3114,15 +3232,39 @@ function AsrWorkbench({
   }, [pendingSuggestions.length]);
 
   useEffect(() => {
-    if (!reviewSuggestions.length) return;
-    if (activeSuggestionId && reviewSuggestions.some((suggestion) => suggestion.id === activeSuggestionId)) return;
-    setActiveSuggestionId(reviewSuggestions[0].id);
-  }, [activeSuggestionId, reviewSuggestions]);
+    if (!navigationSuggestions.length) return;
+    if (activeSuggestionId && navigationSuggestions.some((suggestion) => suggestion.id === activeSuggestionId)) return;
+    setActiveSuggestionId(navigationSuggestions[0].id);
+  }, [activeSuggestionId, navigationSuggestions]);
 
   useEffect(() => {
     if (!hoverSuggestion || hoverSuggestion.status === "pending") return;
     setHoverCard(null);
   }, [hoverSuggestion]);
+
+  useEffect(() => {
+    if (!hasCorrectionSuggestions) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+      if (!asrReviewShortcutAllowed(event.target, previewRef.current, event.key)) return;
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        navigateSuggestion(-1);
+        return;
+      }
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        navigateSuggestion(1);
+        return;
+      }
+      if (event.key === "Enter" && activeSuggestion) {
+        event.preventDefault();
+        void acceptSuggestion(activeSuggestion.id);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [activeSuggestion, hasCorrectionSuggestions, navigationSuggestions]);
 
   async function runCorrection() {
     if (!item) return;
@@ -3289,6 +3431,7 @@ function AsrWorkbench({
         const maxTop = Math.max(0, previewRef.current.scrollHeight - previewRef.current.clientHeight);
         const targetTop = marker.offsetTop - previewRef.current.clientHeight * 0.28;
         previewRef.current.scrollTop = clamp(targetTop, 0, maxTop);
+        showSuggestionCardAtEditorMarker(suggestion.id, marker, previewRef.current);
       }
       syncTranscriptScroll("preview", {
         left: previewRef.current.scrollLeft,
@@ -3298,10 +3441,10 @@ function AsrWorkbench({
   }
 
   function navigateSuggestion(direction: AsrSuggestionDirection) {
-    if (!reviewSuggestions.length) return;
+    if (!navigationSuggestions.length) return;
     const currentIndex = activeSuggestionIndex >= 0 ? activeSuggestionIndex : 0;
-    const nextIndex = clamp(currentIndex + direction, 0, reviewSuggestions.length - 1);
-    focusSuggestionInPreview(reviewSuggestions[nextIndex]);
+    const nextIndex = clamp(currentIndex + direction, 0, navigationSuggestions.length - 1);
+    focusSuggestionInPreview(navigationSuggestions[nextIndex]);
   }
 
   function syncTranscriptScroll(source: "editor" | "preview", scroll: { left: number; top: number }) {
@@ -3337,8 +3480,41 @@ function AsrWorkbench({
   function showSuggestionHover(suggestionId: string, event: ReactMouseEvent<HTMLElement>) {
     const suggestion = suggestionById.get(suggestionId);
     if (!suggestion || suggestion.status !== "pending") return;
+    showSuggestionCardAtMarker(suggestionId, event.currentTarget);
+  }
+
+  function showSuggestionCardAtMarker(suggestionId: string, marker: HTMLElement) {
+    const suggestion = suggestionById.get(suggestionId);
+    if (!suggestion || suggestion.status !== "pending") return;
     clearHoverHideTimer();
-    const rect = event.currentTarget.getBoundingClientRect();
+    const rect = marker.getBoundingClientRect();
+    showSuggestionCardAtRect(suggestionId, rect);
+  }
+
+  function showSuggestionCardAtEditorMarker(
+    suggestionId: string,
+    marker: HTMLElement,
+    editor: HTMLTextAreaElement | null,
+  ) {
+    const suggestion = suggestionById.get(suggestionId);
+    if (!suggestion || !editor || suggestion.status !== "pending") return;
+    clearHoverHideTimer();
+    const editorRect = editor.getBoundingClientRect();
+    const top = editorRect.top + marker.offsetTop - editor.scrollTop;
+    const left = editorRect.left + marker.offsetLeft - editor.scrollLeft;
+    const rect = {
+      left,
+      right: left + marker.offsetWidth,
+      top,
+      bottom: top + marker.offsetHeight,
+    };
+    showSuggestionCardAtRect(suggestionId, rect);
+  }
+
+  function showSuggestionCardAtRect(
+    suggestionId: string,
+    rect: Pick<DOMRect, "left" | "right" | "top" | "bottom">,
+  ) {
     const width = 320;
     const height = 188;
     const left = Math.min(Math.max(12, rect.left), Math.max(12, window.innerWidth - width - 12));
@@ -3515,15 +3691,17 @@ function AsrWorkbench({
                         type="button"
                         onClick={() => navigateSuggestion(-1)}
                         disabled={!activeSuggestion || displaySuggestionIndex <= 1}
+                        title={`${copy.previousSuggestion} (↑)`}
                       >
                         <ArrowUp size={13} />
                         {copy.previousSuggestion}
                       </button>
-                      <strong>{displaySuggestionIndex}/{reviewSuggestions.length}</strong>
+                      <strong>{displaySuggestionIndex}/{navigationSuggestions.length}</strong>
                       <button
                         type="button"
                         onClick={() => navigateSuggestion(1)}
-                        disabled={!activeSuggestion || displaySuggestionIndex >= reviewSuggestions.length}
+                        disabled={!activeSuggestion || displaySuggestionIndex >= navigationSuggestions.length}
+                        title={`${copy.nextSuggestion} (↓)`}
                       >
                         <ArrowDown size={13} />
                         {copy.nextSuggestion}
@@ -3662,7 +3840,7 @@ function AsrWorkbench({
               ) : null}
               <button className="asr-primary-action wide" type="button" onClick={() => void runCorrection()} disabled={Boolean(busy) || !selectedModelId}>
                 {busy ? <Loader2 className="spin" size={15} /> : <Sparkles size={15} />}
-                {copy.runAsrCorrection}
+                {suggestions.length ? copy.rerunAsrCorrection : copy.runAsrCorrection}
               </button>
             </section>
 
@@ -3736,15 +3914,6 @@ function AsrWorkbench({
                       <CheckCheck size={14} />
                       {copy.acceptAllChanges}
                     </button>
-                    <button
-                      className="secondary-action asr-rerun-action"
-                      type="button"
-                      onClick={() => void runCorrection()}
-                      disabled={Boolean(busy) || !selectedModelId}
-                    >
-                      <Sparkles size={14} />
-                      {copy.rerunAsrCorrection}
-                    </button>
                   </div>
                 </div>
                 <div className="asr-suggestions">
@@ -3804,7 +3973,12 @@ function AsrWorkbench({
                           {suggestion.evidence ? <p><strong>{copy.evidence}</strong>{suggestion.evidence}</p> : null}
                         </div>
                         <div className="asr-suggestion-actions">
-                          <button type="button" onClick={() => void acceptSuggestion(suggestion.id)} disabled={suggestion.status !== "pending"}>
+                          <button
+                            type="button"
+                            onClick={() => void acceptSuggestion(suggestion.id)}
+                            disabled={suggestion.status !== "pending"}
+                            title={suggestion.id === activeSuggestion?.id ? `${copy.acceptCurrentSuggestionShortcut} (Enter)` : copy.acceptChange}
+                          >
                             <Check size={14} />
                             {copy.acceptChange}
                           </button>
@@ -4023,6 +4197,17 @@ function findAsrEditorMarker(
   );
 }
 
+function asrReviewShortcutAllowed(target: EventTarget | null, previewEditor: HTMLTextAreaElement | null, key: string): boolean {
+  const element = target instanceof HTMLElement ? target : document.activeElement;
+  if (!(element instanceof HTMLElement)) return true;
+  if (previewEditor && element === previewEditor) return true;
+  if (element.isContentEditable) return false;
+  const tagName = element.tagName.toLowerCase();
+  if (tagName === "input" || tagName === "select" || tagName === "textarea") return false;
+  if (key === "Enter" && element.closest("button, a, [role='button']")) return false;
+  return true;
+}
+
 function draftFromModelSettings(settings: ModelSettings, preferredActiveProfileId?: string): SettingsDraft {
   const profiles =
     settings.profiles.length > 0
@@ -4058,7 +4243,7 @@ function draftFromModelSettings(settings: ModelSettings, preferredActiveProfileI
     learning_model_id: settings.learning_model_id || firstId,
     global_model_id: settings.global_model_id || firstId,
     asr_model_id: settings.asr_model_id || firstId,
-    study_detail_level: "faithful",
+    study_detail_level: settings.study_detail_level,
     task_parameters: taskParametersToDraft(settings.task_parameters),
   };
 }
@@ -4095,7 +4280,7 @@ function modelSettingsToInput(settings: ModelSettings): ModelSettingsInput {
     learning_model_id: settings.learning_model_id,
     global_model_id: settings.global_model_id,
     asr_model_id: settings.asr_model_id,
-    study_detail_level: "faithful",
+    study_detail_level: settings.study_detail_level,
     task_parameters: settings.task_parameters,
   };
 }
@@ -4459,6 +4644,15 @@ function SettingsModal({
           />
         </label>
         <label className="settings-field">
+          <span>{copy.modelApiKey}</span>
+          <input
+            autoComplete="off"
+            value={selectedProfile?.api_key ?? ""}
+            onChange={(event) => updateSelectedProfile({ api_key: event.target.value })}
+            placeholder={selectedProfile?.api_key_preview ? copy.modelApiKeyHint : copy.apiKeyOptionalHint}
+          />
+        </label>
+        <label className="settings-field">
           <span>{copy.modelName}</span>
           <input
             list="course-navigator-model-options"
@@ -4553,15 +4747,6 @@ function SettingsModal({
             </>
           ) : null}
         </div>
-        <label className="settings-field">
-          <span>{copy.modelApiKey}</span>
-          <input
-            autoComplete="off"
-            value={selectedProfile?.api_key ?? ""}
-            onChange={(event) => updateSelectedProfile({ api_key: event.target.value })}
-            placeholder={selectedProfile?.api_key_preview ? copy.modelApiKeyHint : copy.apiKeyOptionalHint}
-          />
-        </label>
         <div className="modal-actions">
           {message ? <span>{message}</span> : null}
           <button onClick={onSave} disabled={busy}>
@@ -5011,42 +5196,44 @@ function VideoCaptionDock({
   return (
     <div className="video-caption-dock">
       <div className="video-caption-toolbar">
-        <span>{copy.videoCaption}</span>
-        {captionControlsAvailable ? (
-          <>
-            <DisplayModeControls
-              copy={copy}
-              scopeLabel={copy.videoCaption}
-              value={mode}
-              onChange={onModeChange}
-              allowHidden
-            />
-            <div className="caption-placement-controls" role="group" aria-label={copy.videoCaption}>
-              <button
-                className={placement === "overlay" ? "mode-chip active" : "mode-chip"}
-                aria-label={copy.captionOverlay}
-                title={copy.captionOverlay}
-                onClick={() => onPlacementChange("overlay")}
-              >
-                <span className="mode-glyph">浮</span>
-              </button>
-              <button
-                className={placement === "panel" ? "mode-chip active" : "mode-chip"}
-                aria-label={copy.captionPanel}
-                title={copy.captionPanel}
-                onClick={() => onPlacementChange("panel")}
-              >
-                <span className="mode-glyph">栏</span>
-              </button>
-            </div>
-          </>
-        ) : (
-          <span className="caption-dock-note">{copy.bilibiliEmbedUnavailable}</span>
-        )}
-        <button className="caption-fullscreen-button" type="button" onClick={onFullscreen}>
-          <Maximize2 size={14} />
-          <span>{copy.fullscreenVideo}</span>
-        </button>
+        <div className="video-caption-toolbar-controls">
+          <span>{copy.videoCaption}</span>
+          {captionControlsAvailable ? (
+            <>
+              <DisplayModeControls
+                copy={copy}
+                scopeLabel={copy.videoCaption}
+                value={mode}
+                onChange={onModeChange}
+                allowHidden
+              />
+              <div className="caption-placement-controls" role="group" aria-label={copy.videoCaption}>
+                <button
+                  className={placement === "overlay" ? "mode-chip active" : "mode-chip"}
+                  aria-label={copy.captionOverlay}
+                  title={copy.captionOverlay}
+                  onClick={() => onPlacementChange("overlay")}
+                >
+                  <span className="mode-glyph">浮</span>
+                </button>
+                <button
+                  className={placement === "panel" ? "mode-chip active" : "mode-chip"}
+                  aria-label={copy.captionPanel}
+                  title={copy.captionPanel}
+                  onClick={() => onPlacementChange("panel")}
+                >
+                  <span className="mode-glyph">栏</span>
+                </button>
+              </div>
+            </>
+          ) : (
+            <span className="caption-dock-note">{copy.bilibiliEmbedUnavailable}</span>
+          )}
+          <button className="caption-fullscreen-button" type="button" onClick={onFullscreen}>
+            <Maximize2 size={14} />
+            <span>{copy.fullscreenVideo}</span>
+          </button>
+        </div>
       </div>
       {captionControlsAvailable && placement === "panel" && !captionsHidden ? (
         <div className="video-caption-panel">
@@ -5213,10 +5400,19 @@ function StudyView({
       <div className="study-scroll">
         <section className="guide-lead">
           <h2 title={study.one_line}>{compactGuideSummary(study.one_line)}</h2>
+          {study.time_map.length ? (
+            <p>{formatCountMessage(copy.studyBlockCount, study.time_map.length)}</p>
+          ) : null}
         </section>
         <InfoList title={copy.prerequisites} items={study.prerequisites} fallback={copy.noPrerequisites} />
         <InfoList title={copy.thoughtPrompts} items={study.thought_prompts} fallback={copy.noPrompts} />
         <InfoList title={copy.reviewSuggestions} items={study.review_suggestions} fallback={copy.noReviews} />
+        <InfoList title={copy.beginnerFocus} items={study.beginner_focus ?? []} fallback={copy.noBeginnerFocus} />
+        <InfoList
+          title={copy.experiencedGuidance}
+          items={study.experienced_guidance ?? []}
+          fallback={copy.noExperiencedGuidance}
+        />
       </div>
     );
   }
@@ -5808,6 +6004,23 @@ function saveBooleanPreference(key: string, value: boolean) {
   }
 }
 
+function loadStudyDetailModePreference(): StudyMapDetailMode {
+  try {
+    const raw = window.localStorage.getItem(STUDY_DETAIL_LEVEL_STORAGE_KEY);
+    return raw === "faithful" ? "faithful" : "standard";
+  } catch {
+    return "standard";
+  }
+}
+
+function saveStudyDetailModePreference(value: StudyMapDetailMode) {
+  try {
+    window.localStorage.setItem(STUDY_DETAIL_LEVEL_STORAGE_KEY, value);
+  } catch {
+    // Local storage is optional; the in-memory state already changed.
+  }
+}
+
 function downloadJsonFile(payload: unknown, fileName: string) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -5906,12 +6119,6 @@ function findExistingItemForUrl(items: CourseItem[], sourceUrl: string): CourseI
   return items.find((item) => canonicalSourceKey(item.source_url) === sourceKey) ?? null;
 }
 
-function firstWords(text: string, count: number): string {
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length <= count) return text;
-  return `${words.slice(0, count).join(" ")}...`;
-}
-
 function compactGuideSummary(text: string): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   const zhMatch = normalized.match(/(\d+\s*个学习块)[：:]\s*(.+)$/);
@@ -5938,7 +6145,9 @@ function hasStudyMaterial(study: StudyMaterial | null): boolean {
       study.high_fidelity_text.trim() ||
       study.prerequisites.length ||
       study.thought_prompts.length ||
-      study.review_suggestions.length,
+      study.review_suggestions.length ||
+      (study.beginner_focus?.length ?? 0) ||
+      (study.experienced_guidance?.length ?? 0),
   );
 }
 
@@ -5947,6 +6156,10 @@ function regenerateLabelForTab(tab: StudySection, copy: (typeof COPY)[UiLanguage
   if (tab === "detailed") return copy.regenerateDetailed;
   if (tab === "high") return copy.regenerateHigh;
   return copy.regenerateGuide;
+}
+
+function formatCountMessage(template: string, count: number): string {
+  return template.replace("{count}", String(count));
 }
 
 function firstCompleteSentence(text: string, language: OutputLanguage): string {

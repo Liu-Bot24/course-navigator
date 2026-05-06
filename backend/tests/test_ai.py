@@ -1,8 +1,8 @@
 import pytest
 
 import course_navigator.ai as ai
-from course_navigator.ai import LlmProvider, _chat_text, _normalize_study_payload, generate_study_material
-from course_navigator.models import OutlineNode, StudyMaterial, TimeRange, TranscriptSegment
+from course_navigator.ai import LlmProvider, _chat_text, generate_study_material
+from course_navigator.models import OutlineNode, StudyMaterial, TimeRange, TranscriptSegment, VideoMetadata
 
 
 def test_generate_study_material_fallback_preserves_transcript_detail():
@@ -44,6 +44,14 @@ def test_generate_study_material_fallback_can_use_chinese_output():
     assert "思考" in study.thought_prompts[0]
     assert "未配置模型" in study.high_fidelity_text
     assert study.translated_transcript == []
+
+
+def test_chinese_one_line_does_not_reuse_english_context_summary():
+    summary = "This is a weekly AI large model news report for May 2026."
+
+    one_line = ai._one_line_from_context("Weekly AI News", [{"title": "OpenAI news"}], "zh-CN", summary)
+
+    assert one_line == "这门课程围绕「Weekly AI News」展开。"
 
 
 def test_generate_study_material_handles_empty_transcript():
@@ -90,7 +98,21 @@ def test_long_transcript_provider_path_builds_layered_study_material(monkeypatch
 
     monkeypatch.setattr(ai, "_generate_translation_context", lambda *args, **kwargs: "课程讲 AI 基础。")
     monkeypatch.setattr(ai, "_translate_transcript_with_provider", lambda *args, **kwargs: translated)
-    monkeypatch.setattr(ai, "_generate_learning_blocks_with_provider", lambda *args, **kwargs: blocks)
+    def fake_blocks(**kwargs):
+        kwargs["partial_ranges"](
+            [
+                TimeRange(
+                    start=0,
+                    end=162,
+                    title="先出的大纲骨架",
+                    summary="先保存可浏览的课程结构。",
+                    priority="focus",
+                )
+            ]
+        )
+        return blocks
+
+    monkeypatch.setattr(ai, "_generate_learning_blocks_with_provider", fake_blocks)
     monkeypatch.setattr(
         ai,
         "_generate_outline_with_provider",
@@ -112,6 +134,9 @@ def test_long_transcript_provider_path_builds_layered_study_material(monkeypatch
             "prerequisites": ["了解什么是任务自动化"],
             "thought_prompts": ["哪些工作流适合迁移？"],
             "review_suggestions": ["回看应用判断片段"],
+            "beginner_focus": ["小白先听基本概念。"],
+            "experienced_guidance": ["有经验者可略过定义，重点复习迁移判断。"],
+            "one_line": "这门课用 AI 应用示例帮助学习者理解任务自动化的判断方法。",
         },
     )
     progress_events: list[tuple[str, int, str]] = []
@@ -129,16 +154,96 @@ def test_long_transcript_provider_path_builds_layered_study_material(monkeypatch
     assert study.outline[0].title == "课程主线"
     assert "经过解释的解读" in study.detailed_notes
     assert "详解学习稿" in study.high_fidelity_text
+    assert study.one_line == "这门课用 AI 应用示例帮助学习者理解任务自动化的判断方法。"
     assert study.prerequisites == ["了解什么是任务自动化"]
+    assert study.beginner_focus == ["小白先听基本概念。"]
+    assert study.experienced_guidance == ["有经验者可略过定义，重点复习迁移判断。"]
+    assert not any("翻译上下文摘要" in event[2] for event in progress_events)
     assert [event[0] for event in progress_events] == [
         "preparing",
         "summary",
+        "guide",
         "translation",
         "segmentation",
         "outline",
-        "guide",
         "assembly",
     ]
+
+
+def test_full_study_generation_reports_partial_study_sections(monkeypatch):
+    transcript = [
+        TranscriptSegment(start=index * 2, end=index * 2 + 2, text=f"source line {index}")
+        for index in range(81)
+    ]
+    translated = [
+        TranscriptSegment(start=segment.start, end=segment.end, text=f"译文 {index}")
+        for index, segment in enumerate(transcript)
+    ]
+    blocks = [
+        {
+            "id": "block-1",
+            "start": 0,
+            "end": 162,
+            "title": "课程主线",
+            "summary": "解释课程。",
+            "priority": "focus",
+            "key_points": ["重点"],
+            "detailed_notes": "新解读",
+            "high_fidelity_text": "新详解",
+        }
+    ]
+
+    monkeypatch.setattr(ai, "_generate_translation_context", lambda *args, **kwargs: "课程上下文。")
+    monkeypatch.setattr(ai, "_translate_transcript_with_provider", lambda *args, **kwargs: translated)
+    def fake_blocks(**kwargs):
+        kwargs["partial_ranges"](
+            [
+                TimeRange(
+                    start=0,
+                    end=162,
+                    title="先出的大纲骨架",
+                    summary="先保存可浏览的课程结构。",
+                    priority="focus",
+                )
+            ]
+        )
+        return blocks
+
+    monkeypatch.setattr(ai, "_generate_learning_blocks_with_provider", fake_blocks)
+    monkeypatch.setattr(
+        ai,
+        "_generate_guidance_with_provider",
+        lambda *args, **kwargs: {
+            "prerequisites": ["先出的导览"],
+            "thought_prompts": ["先出的思考题"],
+            "review_suggestions": ["先出的复习建议"],
+        },
+    )
+    monkeypatch.setattr(
+        ai,
+        "_generate_outline_with_provider",
+        lambda *args, **kwargs: [
+            OutlineNode(id="block-1", start=0, end=162, title="新大纲", summary="大纲摘要", children=[]),
+        ],
+    )
+    partials: list[StudyMaterial] = []
+
+    study = generate_study_material(
+        title="AI for Everyone",
+        transcript=transcript,
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="zh-CN",
+        partial_study=partials.append,
+    )
+
+    assert partials[0].prerequisites == ["先出的导览"]
+    assert partials[0].time_map == []
+    assert partials[1].outline[0].title == "先出的大纲骨架"
+    assert partials[1].detailed_notes == ""
+    assert partials[2].detailed_notes == "00:00-02:42 课程主线\n新解读"
+    assert partials[1].outline
+    assert partials[-1].outline[0].title == "新大纲"
+    assert study.outline[0].title == "新大纲"
 
 
 def test_anthropic_provider_base_url_adds_v1_for_official_endpoint(monkeypatch):
@@ -199,7 +304,7 @@ def test_long_transcript_uses_role_specific_model_slots(monkeypatch):
     ]
     used_models: list[tuple[str, str]] = []
 
-    def fake_context(title, transcript, provider, output_language):
+    def fake_context(title, transcript, provider, output_language, metadata=None):
         used_models.append(("context", provider.model))
         return "课程摘要"
 
@@ -243,10 +348,10 @@ def test_long_transcript_uses_role_specific_model_slots(monkeypatch):
 
     assert used_models == [
         ("context", "long-global"),
+        ("guide", "long-global"),
         ("translation", "fast-translate"),
         ("learning_blocks", "deep-learning"),
         ("outline", "long-global"),
-        ("guide", "long-global"),
     ]
 
 
@@ -363,6 +468,179 @@ def test_transcript_translation_skips_when_transcript_already_matches_output_lan
     assert partials[-1] == transcript
 
 
+def test_transcript_translation_context_generation_receives_video_metadata(monkeypatch):
+    transcript = [
+        TranscriptSegment(start=0, end=2, text="This lesson introduces prompt iteration."),
+        TranscriptSegment(start=2, end=4, text="It compares two model answers."),
+    ]
+    captured = {}
+
+    def fake_context(title, transcript, provider, output_language, metadata=None):
+        captured["metadata"] = metadata
+        return "课程由 Sample Teacher 发布，介绍 D-tail。"
+
+    monkeypatch.setattr(ai, "_generate_translation_context", fake_context)
+    monkeypatch.setattr(
+        ai,
+        "_translate_transcript_with_provider",
+        lambda **kwargs: [
+            TranscriptSegment(start=0, end=2, text="本课介绍提示词迭代。"),
+            TranscriptSegment(start=2, end=4, text="它比较两个模型回答。"),
+        ],
+    )
+
+    translated = ai.translate_transcript_material(
+        title="Prompting Lesson",
+        transcript=transcript,
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="zh-CN",
+        source_language="en",
+        metadata=VideoMetadata(
+            id="abc123",
+            title="Official Prompting Lesson",
+            uploader="Sample Teacher",
+            channel="Sample Channel",
+            description="A trusted upload summary mentioning D-tail terminology.",
+            webpage_url="https://www.youtube.com/watch?v=abc123",
+            extractor="youtube",
+        ),
+    )
+
+    assert translated[0].text == "本课介绍提示词迭代。"
+    assert captured["metadata"].uploader == "Sample Teacher"
+    assert captured["metadata"].description == "A trusted upload summary mentioning D-tail terminology."
+
+
+def test_translation_context_prompt_describes_transcript_context_not_translation(monkeypatch):
+    captured = {}
+
+    def fake_chat_text(provider, messages, **kwargs):
+        captured["messages"] = messages
+        return '{"summary":"课程讨论提示工程。"}'
+
+    monkeypatch.setattr(ai, "_chat_text", fake_chat_text)
+
+    summary = ai._generate_translation_context(
+        title="提示工程课程",
+        transcript=[TranscriptSegment(start=0, end=2, text="这里介绍提示词迭代。")],
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="zh-CN",
+    )
+
+    system_prompt = captured["messages"][0]["content"]
+    assert summary == "课程讨论提示工程。"
+    assert "translation" not in system_prompt.lower()
+    assert "Simplified Chinese" not in system_prompt
+
+
+def test_translation_context_prompt_includes_trusted_video_metadata(monkeypatch):
+    captured = {}
+
+    def fake_chat_text(provider, messages, **kwargs):
+        captured["messages"] = messages
+        return '{"summary":"课程由 Sample Teacher 发布，介绍 D-tail。"}'
+
+    monkeypatch.setattr(ai, "_chat_text", fake_chat_text)
+
+    summary = ai._generate_translation_context(
+        title="提示工程课程",
+        transcript=[TranscriptSegment(start=0, end=2, text="这里介绍提示词迭代。")],
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="zh-CN",
+        metadata=VideoMetadata(
+            id="abc123",
+            title="Official Sample Lesson",
+            uploader="Sample Teacher",
+            channel="Sample Channel",
+            creator="Sample Creator",
+            description="A trusted upload summary mentioning D-tail terminology.",
+            webpage_url="https://www.youtube.com/watch?v=abc123",
+            extractor="youtube",
+        ),
+    )
+
+    prompt = captured["messages"][1]["content"]
+    assert summary == "课程由 Sample Teacher 发布，介绍 D-tail。"
+    assert "Trusted video metadata" in prompt
+    assert "Sample Teacher" in prompt
+    assert "A trusted upload summary mentioning D-tail terminology." in prompt
+
+
+def test_translation_context_prompt_uses_full_transcript(monkeypatch):
+    captured = {}
+    transcript = [
+        TranscriptSegment(start=index * 3, end=index * 3 + 3, text=f"summary line {index}")
+        for index in range(100)
+    ]
+
+    def fake_chat_text(provider, messages, **kwargs):
+        captured["messages"] = messages
+        return '{"summary":"课程完整摘要。"}'
+
+    monkeypatch.setattr(ai, "_chat_text", fake_chat_text)
+
+    ai._generate_translation_context(
+        title="长课程",
+        transcript=transcript,
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="zh-CN",
+    )
+
+    prompt = captured["messages"][1]["content"]
+    assert "Full transcript:" in prompt
+    assert "Transcript sample:" not in prompt
+    assert "1. [00:00-00:03] summary line 0" in prompt
+    assert "100. [04:57-05:00] summary line 99" in prompt
+
+
+def test_transcript_translation_can_translate_unknown_source_to_english(monkeypatch):
+    transcript = [
+        TranscriptSegment(start=0, end=2, text="这里介绍提示词迭代。"),
+        TranscriptSegment(start=2, end=4, text="然后比较两个输出。"),
+    ]
+
+    monkeypatch.setattr(ai, "_generate_translation_context", lambda *args, **kwargs: "课程讨论提示工程。")
+    monkeypatch.setattr(
+        ai,
+        "_translate_transcript_with_provider",
+        lambda **kwargs: [
+            TranscriptSegment(start=0, end=2, text="This introduces prompt iteration."),
+            TranscriptSegment(start=2, end=4, text="Then it compares two outputs."),
+        ],
+    )
+
+    translated = ai.translate_transcript_material(
+        title="提示工程课程",
+        transcript=transcript,
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="en",
+        source_language=None,
+    )
+
+    assert translated[0].text == "This introduces prompt iteration."
+
+
+def test_title_translation_can_translate_to_english(monkeypatch):
+    captured = {}
+
+    def fake_chat_json(provider, messages, **kwargs):
+        captured["task_key"] = kwargs["task_key"]
+        captured["messages"] = messages
+        return {"translated_title": "Prompt Engineering Course"}
+
+    monkeypatch.setattr(ai, "_chat_json", fake_chat_json)
+
+    translated = ai._translate_title_with_provider(
+        title="提示工程课程",
+        context_summary="课程讨论提示词迭代。",
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="en",
+    )
+
+    assert translated == "Prompt Engineering Course"
+    assert captured["task_key"] == "title_translation"
+
+
 def test_transcript_translation_reports_partial_chunks(monkeypatch):
     transcript = [
         TranscriptSegment(start=index, end=index + 1, text=f"source {index}")
@@ -443,6 +721,63 @@ def test_long_transcript_reuses_existing_context_summary(monkeypatch):
     assert study.translated_title == "面向所有人的 AI"
 
 
+def test_long_transcript_reuses_existing_context_summary_even_with_metadata(monkeypatch):
+    transcript = [
+        TranscriptSegment(start=index * 2, end=index * 2 + 2, text=f"source line {index}")
+        for index in range(81)
+    ]
+    translated = [
+        TranscriptSegment(start=segment.start, end=segment.end, text=f"译文 {index}")
+        for index, segment in enumerate(transcript)
+    ]
+    blocks = [
+        {
+            "id": "block-1",
+            "start": 0,
+            "end": 162,
+            "title": "课程主线",
+            "summary": "解释课程。",
+            "priority": "focus",
+            "key_points": ["重点"],
+            "detailed_notes": "解读",
+            "high_fidelity_text": "详解文本",
+        }
+    ]
+    used_contexts: list[str] = []
+
+    def fail_context(*args, **kwargs):
+        raise AssertionError("context summary should be reused")
+
+    def fake_blocks(**kwargs):
+        used_contexts.append(kwargs["context_summary"])
+        return blocks
+
+    monkeypatch.setattr(ai, "_generate_translation_context", fail_context)
+    monkeypatch.setattr(ai, "_generate_learning_blocks_with_provider", fake_blocks)
+    monkeypatch.setattr(ai, "_generate_outline_with_provider", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ai, "_generate_guidance_with_provider", lambda *args, **kwargs: {})
+
+    study = generate_study_material(
+        title="一个视频搞懂 DeepSeek V4！",
+        transcript=transcript,
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="zh-CN",
+        existing_translation=translated,
+        existing_context_summary="已有字幕阶段上下文摘要。",
+        metadata=VideoMetadata(
+            id="BV1tn9aBqEYg",
+            title="一个视频搞懂 DeepSeek V4！",
+            uploader="林亦LYi",
+            description="我们全面测试了 DeepSeek V4。",
+            webpage_url="https://www.bilibili.com/video/BV1tn9aBqEYg/",
+            extractor="BiliBili",
+        ),
+    )
+
+    assert study.context_summary == "已有字幕阶段上下文摘要。"
+    assert "林亦LYi" in used_contexts[0]
+
+
 def test_long_transcript_repairs_incomplete_existing_translation(monkeypatch):
     transcript = [
         TranscriptSegment(
@@ -520,6 +855,8 @@ def test_regenerate_guide_updates_only_guidance(monkeypatch):
         prerequisites=["旧预备"],
         thought_prompts=["旧问题"],
         review_suggestions=["旧复习"],
+        beginner_focus=["旧小白建议"],
+        experienced_guidance=["旧进阶建议"],
     )
 
     monkeypatch.setattr(
@@ -529,6 +866,9 @@ def test_regenerate_guide_updates_only_guidance(monkeypatch):
             "prerequisites": ["新预备"],
             "thought_prompts": ["新问题"],
             "review_suggestions": ["新复习"],
+            "beginner_focus": ["新小白建议"],
+            "experienced_guidance": ["新进阶建议"],
+            "one_line": "这节课帮助学习者把握核心观点和学习重点。",
         },
     )
     monkeypatch.setattr(
@@ -546,12 +886,82 @@ def test_regenerate_guide_updates_only_guidance(monkeypatch):
         section="guide",
     )
 
+    assert study.one_line == "这节课帮助学习者把握核心观点和学习重点。"
     assert study.prerequisites == ["新预备"]
     assert study.thought_prompts == ["新问题"]
     assert study.review_suggestions == ["新复习"]
+    assert study.beginner_focus == ["新小白建议"]
+    assert study.experienced_guidance == ["新进阶建议"]
     assert study.outline == existing.outline
     assert study.detailed_notes == "旧解读"
     assert study.high_fidelity_text == "旧详解"
+
+
+def test_guidance_prompt_parses_beginner_and_experienced_arrays(monkeypatch):
+    captured_messages = []
+
+    def fake_chat_json(provider, messages, **kwargs):
+        captured_messages.extend(messages)
+        return {
+            "prerequisites": ["预备知识"],
+            "thought_prompts": ["思考提示"],
+            "review_suggestions": ["复习建议"],
+            "beginner_focus": ["小白重点听课程中的基础概念和例子。"],
+            "experienced_guidance": ["有经验者可略过入门定义，但复习实践判断。"],
+            "one_line": "这节课讲解提示工程中的概念理解和实践判断。",
+        }
+
+    monkeypatch.setattr(ai, "_chat_json", fake_chat_json)
+
+    guidance = ai._generate_guidance_with_provider(
+        "Prompting Lesson",
+        [TranscriptSegment(start=0, end=5, text="This course explains concepts and examples.")],
+        "课程摘要",
+        LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        "zh-CN",
+    )
+
+    assert guidance["prerequisites"] == ["预备知识"]
+    assert guidance["one_line"] == "这节课讲解提示工程中的概念理解和实践判断。"
+    assert guidance["beginner_focus"] == ["小白重点听课程中的基础概念和例子。"]
+    assert guidance["experienced_guidance"] == ["有经验者可略过入门定义，但复习实践判断。"]
+    assert "beginner_focus" in captured_messages[0]["content"]
+    assert "experienced_guidance" in captured_messages[0]["content"]
+
+
+def test_guidance_prompt_uses_full_transcript(monkeypatch):
+    captured_messages = []
+    transcript = [
+        TranscriptSegment(start=index * 5, end=index * 5 + 5, text=f"line {index}")
+        for index in range(100)
+    ]
+
+    def fake_chat_json(provider, messages, **kwargs):
+        captured_messages.extend(messages)
+        return {
+            "prerequisites": [],
+            "thought_prompts": [],
+            "review_suggestions": [],
+            "beginner_focus": [],
+            "experienced_guidance": [],
+            "one_line": "这是一节长课程。",
+        }
+
+    monkeypatch.setattr(ai, "_chat_json", fake_chat_json)
+
+    ai._generate_guidance_with_provider(
+        "Long Lesson",
+        transcript,
+        "课程摘要",
+        LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        "zh-CN",
+    )
+
+    user_prompt = captured_messages[1]["content"]
+    assert "Full transcript:" in user_prompt
+    assert "Transcript sample:" not in user_prompt
+    assert "1. [00:00-00:05] line 0" in user_prompt
+    assert "100. [08:15-08:20] line 99" in user_prompt
 
 
 def test_regenerate_outline_preserves_other_sections(monkeypatch):
@@ -582,6 +992,55 @@ def test_regenerate_outline_preserves_other_sections(monkeypatch):
     assert study.one_line == "旧导览"
     assert study.detailed_notes == "旧解读"
     assert study.high_fidelity_text == "旧详解"
+
+
+def test_regenerate_high_reuses_existing_structure_and_interpretation(monkeypatch):
+    transcript = [
+        TranscriptSegment(start=0, end=5, text="Opening idea."),
+        TranscriptSegment(start=5, end=10, text="Important detail."),
+    ]
+    existing = StudyMaterial(
+        one_line="旧导览",
+        context_summary="已有上下文摘要",
+        time_map=[TimeRange(start=0, end=10, title="旧结构标题", summary="旧结构摘要", priority="focus")],
+        outline=[OutlineNode(id="block-1", start=0, end=10, title="旧大纲", summary="旧摘要", children=[])],
+        detailed_notes="00:00-00:10 旧结构标题\n已有解读内容。",
+        high_fidelity_text="旧详解",
+    )
+    calls: dict[str, object] = {"structure": 0, "interpretation": 0}
+
+    def fail_structure(*args, **kwargs):
+        calls["structure"] = int(calls["structure"]) + 1
+        raise AssertionError("structure should be reused")
+
+    def fail_interpretation(*args, **kwargs):
+        calls["interpretation"] = int(calls["interpretation"]) + 1
+        raise AssertionError("interpretation should be reused")
+
+    def fake_high(**kwargs):
+        calls["structure_payload"] = kwargs["structure"]
+        calls["detailed_notes"] = kwargs["detailed_notes"]
+        return "新详解内容。"
+
+    monkeypatch.setattr(ai, "_generate_learning_block_structure_with_provider", fail_structure)
+    monkeypatch.setattr(ai, "_generate_learning_block_interpretation_with_provider", fail_interpretation)
+    monkeypatch.setattr(ai, "_generate_learning_block_high_fidelity_with_provider", fake_high)
+
+    study = ai.regenerate_study_section(
+        title="Lesson",
+        transcript=transcript,
+        existing_study=existing,
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="zh-CN",
+        section="high",
+    )
+
+    assert calls["structure"] == 0
+    assert calls["interpretation"] == 0
+    assert calls["structure_payload"]["title"] == "旧结构标题"
+    assert calls["detailed_notes"] == "已有解读内容。"
+    assert study.detailed_notes == existing.detailed_notes
+    assert "新详解内容" in study.high_fidelity_text
 
 
 def test_outline_time_calibration_uses_block_ids():
@@ -742,6 +1201,60 @@ def test_learning_blocks_use_semantic_ranges_before_block_generation(monkeypatch
     assert "Next:" in calls[0][3]
 
 
+def test_learning_block_generation_splits_structure_interpretation_and_high_fidelity(monkeypatch):
+    source_chunk = [
+        TranscriptSegment(start=0, end=5, text="Opening idea corrected."),
+        TranscriptSegment(start=5, end=10, text="The example shows two prompt versions."),
+    ]
+    translated_chunk = [
+        TranscriptSegment(start=0, end=5, text="校正后的开场观点。"),
+        TranscriptSegment(start=5, end=10, text="例子展示两个提示词版本。"),
+    ]
+    calls: list[tuple[str | None, str, str]] = []
+
+    def fake_chat_json(provider, messages, temperature, max_tokens, timeout, task_key=None):
+        calls.append((task_key, messages[0]["content"], messages[1]["content"]))
+        if len(calls) == 1:
+            return {
+                "title": "提示词版本对比",
+                "summary": "这一块用例子说明提示词迭代。",
+                "priority": "focus",
+                "key_points": [
+                    {"type": "example", "text": "比较两个提示词版本。", "evidence": "example line"},
+                ],
+                "terms": ["提示词迭代"],
+                "open_questions": [],
+            }
+        if len(calls) == 2:
+            return {"detailed_notes": "解读层说明这个例子为什么重要。"}
+        return {"high_fidelity_text": "详解层保留两个版本的铺垫、比较和结论。"}
+
+    monkeypatch.setattr(ai, "_chat_json", fake_chat_json)
+
+    block = ai._generate_learning_block_with_provider(
+        title="Lesson",
+        index=0,
+        source_chunk=source_chunk,
+        translated_chunk=translated_chunk,
+        context_summary="课程讲提示词迭代。",
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="learning"),
+        output_language="zh-CN",
+        detail_level="faithful",
+        neighbor_context="Next: another block.",
+    )
+
+    assert [call[0] for call in calls] == ["interpretation", "interpretation", "high_fidelity"]
+    assert "detailed_notes" not in calls[0][1]
+    assert "high_fidelity_text" not in calls[0][1]
+    assert "Learning block structure" in calls[1][2]
+    assert "detailed_notes" in calls[2][2]
+    assert "Opening idea corrected." in calls[0][2]
+    assert block["title"] == "提示词版本对比"
+    assert block["key_points"] == ["比较两个提示词版本。"]
+    assert block["detailed_notes"] == "解读层说明这个例子为什么重要。"
+    assert block["high_fidelity_text"] == "详解层保留两个版本的铺垫、比较和结论。"
+
+
 def test_fallback_outline_has_three_visible_levels():
     blocks = [
         {
@@ -761,20 +1274,3 @@ def test_fallback_outline_has_three_visible_levels():
     assert outline[0].children
     assert outline[0].children[0].children
     assert "block-1" in outline[0].children[0].children[0].id
-
-
-def test_normalize_study_payload_accepts_common_model_shape_drift():
-    payload = {
-        "one_line": "一行总结",
-        "time_map": [{"start": 0, "end": 3, "title": "开场", "summary": "内容", "priority": "high"}],
-        "outline": {"id": "root", "start": 0, "end": 3, "title": "开场", "summary": "内容", "children": []},
-        "detailed_notes": "细节",
-        "high_fidelity_text": "全文",
-        "translated_transcript": [{"start": 0, "end": 3, "text": "欢迎"}],
-    }
-
-    normalized = _normalize_study_payload(payload)
-
-    assert normalized["time_map"][0]["priority"] == "focus"
-    assert isinstance(normalized["outline"], list)
-    assert normalized["outline"][0]["id"] == "root"

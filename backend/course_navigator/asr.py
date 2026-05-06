@@ -47,7 +47,7 @@ def suggest_asr_corrections(
         return []
 
     _report(progress, "candidate", 6, "正在建立资料上下文并检查 ASR 候选项")
-    candidates = _extract_asr_candidates(
+    candidates = _extract_candidate_items(
         title,
         transcript,
         provider,
@@ -98,18 +98,6 @@ def suggest_asr_corrections(
         source="model",
     )
     return _normalize_patch_payload(raw_patches, transcript, source="model")
-
-
-def _extract_asr_candidates(
-    title: str,
-    transcript: list[TranscriptSegment],
-    provider: LlmProvider,
-    context: dict[str, object] | None,
-    progress: ProgressCallback | None,
-    *,
-    search_enabled: bool,
-) -> list[dict[str, Any]]:
-    return _extract_candidate_items(title, transcript, provider, context, progress, search_enabled=search_enabled)
 
 
 def _extract_candidate_items(
@@ -384,6 +372,8 @@ def _candidate_messages(
                 "each q item must be <= 80 chars; do not include transcript context, timestamps, evidence, or long explanations in JSON; "
                 "do not include ordinary filler words; prioritize recurring named "
                 "entities, people, products, acronyms, terms, numbers, and cross-segment inconsistencies. "
+                "Do not flag a valid acronym, abbreviation, shorthand, or spoken alias merely because it can be expanded to a full name; "
+                "ASR correction must preserve what the speaker likely said. "
                 "Do not output final patches in this step. Keep JSON minified; no markdown. "
                 f"{search_instruction}\n\n"
                 f"Course title: {title}\nTrusted metadata and user reference:\n{_context_text(context)}\n\n"
@@ -433,6 +423,8 @@ def _review_messages(
                 f"Write reason and evidence in {target_language}. Keep them concise and user-readable. "
                 "Do not write reason or evidence in English unless the requested output language is English. "
                 "Do not translate original_text or corrected_text; only correct the ASR span.\n"
+                "Preserve valid acronyms, abbreviations, shorthand names, and spoken aliases when local audio/transcript context suggests the speaker used the short form. "
+                "Do not expand a recognized shorthand to its full form unless the ASR text itself is clearly wrong or inconsistent with nearby usage.\n"
                 f"{source_rule}\n\n"
                 f"Course title: {title}\nTrusted metadata and user reference:\n{_context_text(context)}\n\n"
                 f"Candidate errors:\n{candidate_text}\n\n"

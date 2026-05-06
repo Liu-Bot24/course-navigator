@@ -33,6 +33,8 @@ export type StudyMaterial = {
   prerequisites: string[];
   thought_prompts: string[];
   review_suggestions: string[];
+  beginner_focus?: string[];
+  experienced_guidance?: string[];
 };
 
 export type UiLanguage = "zh-CN" | "en";

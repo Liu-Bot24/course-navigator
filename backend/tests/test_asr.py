@@ -19,6 +19,7 @@ def test_direct_asr_correction_uses_few_scan_batches_and_final_patch_review(monk
             assert '"asr_text"' not in user_message
             assert "Write reason and evidence in Simplified Chinese" in user_message
             assert "Do not write reason or evidence in English" in user_message
+            assert "Preserve valid acronyms, abbreviations, shorthand names, and spoken aliases" in user_message
             return '{"patches":[{"segment_index":0,"original_text":"noba dek","corrected_text":"NovaDeck","confidence":0.94,"reason":"附加参考信息和上下文都指向 NovaDeck。","evidence":"用户参考信息。"}]}'
         match = re.search(r"\[(\d+) \|", user_message)
         segment_index = int(match.group(1)) if match else 0
@@ -48,6 +49,35 @@ def test_direct_asr_correction_uses_few_scan_batches_and_final_patch_review(monk
     assert all(timeout == 240 for timeout in timeouts)
     assert suggestions[0].original_text == "noba dek"
     assert suggestions[0].corrected_text == "NovaDeck"
+
+
+def test_asr_correction_prompt_preserves_valid_spoken_abbreviations(monkeypatch):
+    chat_calls = []
+
+    def fake_chat_text(provider, messages, **kwargs):
+        user_message = messages[-1]["content"]
+        chat_calls.append(user_message)
+        if "Candidate errors:" in user_message:
+            assert "Do not expand a recognized shorthand to its full form" in user_message
+            return '{"patches":[]}'
+        assert "Do not flag a valid acronym, abbreviation, shorthand, or spoken alias" in user_message
+        return '{"c":[{"i":0,"f":"ND","t":"NovaDeck","k":"acronym","r":"possible shorthand","c":0.95,"q":[],"p":1}]}'
+
+    monkeypatch.setattr("course_navigator.asr._chat_text", fake_chat_text)
+    provider = LlmProvider(base_url="https://api.example.com/v1", api_key="sk-test", model="model")
+
+    suggestions = suggest_asr_corrections(
+        title="Product walkthrough",
+        transcript=[
+            TranscriptSegment(start=0, end=1, text="后面我简称它为 ND"),
+            TranscriptSegment(start=1, end=2, text="ND 的接口比较清楚"),
+        ],
+        provider=provider,
+        search_config=AsrCorrectionSearchConfig(enabled=False),
+        context={"user_context": "ND 是产品简称时不需要展开"},
+    )
+
+    assert suggestions == []
 
 
 def test_asr_correction_uses_one_or_two_scan_batches_for_short_transcripts(monkeypatch):

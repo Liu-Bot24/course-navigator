@@ -4,7 +4,7 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Literal
 
 import httpx
 
@@ -19,13 +19,24 @@ from .models import (
     TaskParameterOverride,
     TimeRange,
     TranscriptSegment,
+    VideoMetadata,
 )
 
 
 ProgressCallback = Callable[[str, int, str], None]
 TranslationProgressCallback = Callable[[list[TranscriptSegment]], None]
+PartialStudyCallback = Callable[[StudyMaterial], None]
+PartialRangesCallback = Callable[[list[TimeRange]], None]
 TitleTranslationCallback = Callable[[str | None], None]
 ContextSummaryCallback = Callable[[str], None]
+
+GUIDANCE_LIST_KEYS = (
+    "prerequisites",
+    "thought_prompts",
+    "review_suggestions",
+    "beginner_focus",
+    "experienced_guidance",
+)
 
 
 @dataclass(frozen=True)
@@ -69,9 +80,9 @@ DETAIL_STRATEGIES: dict[StudyDetailLevel, StudyGenerationStrategy] = {
     ),
     "standard": StudyGenerationStrategy(
         detail_level="standard",
-        target_block_seconds=180,
-        min_block_seconds=75,
-        max_block_seconds=300,
+        target_block_seconds=300,
+        min_block_seconds=120,
+        max_block_seconds=480,
         block_base_tokens=1800,
         block_tokens_per_minute=850,
         block_max_tokens=7200,
@@ -105,10 +116,12 @@ def generate_study_material(
     detail_level: StudyDetailLevel = "standard",
     progress: ProgressCallback | None = None,
     partial_translation: TranslationProgressCallback | None = None,
+    partial_study: PartialStudyCallback | None = None,
     existing_translation: list[TranscriptSegment] | None = None,
     existing_context_summary: str | None = None,
     existing_translated_title: str | None = None,
     source_language: str | None = None,
+    metadata: VideoMetadata | None = None,
 ) -> StudyMaterial:
     _report(progress, "preparing", 1, "正在准备字幕与课程信息")
     if not transcript:
@@ -141,10 +154,12 @@ def generate_study_material(
                 detail_level,
                 progress,
                 partial_translation,
+                partial_study,
                 existing_translation,
                 existing_context_summary,
                 existing_translated_title,
                 source_language,
+                metadata,
             )
         except Exception as exc:
             _report(progress, "fallback", 90, f"模型生成失败，使用本地回退：{type(exc).__name__}")
@@ -164,6 +179,7 @@ def regenerate_study_section(
     detail_level: StudyDetailLevel = "standard",
     progress: ProgressCallback | None = None,
     source_language: str | None = None,
+    metadata: VideoMetadata | None = None,
 ) -> StudyMaterial:
     if section == "all" or not existing_study:
         return generate_study_material(
@@ -177,6 +193,7 @@ def regenerate_study_section(
             existing_context_summary=existing_study.context_summary if existing_study else None,
             existing_translated_title=existing_study.translated_title if existing_study else None,
             source_language=source_language,
+            metadata=metadata,
         )
 
     _report(progress, "preparing", 1, f"正在准备重新生成{_section_label(section)}")
@@ -194,33 +211,37 @@ def regenerate_study_section(
 
     context_summary = existing_study.context_summary
     if context_summary:
-        _report(progress, "summary", 8, "已复用字幕翻译上下文摘要")
+        _report(progress, "summary", 8, "已复用课程上下文摘要")
     else:
         _report(progress, "summary", 8, "正在生成上下文摘要")
-        context_summary = _generate_translation_context(title, transcript, global_provider, output_language)
+        context_summary = _generate_translation_context(title, transcript, global_provider, output_language, metadata)
 
     next_study = existing_study.model_copy(deep=True)
     next_study.context_summary = context_summary
+    prompt_context_summary = _context_summary_with_metadata(context_summary, metadata)
 
     if section == "guide":
         _report(progress, "guide", 35, "正在重新生成导览")
         guidance = _generate_guidance_with_provider(
             title,
             transcript,
-            context_summary,
+            prompt_context_summary,
             global_provider,
             output_language,
         )
         if guidance:
+            next_study.one_line = str(guidance.get("one_line") or next_study.one_line).strip() or next_study.one_line
             next_study.prerequisites = guidance.get("prerequisites", next_study.prerequisites)
             next_study.thought_prompts = guidance.get("thought_prompts", next_study.thought_prompts)
             next_study.review_suggestions = guidance.get("review_suggestions", next_study.review_suggestions)
-        if next_study.time_map:
+            next_study.beginner_focus = guidance.get("beginner_focus", next_study.beginner_focus)
+            next_study.experienced_guidance = guidance.get("experienced_guidance", next_study.experienced_guidance)
+        if next_study.time_map and not guidance.get("one_line"):
             next_study.one_line = _one_line_from_context(
                 title,
                 _blocks_from_time_map(next_study.time_map),
                 output_language,
-                context_summary,
+                prompt_context_summary,
             )
         _report(progress, "complete", 95, "导览已重新生成")
         return next_study
@@ -232,7 +253,7 @@ def regenerate_study_section(
         next_study.outline = _generate_outline_with_provider(
             title,
             blocks,
-            context_summary,
+            prompt_context_summary,
             global_provider,
             output_language,
         )
@@ -240,12 +261,45 @@ def regenerate_study_section(
         return next_study
 
     _report(progress, section, 20, f"正在重新生成{_section_label(section)}")
+    if section == "detailed" and next_study.time_map:
+        learning_blocks = _generate_interpretation_blocks_for_existing_ranges_with_provider(
+            title=title,
+            source_transcript=transcript,
+            translated_transcript=next_study.translated_transcript,
+            ranges=next_study.time_map,
+            existing_study=next_study,
+            context_summary=prompt_context_summary,
+            provider=learning_provider,
+            output_language=output_language,
+            detail_level=detail_level,
+            progress=progress,
+        )
+        next_study.detailed_notes = _detailed_notes_from_blocks(learning_blocks)
+        _report(progress, "complete", 95, "解读已重新生成")
+        return next_study
+    if section == "high" and next_study.time_map and next_study.detailed_notes.strip():
+        learning_blocks = _generate_high_fidelity_blocks_for_existing_ranges_with_provider(
+            title=title,
+            source_transcript=transcript,
+            translated_transcript=next_study.translated_transcript,
+            ranges=next_study.time_map,
+            existing_study=next_study,
+            context_summary=prompt_context_summary,
+            provider=learning_provider,
+            output_language=output_language,
+            detail_level=detail_level,
+            progress=progress,
+        )
+        next_study.high_fidelity_text = _high_fidelity_text_from_blocks(learning_blocks)
+        _report(progress, "complete", 95, "详解已重新生成")
+        return next_study
+
     learning_blocks = _generate_learning_blocks_for_ranges_with_provider(
         title=title,
         source_transcript=transcript,
         translated_transcript=next_study.translated_transcript,
         ranges=next_study.time_map,
-        context_summary=context_summary,
+        context_summary=prompt_context_summary,
         provider=learning_provider,
         output_language=output_language,
         detail_level=detail_level,
@@ -446,7 +500,6 @@ def _generate_fallback(
     title: str,
     transcript: list[TranscriptSegment],
     output_language: OutputLanguage,
-    model_backed: bool = False,
 ) -> StudyMaterial:
     chunks = _chunk_segments(transcript, target_size=8)
     chinese = output_language == "zh-CN"
@@ -498,16 +551,12 @@ def _generate_fallback(
     )
     high_fidelity_text = (
         (
-            high_fidelity_lines
-            if model_backed
-            else "未配置模型，以下保留原始字幕逐句稿；配置模型后会生成中文详解学习稿。\n"
+            "未配置模型，以下保留原始字幕逐句稿；配置模型后会生成中文详解学习稿。\n"
             + high_fidelity_lines
         )
         if chinese
         else (
-            high_fidelity_lines
-            if model_backed
-            else "モデルが未設定です。以下は元字幕を保持した逐語稿です。\n" + high_fidelity_lines
+            "モデルが未設定です。以下は元字幕を保持した逐語稿です。\n" + high_fidelity_lines
         )
         if japanese
         else high_fidelity_lines
@@ -572,10 +621,12 @@ def _generate_with_provider(
     detail_level: StudyDetailLevel,
     progress: ProgressCallback | None = None,
     partial_translation: TranslationProgressCallback | None = None,
+    partial_study: PartialStudyCallback | None = None,
     existing_translation: list[TranscriptSegment] | None = None,
     existing_context_summary: str | None = None,
     existing_translated_title: str | None = None,
     source_language: str | None = None,
+    metadata: VideoMetadata | None = None,
 ) -> StudyMaterial:
     return _generate_long_translated_with_provider(
         title,
@@ -585,10 +636,12 @@ def _generate_with_provider(
         detail_level,
         progress,
         partial_translation,
+        partial_study,
         existing_translation,
         existing_context_summary,
         existing_translated_title,
         source_language,
+        metadata,
     )
 
 
@@ -600,10 +653,12 @@ def _generate_long_translated_with_provider(
     detail_level: StudyDetailLevel,
     progress: ProgressCallback | None = None,
     partial_translation: TranslationProgressCallback | None = None,
+    partial_study: PartialStudyCallback | None = None,
     existing_translation: list[TranscriptSegment] | None = None,
     existing_context_summary: str | None = None,
     existing_translated_title: str | None = None,
     source_language: str | None = None,
+    metadata: VideoMetadata | None = None,
 ) -> StudyMaterial:
     context_provider = _first_provider(provider_set.global_provider, provider_set.translation, provider_set.learning)
     translation_provider = _first_provider(provider_set.translation, context_provider)
@@ -613,11 +668,12 @@ def _generate_long_translated_with_provider(
         return _generate_fallback(title, transcript, output_language)
 
     if existing_context_summary:
-        _report(progress, "summary", 8, "已复用字幕翻译上下文摘要")
+        _report(progress, "summary", 8, "已复用课程上下文摘要")
         context_summary = existing_context_summary
     else:
-        _report(progress, "summary", 8, "正在生成翻译上下文摘要")
-        context_summary = _generate_translation_context(title, transcript, context_provider, output_language)
+        _report(progress, "summary", 8, "正在生成课程上下文摘要")
+        context_summary = _generate_translation_context(title, transcript, context_provider, output_language, metadata)
+    prompt_context_summary = _context_summary_with_metadata(context_summary, metadata)
     should_translate = _should_translate_transcript(source_language, output_language) and not _transcript_matches_output_language(
         transcript,
         output_language,
@@ -627,6 +683,34 @@ def _generate_long_translated_with_provider(
         if should_translate
         else None
     )
+    _report(progress, "guide", 12, "正在生成学习导览")
+    try:
+        guidance = _generate_guidance_with_provider(
+            title,
+            transcript,
+            prompt_context_summary,
+            global_provider,
+            output_language,
+        )
+    except Exception:
+        guidance = {}
+    if partial_study:
+        guide_study = StudyMaterial(
+            one_line=str(guidance.get("one_line") or _partial_one_line_from_context(title, output_language, context_summary)).strip(),
+            translated_title=translated_title,
+            context_summary=context_summary,
+            time_map=[],
+            outline=[],
+            detailed_notes="",
+            high_fidelity_text="",
+            translated_transcript=[],
+            prerequisites=guidance.get("prerequisites", []) if guidance else [],
+            thought_prompts=guidance.get("thought_prompts", []) if guidance else [],
+            review_suggestions=guidance.get("review_suggestions", []) if guidance else [],
+            beginner_focus=guidance.get("beginner_focus", []) if guidance else [],
+            experienced_guidance=guidance.get("experienced_guidance", []) if guidance else [],
+        )
+        _send_partial_study(partial_study, guide_study)
     if not should_translate:
         translated = [
             TranscriptSegment(start=segment.start, end=segment.end, text=segment.text)
@@ -672,16 +756,38 @@ def _generate_long_translated_with_provider(
             partial_translation=partial_translation,
         )
     _report(progress, "segmentation", 74, "正在进行语义分块")
+    def save_partial_ranges(ranges: list[TimeRange]) -> None:
+        if not partial_study:
+            return
+        range_blocks = [_block_from_time_range(index, time_range) for index, time_range in enumerate(ranges)]
+        range_study = StudyMaterial(
+            one_line=str(guidance.get("one_line") or _one_line_from_context(title, range_blocks, output_language, context_summary)).strip(),
+            translated_title=translated_title,
+            context_summary=context_summary,
+            time_map=[time_range.model_copy(deep=True) for time_range in ranges],
+            outline=_outline_from_blocks(range_blocks),
+            detailed_notes="",
+            high_fidelity_text="",
+            translated_transcript=translated,
+            prerequisites=guidance.get("prerequisites", []) if guidance else [],
+            thought_prompts=guidance.get("thought_prompts", []) if guidance else [],
+            review_suggestions=guidance.get("review_suggestions", []) if guidance else [],
+            beginner_focus=guidance.get("beginner_focus", []) if guidance else [],
+            experienced_guidance=guidance.get("experienced_guidance", []) if guidance else [],
+        )
+        _send_partial_study(partial_study, range_study)
+
     blocks = _generate_learning_blocks_with_provider(
         title=title,
         source_transcript=transcript,
         translated_transcript=translated,
-        context_summary=context_summary,
+        context_summary=prompt_context_summary,
         provider=learning_provider,
         segmentation_provider=global_provider,
         output_language=output_language,
         detail_level=detail_level,
         progress=progress,
+        partial_ranges=save_partial_ranges,
     )
     _report(progress, "outline", 90, "正在生成课程大纲")
     study = _assemble_study_from_blocks(
@@ -693,19 +799,19 @@ def _generate_long_translated_with_provider(
     study.translated_transcript = translated
     study.translated_title = translated_title
     study.context_summary = context_summary
-    try:
-        study.outline = _generate_outline_with_provider(title, blocks, context_summary, global_provider, output_language)
-    except Exception:
-        study.outline = _outline_from_blocks(blocks)
-    _report(progress, "guide", 94, "正在生成学习导览")
-    try:
-        guidance = _generate_guidance_with_provider(title, transcript, context_summary, global_provider, output_language)
-    except Exception:
-        guidance = {}
     if guidance:
+        study.one_line = str(guidance.get("one_line") or study.one_line).strip() or study.one_line
         study.prerequisites = guidance.get("prerequisites", study.prerequisites)
         study.thought_prompts = guidance.get("thought_prompts", study.thought_prompts)
         study.review_suggestions = guidance.get("review_suggestions", study.review_suggestions)
+        study.beginner_focus = guidance.get("beginner_focus", study.beginner_focus)
+        study.experienced_guidance = guidance.get("experienced_guidance", study.experienced_guidance)
+    _send_partial_study(partial_study, study)
+    try:
+        study.outline = _generate_outline_with_provider(title, blocks, prompt_context_summary, global_provider, output_language)
+    except Exception:
+        study.outline = _outline_from_blocks(blocks)
+    _send_partial_study(partial_study, study)
     _report(progress, "assembly", 96, "正在组装时间地图、解读和详解文本")
     return study
 
@@ -720,6 +826,7 @@ def translate_transcript_material(
     title_translation: TitleTranslationCallback | None = None,
     context_summary_created: ContextSummaryCallback | None = None,
     source_language: str | None = None,
+    metadata: VideoMetadata | None = None,
 ) -> list[TranscriptSegment]:
     if not transcript:
         return []
@@ -739,8 +846,8 @@ def translate_transcript_material(
     translation_provider = _first_provider(provider_set.translation, context_provider)
     if not (context_provider and translation_provider):
         raise ValueError("未配置可用的翻译模型")
-    _report(progress, "summary", 8, "正在生成翻译上下文摘要")
-    context_summary = _generate_translation_context(title, transcript, context_provider, output_language)
+    _report(progress, "summary", 8, "正在生成课程上下文摘要")
+    context_summary = _generate_translation_context(title, transcript, context_provider, output_language, metadata)
     context_summary_created and context_summary_created(context_summary)
     translated_title = _translate_title_with_provider(title, context_summary, translation_provider, output_language)
     if translated_title:
@@ -763,8 +870,6 @@ def _translate_title_with_provider(
     provider: LlmProvider,
     output_language: OutputLanguage,
 ) -> str | None:
-    if output_language == "en":
-        return None
     target_language = _target_language_name(output_language)
     try:
         payload = _chat_json(
@@ -954,8 +1059,6 @@ def _normalize_translation_compare(value: str) -> str:
 def _should_translate_transcript(source_language: str | None, output_language: OutputLanguage) -> bool:
     if _source_language_matches_output(source_language, output_language):
         return False
-    if output_language == "en" and not source_language:
-        return False
     return True
 
 
@@ -1058,15 +1161,6 @@ def _translation_chunk_size(provider: LlmProvider) -> int:
     return 30
 
 
-def _learning_chunk_size(provider: LlmProvider) -> int:
-    window = provider.context_window or 0
-    if window and window < 32000:
-        return 8
-    if window >= 256000:
-        return 24
-    return 16
-
-
 def _translate_chunk_with_provider(
     title: str,
     chunk: list[TranscriptSegment],
@@ -1124,21 +1218,31 @@ def _generate_translation_context(
     transcript: list[TranscriptSegment],
     provider: LlmProvider,
     output_language: OutputLanguage,
+    metadata: VideoMetadata | None = None,
 ) -> str:
-    sampled = _sample_transcript_for_context(transcript)
-    target_language = _target_language_name(output_language)
+    transcript_text = _full_transcript_for_prompt(transcript)
+    metadata_reference = _metadata_prompt_reference(metadata)
     payload = _chat_json(
         provider,
         [
             {
                 "role": "system",
                 "content": (
-                    f"Create a concise {target_language} context summary for subtitle translation. "
+                    "Create a concise context summary for a course transcript. "
                     "Return strict JSON only: {\"summary\": string}. Include the topic, speaker/course type, "
-                    "and important terms. Do not invent facts outside the transcript."
+                    "source identity, uploader/channel when provided, author-provided course description when useful, "
+                    "and important terms. Use trusted video metadata only for source identity and course background; "
+                    "use transcript lines for course claims. Do not invent facts outside the provided inputs."
                 ),
             },
-            {"role": "user", "content": f"Title: {title}\nTranscript sample:\n{sampled}"},
+            {
+                "role": "user",
+                "content": (
+                    f"Title: {title}\n"
+                    f"{metadata_reference}"
+                    f"Full transcript:\n{transcript_text}"
+                ),
+            },
         ],
         temperature=0.1,
         max_tokens=1000,
@@ -1155,8 +1259,8 @@ def _generate_guidance_with_provider(
     context_summary: str,
     provider: LlmProvider,
     output_language: OutputLanguage,
-) -> dict[str, list[str]]:
-    sampled = _sample_transcript_for_context(transcript)
+) -> dict[str, object]:
+    transcript_text = _full_transcript_for_prompt(transcript)
     target_language = _target_language_name(output_language)
     payload = _chat_json(
         provider,
@@ -1165,8 +1269,16 @@ def _generate_guidance_with_provider(
                 "role": "system",
                 "content": (
                     f"Output concise {target_language} study guidance for a busy working professional. "
-                    "Use transcript-derived content for course claims. Return strict JSON only with "
-                    "prerequisites, thought_prompts, and review_suggestions arrays. Keep each item short."
+                    "Use transcript-derived content for course claims, and use your domain judgment to judge "
+                    "what different learner levels should focus on or skip. Do not turn the guidance into a "
+                    "timestamped navigation map. Return strict JSON only with one string field and five arrays: "
+                    "one_line, prerequisites, thought_prompts, review_suggestions, beginner_focus, and "
+                    "experienced_guidance. one_line must be a meaningful one-sentence course overview in the "
+                    "target language; do not make it a block-count status line. Keep each item short. In beginner_focus, advise new learners which "
+                    "concepts, explanations, or examples deserve focused listening. In experienced_guidance, "
+                    "advise learners with foundations or practice which basic parts can likely be skimmed or "
+                    "skipped, and which ideas are still worth reviewing; if the whole course is too basic, say so "
+                    "plainly while naming any rare points still worth knowing."
                 ),
             },
             {
@@ -1174,7 +1286,7 @@ def _generate_guidance_with_provider(
                 "content": (
                     f"Title: {title}\n"
                     f"Summary: {context_summary}\n"
-                    f"Transcript sample:\n{sampled}"
+                    f"Full transcript:\n{transcript_text}"
                 ),
             },
         ],
@@ -1185,8 +1297,11 @@ def _generate_guidance_with_provider(
     )
     if not isinstance(payload, dict):
         return {}
-    result: dict[str, list[str]] = {}
-    for key in ("prerequisites", "thought_prompts", "review_suggestions"):
+    result: dict[str, object] = {}
+    one_line = str(payload.get("one_line") or "").strip()
+    if one_line:
+        result["one_line"] = one_line
+    for key in GUIDANCE_LIST_KEYS:
         result[key] = [str(item) for item in _ensure_list(payload.get(key)) if str(item).strip()]
     return result
 
@@ -1204,8 +1319,16 @@ def _learning_temperature(detail_level: StudyDetailLevel) -> float:
     }.get(detail_level, 0.3)
 
 
-def _learning_task_key(detail_level: StudyDetailLevel) -> TaskParameterKey:
-    return "high_fidelity" if detail_level == "faithful" else "interpretation"
+def _semantic_soft_block_limit(duration_seconds: float, strategy: StudyGenerationStrategy) -> int | None:
+    if strategy.detail_level == "faithful":
+        return None
+    target_blocks = max(1, round(duration_seconds / max(strategy.target_block_seconds, 1)))
+    duration_minutes = duration_seconds / 60
+    if duration_minutes >= 120:
+        return max(target_blocks + 8, round(target_blocks * 1.45))
+    if duration_minutes >= 60:
+        return max(target_blocks + 5, round(target_blocks * 1.35))
+    return max(target_blocks + 3, round(target_blocks * 1.25))
 
 
 def _generate_semantic_ranges_with_provider(
@@ -1222,7 +1345,17 @@ def _generate_semantic_ranges_with_provider(
         raise ValueError("Transcript exceeds the configured semantic segmentation budget")
 
     target_language = _target_language_name(output_language)
-    target_blocks = max(1, round(_transcript_duration(transcript) / max(strategy.target_block_seconds, 1)))
+    duration_seconds = _transcript_duration(transcript)
+    target_blocks = max(1, round(duration_seconds / max(strategy.target_block_seconds, 1)))
+    soft_block_limit = _semantic_soft_block_limit(duration_seconds, strategy)
+    block_count_instruction = (
+        "High-fidelity mode may use as many semantic blocks as the transcript genuinely needs."
+        if soft_block_limit is None
+        else (
+            f"Soft maximum block count is {soft_block_limit}; exceed it only for long or structurally dense courses "
+            "where merging would hide important teaching shifts."
+        )
+    )
     max_tokens = min(
         14000,
         max(1800, 900 + target_blocks * 260),
@@ -1251,7 +1384,8 @@ def _generate_semantic_ranges_with_provider(
                             f"Target block duration is about {_duration_label(strategy.target_block_seconds)}; "
                             f"acceptable range is {_duration_label(strategy.min_block_seconds)} to "
                             f"{_duration_label(strategy.max_block_seconds)} unless the course structure strongly "
-                            "requires a different size. Cover the whole transcript timeline exactly once. "
+                            f"requires a different size. {block_count_instruction} "
+                            "Cover the whole transcript timeline exactly once. "
                             "Do not invent course facts outside the transcript. "
                             f"{extra_instruction}"
                         ),
@@ -1261,7 +1395,7 @@ def _generate_semantic_ranges_with_provider(
                         "content": (
                             f"Course title: {title}\n"
                             f"Course context: {context_summary}\n"
-                            f"Transcript duration: {_duration_label(_transcript_duration(transcript))}\n"
+                            f"Transcript duration: {_duration_label(duration_seconds)}\n"
                             f"Approximate target block count: {target_blocks}\n\n"
                             "Timestamped source transcript:\n"
                             f"{transcript_text}"
@@ -1553,6 +1687,7 @@ def _generate_learning_blocks_with_provider(
     segmentation_provider: LlmProvider | None = None,
     detail_level: StudyDetailLevel = "standard",
     progress: ProgressCallback | None = None,
+    partial_ranges: PartialRangesCallback | None = None,
 ) -> list[dict]:
     strategy = _study_strategy(detail_level)
     segment_provider = segmentation_provider or provider
@@ -1569,6 +1704,9 @@ def _generate_learning_blocks_with_provider(
     except Exception:
         ranges = _fallback_time_ranges_from_transcript(source_transcript, output_language, strategy)
         _report(progress, "segmentation", 78, f"语义分块失败，已使用本地分块，共 {len(ranges)} 个学习块")
+
+    if partial_ranges:
+        partial_ranges(ranges)
 
     return _generate_learning_blocks_for_ranges_with_provider(
         title=title,
@@ -1680,6 +1818,193 @@ def _generate_learning_blocks_for_ranges_with_provider(
     ]
 
 
+def _generate_interpretation_blocks_for_existing_ranges_with_provider(
+    title: str,
+    source_transcript: list[TranscriptSegment],
+    translated_transcript: list[TranscriptSegment],
+    ranges: list[TimeRange],
+    existing_study: StudyMaterial,
+    context_summary: str,
+    provider: LlmProvider,
+    output_language: OutputLanguage,
+    detail_level: StudyDetailLevel = "standard",
+    progress: ProgressCallback | None = None,
+) -> list[dict]:
+    return _generate_existing_range_blocks_with_provider(
+        title=title,
+        source_transcript=source_transcript,
+        translated_transcript=translated_transcript,
+        ranges=ranges,
+        existing_study=existing_study,
+        context_summary=context_summary,
+        provider=provider,
+        output_language=output_language,
+        detail_level=detail_level,
+        progress=progress,
+        section="detailed",
+    )
+
+
+def _generate_high_fidelity_blocks_for_existing_ranges_with_provider(
+    title: str,
+    source_transcript: list[TranscriptSegment],
+    translated_transcript: list[TranscriptSegment],
+    ranges: list[TimeRange],
+    existing_study: StudyMaterial,
+    context_summary: str,
+    provider: LlmProvider,
+    output_language: OutputLanguage,
+    detail_level: StudyDetailLevel = "standard",
+    progress: ProgressCallback | None = None,
+) -> list[dict]:
+    return _generate_existing_range_blocks_with_provider(
+        title=title,
+        source_transcript=source_transcript,
+        translated_transcript=translated_transcript,
+        ranges=ranges,
+        existing_study=existing_study,
+        context_summary=context_summary,
+        provider=provider,
+        output_language=output_language,
+        detail_level=detail_level,
+        progress=progress,
+        section="high",
+    )
+
+
+def _generate_existing_range_blocks_with_provider(
+    title: str,
+    source_transcript: list[TranscriptSegment],
+    translated_transcript: list[TranscriptSegment],
+    ranges: list[TimeRange],
+    existing_study: StudyMaterial,
+    context_summary: str,
+    provider: LlmProvider,
+    output_language: OutputLanguage,
+    detail_level: StudyDetailLevel,
+    progress: ProgressCallback | None,
+    section: Literal["detailed", "high"],
+) -> list[dict]:
+    translated_by_start = {round(segment.start, 2): segment for segment in translated_transcript}
+    blocks_by_index: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {}
+        for index, time_range in enumerate(ranges):
+            source_chunk, translated_chunk = _chunks_for_time_range(
+                source_transcript,
+                translated_by_start,
+                time_range,
+            )
+            if not source_chunk:
+                block = _existing_structure_for_range(existing_study, index, time_range)
+                if section == "high":
+                    block["detailed_notes"] = _existing_detailed_notes_for_range(existing_study, index, time_range)
+                blocks_by_index[index] = block
+                continue
+            futures[
+                executor.submit(
+                    _generate_existing_range_block_with_provider,
+                    title=title,
+                    index=index,
+                    time_range=time_range,
+                    source_chunk=source_chunk,
+                    translated_chunk=translated_chunk,
+                    existing_study=existing_study,
+                    context_summary=context_summary,
+                    provider=provider,
+                    output_language=output_language,
+                    detail_level=detail_level,
+                    section=section,
+                )
+            ] = (index, time_range)
+
+        completed = 0
+        total = max(len(futures), 1)
+        for future in as_completed(futures):
+            index, time_range = futures[future]
+            try:
+                block = future.result()
+                block["id"] = f"block-{index + 1}"
+                block["start"] = time_range.start
+                block["end"] = time_range.end
+                blocks_by_index[index] = block
+            except Exception:
+                blocks_by_index[index] = _block_from_time_range(index, time_range)
+            completed += 1
+            _report(
+                progress,
+                "learning_blocks",
+                20 + round((completed / total) * 65),
+                f"正在重新生成{_section_label(section)} {completed}/{total}",
+            )
+
+    return [
+        blocks_by_index.get(index) or _block_from_time_range(index, time_range)
+        for index, time_range in enumerate(ranges)
+    ]
+
+
+def _generate_existing_range_block_with_provider(
+    title: str,
+    index: int,
+    time_range: TimeRange,
+    source_chunk: list[TranscriptSegment],
+    translated_chunk: list[TranscriptSegment],
+    existing_study: StudyMaterial,
+    context_summary: str,
+    provider: LlmProvider,
+    output_language: OutputLanguage,
+    detail_level: StudyDetailLevel,
+    section: Literal["detailed", "high"],
+) -> dict:
+    fallback = _fallback_learning_block(index, source_chunk, translated_chunk, output_language)
+    structure = _existing_structure_for_range(existing_study, index, time_range)
+    if section == "detailed":
+        try:
+            detailed_notes = _generate_learning_block_interpretation_with_provider(
+                title=title,
+                index=index,
+                source_chunk=source_chunk,
+                translated_chunk=translated_chunk,
+                context_summary=context_summary,
+                structure=structure,
+                provider=provider,
+                output_language=output_language,
+                detail_level=detail_level,
+            )
+        except Exception:
+            detailed_notes = fallback["detailed_notes"]
+        high_fidelity_text = fallback["high_fidelity_text"]
+    else:
+        detailed_notes = _existing_detailed_notes_for_range(existing_study, index, time_range)
+        try:
+            high_fidelity_text = _generate_learning_block_high_fidelity_with_provider(
+                title=title,
+                index=index,
+                source_chunk=source_chunk,
+                translated_chunk=translated_chunk,
+                context_summary=context_summary,
+                structure=structure,
+                detailed_notes=detailed_notes,
+                provider=provider,
+                output_language=output_language,
+                detail_level=detail_level,
+            )
+        except Exception:
+            high_fidelity_text = fallback["high_fidelity_text"]
+    return {
+        "id": f"block-{index + 1}",
+        "start": time_range.start,
+        "end": time_range.end,
+        "title": str(structure.get("title") or fallback["title"]).strip(),
+        "summary": str(structure.get("summary") or fallback["summary"]).strip(),
+        "priority": structure.get("priority") if structure.get("priority") in {"focus", "skim", "skip", "review"} else fallback["priority"],
+        "key_points": _normalize_key_points(structure.get("key_points")) or fallback["key_points"],
+        "detailed_notes": str(detailed_notes or fallback["detailed_notes"]).strip(),
+        "high_fidelity_text": str(high_fidelity_text or fallback["high_fidelity_text"]).strip(),
+    }
+
+
 def _generate_learning_block_with_provider(
     title: str,
     index: int,
@@ -1691,74 +2016,313 @@ def _generate_learning_block_with_provider(
     detail_level: StudyDetailLevel = "standard",
     neighbor_context: str = "",
 ) -> dict:
-    strategy = _study_strategy(detail_level)
+    fallback = _fallback_learning_block(index, source_chunk, translated_chunk, output_language)
+    try:
+        structure = _generate_learning_block_structure_with_provider(
+            title=title,
+            index=index,
+            source_chunk=source_chunk,
+            translated_chunk=translated_chunk,
+            context_summary=context_summary,
+            provider=provider,
+            output_language=output_language,
+            detail_level=detail_level,
+            neighbor_context=neighbor_context,
+        )
+    except Exception:
+        structure = {
+            "title": fallback["title"],
+            "summary": fallback["summary"],
+            "priority": fallback["priority"],
+            "key_points": fallback["key_points"],
+            "terms": [],
+            "open_questions": [],
+        }
+
+    try:
+        detailed_notes = _generate_learning_block_interpretation_with_provider(
+            title=title,
+            index=index,
+            source_chunk=source_chunk,
+            translated_chunk=translated_chunk,
+            context_summary=context_summary,
+            structure=structure,
+            provider=provider,
+            output_language=output_language,
+            detail_level=detail_level,
+        )
+    except Exception:
+        detailed_notes = fallback["detailed_notes"]
+
+    try:
+        high_fidelity_text = _generate_learning_block_high_fidelity_with_provider(
+            title=title,
+            index=index,
+            source_chunk=source_chunk,
+            translated_chunk=translated_chunk,
+            context_summary=context_summary,
+            structure=structure,
+            detailed_notes=detailed_notes,
+            provider=provider,
+            output_language=output_language,
+            detail_level=detail_level,
+        )
+    except Exception:
+        high_fidelity_text = fallback["high_fidelity_text"]
+
+    priority = str(structure.get("priority") or fallback["priority"]).lower()
+    if priority not in {"focus", "skim", "skip", "review"}:
+        priority = fallback["priority"]
+    key_points = _normalize_key_points(structure.get("key_points"))
+    return {
+        "id": f"block-{index + 1}",
+        "start": source_chunk[0].start,
+        "end": source_chunk[-1].end,
+        "title": str(structure.get("title") or fallback["title"]).strip(),
+        "summary": str(structure.get("summary") or fallback["summary"]).strip(),
+        "priority": priority,
+        "key_points": key_points or fallback["key_points"],
+        "detailed_notes": str(detailed_notes or fallback["detailed_notes"]).strip(),
+        "high_fidelity_text": str(high_fidelity_text or fallback["high_fidelity_text"]).strip(),
+    }
+
+
+def _generate_learning_block_structure_with_provider(
+    title: str,
+    index: int,
+    source_chunk: list[TranscriptSegment],
+    translated_chunk: list[TranscriptSegment],
+    context_summary: str,
+    provider: LlmProvider,
+    output_language: OutputLanguage,
+    detail_level: StudyDetailLevel,
+    neighbor_context: str,
+) -> dict:
     target_language = _target_language_name(output_language)
-    block_minutes = max((source_chunk[-1].end - source_chunk[0].start) / 60, 0.25)
-    max_tokens = min(
-        strategy.block_max_tokens,
-        max(1800, round(strategy.block_base_tokens + block_minutes * strategy.block_tokens_per_minute)),
-    )
     payload = _chat_json(
         provider,
         [
             {
                 "role": "system",
                 "content": (
-                    f"Create one timestamp-linked course learning block in {target_language}. "
-                    "Use only the provided transcript lines for course facts. Do not output a raw subtitle dump. "
-                    "Return strict JSON only with: title string, summary string, priority one of focus/skim/skip/review, "
-                    "key_points array, detailed_notes string, high_fidelity_text string. "
-                    "detailed_notes is the overview layer: explain what this block is about, why it matters, "
-                    "and how it fits the course. It should help the learner decide whether to focus, skim, "
-                    "skip, or review this segment. key_points should extract concrete claims, methods, "
-                    "examples, distinctions, or warnings rather than generic topic names. "
-                    "high_fidelity_text is the high-fidelity compressed layer: preserve the original expansion "
-                    "path, including setup, claims, reasoning chain, examples, numbers, definitions, steps, "
-                    "caveats, transitions, comparisons, and unresolved or uncertain points when present. "
-                    "Prefer finer decomposition over premature compression. Do not flatten several distinct "
-                    "claims into one generic sentence. Keep enough detail that a learner who cannot watch "
-                    "the video can still recover most of the information value from this block. Avoid "
-                    "verbatim subtitle copying except for terms, short phrases, or necessary definitions. "
-                    "Use cautious wording for transcript uncertainty instead of inventing corrections. "
-                    "The result should substitute for close watching of this block while still being skimmable, "
-                    "not a raw subtitle dump."
+                    f"Extract the learning-block structure from one course transcript segment in {target_language}. "
+                    "Use only the provided transcript lines and adjacent block context. Do not add facts outside "
+                    "the transcript. Do not write long interpretation, detailed notes, or high-fidelity prose. "
+                    "Return strict JSON only: {\"title\":string,\"summary\":string,"
+                    "\"priority\":\"focus|skim|skip|review\",\"key_points\":[{\"type\":string,"
+                    "\"text\":string,\"evidence\":string}],\"terms\":[string],\"open_questions\":[string]}. "
+                    "The title should be short. The summary should explain the block in one or two sentences. "
+                    "key_points must extract concrete concepts, claims, methods, examples, steps, warnings, "
+                    "definitions, comparisons, transitions, or uncertainties rather than generic topic names. "
+                    "Use evidence to briefly identify what transcript content supports each point. "
+                    "terms should list important terms, names, product names, or method names in this block. "
+                    "open_questions should include only uncertainty or unresolved points actually present in the transcript."
+                ),
+            },
+            {
+                "role": "user",
+                "content": _learning_block_user_context(
+                    title,
+                    index,
+                    source_chunk,
+                    translated_chunk,
+                    context_summary,
+                    neighbor_context=neighbor_context,
+                ),
+            },
+        ],
+        temperature=_learning_temperature(detail_level),
+        max_tokens=_learning_block_structure_tokens(detail_level, source_chunk),
+        timeout=150,
+        task_key="interpretation",
+    )
+    if not isinstance(payload, dict):
+        raise TypeError("Learning block structure payload must be an object")
+    return payload
+
+
+def _generate_learning_block_interpretation_with_provider(
+    title: str,
+    index: int,
+    source_chunk: list[TranscriptSegment],
+    translated_chunk: list[TranscriptSegment],
+    context_summary: str,
+    structure: dict,
+    provider: LlmProvider,
+    output_language: OutputLanguage,
+    detail_level: StudyDetailLevel,
+) -> str:
+    target_language = _target_language_name(output_language)
+    payload = _chat_json(
+        provider,
+        [
+            {
+                "role": "system",
+                "content": (
+                    f"Write the interpretation layer for one course learning block in {target_language}. "
+                    "Use only the provided transcript, course context, and extracted learning-block structure. "
+                    "Do not invent facts outside the transcript. Do not produce a raw subtitle retelling. "
+                    "Do not write the high-fidelity detailed version in this call. "
+                    "Return strict JSON only: {\"detailed_notes\": string}. "
+                    "detailed_notes should explain what this block is about, why it matters, and how it connects "
+                    "to the course thread. It should help the learner decide whether to focus, skim, skip, or review. "
+                    "Integrate key points naturally instead of mechanically listing every item."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Course title: {title}\n"
-                    f"Course context: {context_summary}\n"
-                    f"Block index: {index + 1}\n"
-                    f"Time range: {_format_time(source_chunk[0].start)}-{_format_time(source_chunk[-1].end)}\n\n"
-                    f"Adjacent block context:\n{neighbor_context or 'No adjacent context.'}\n\n"
-                    "Transcript lines:\n"
-                    + _paired_transcript_lines(source_chunk, translated_chunk)
+                    _learning_block_user_context(
+                        title,
+                        index,
+                        source_chunk,
+                        translated_chunk,
+                        context_summary,
+                    )
+                    + "\n\nLearning block structure:\n"
+                    + json.dumps(_serializable_learning_block_structure(structure), ensure_ascii=False)
                 ),
             },
         ],
         temperature=_learning_temperature(detail_level),
-        max_tokens=max_tokens,
+        max_tokens=_learning_block_interpretation_tokens(detail_level, source_chunk),
         timeout=180,
-        task_key=_learning_task_key(detail_level),
+        task_key="interpretation",
     )
     if not isinstance(payload, dict):
-        raise TypeError("Learning block payload must be an object")
-    fallback = _fallback_learning_block(index, source_chunk, translated_chunk, output_language)
-    priority = str(payload.get("priority") or fallback["priority"]).lower()
-    if priority not in {"focus", "skim", "skip", "review"}:
-        priority = fallback["priority"]
+        raise TypeError("Learning block interpretation payload must be an object")
+    return str(payload.get("detailed_notes") or "").strip()
+
+
+def _generate_learning_block_high_fidelity_with_provider(
+    title: str,
+    index: int,
+    source_chunk: list[TranscriptSegment],
+    translated_chunk: list[TranscriptSegment],
+    context_summary: str,
+    structure: dict,
+    detailed_notes: str,
+    provider: LlmProvider,
+    output_language: OutputLanguage,
+    detail_level: StudyDetailLevel,
+) -> str:
+    strategy = _study_strategy(detail_level)
+    target_language = _target_language_name(output_language)
+    payload = _chat_json(
+        provider,
+        [
+            {
+                "role": "system",
+                "content": (
+                    f"Write the high-fidelity detailed layer for one course learning block in {target_language}. "
+                    "Use only the provided transcript, course context, learning-block structure, and interpretation. "
+                    "Do not add facts outside the transcript. Do not flatten several distinct claims into one "
+                    "generic sentence. Do not output a raw subtitle dump. "
+                    "Return strict JSON only: {\"high_fidelity_text\": string}. "
+                    "high_fidelity_text should preserve the original teaching path: setup, claims, reasoning chain, "
+                    "examples, numbers, definitions, steps, caveats, transitions, comparisons, limitations, and "
+                    "unresolved or uncertain points when present. Prefer finer decomposition over premature compression. "
+                    "Keep enough detail that a learner who cannot watch the video can still recover most of the "
+                    "information value from this block. Avoid verbatim subtitle copying except for terms, short "
+                    "phrases, or necessary definitions. "
+                    "Use cautious wording for transcript uncertainty instead of inventing corrections. "
+                    "The result should substitute for close watching while still being skimmable."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    _learning_block_user_context(title, index, source_chunk, translated_chunk, context_summary)
+                    + "\n\nLearning block structure:\n"
+                    + json.dumps(_serializable_learning_block_structure(structure), ensure_ascii=False)
+                    + "\n\nInterpretation detailed_notes:\n"
+                    + detailed_notes
+                ),
+            },
+        ],
+        temperature=_learning_temperature(detail_level),
+        max_tokens=_learning_block_high_fidelity_tokens(strategy, source_chunk),
+        timeout=180,
+        task_key="high_fidelity",
+    )
+    if not isinstance(payload, dict):
+        raise TypeError("Learning block high-fidelity payload must be an object")
+    return str(payload.get("high_fidelity_text") or "").strip()
+
+
+def _learning_block_user_context(
+    title: str,
+    index: int,
+    source_chunk: list[TranscriptSegment],
+    translated_chunk: list[TranscriptSegment],
+    context_summary: str,
+    neighbor_context: str = "",
+) -> str:
+    return (
+        f"Course title: {title}\n"
+        f"Course context: {context_summary}\n"
+        f"Block index: {index + 1}\n"
+        f"Time range: {_format_time(source_chunk[0].start)}-{_format_time(source_chunk[-1].end)}\n\n"
+        f"Adjacent block context:\n{neighbor_context or 'No adjacent context.'}\n\n"
+        "Transcript lines:\n"
+        + _paired_transcript_lines(source_chunk, translated_chunk)
+    )
+
+
+def _learning_block_structure_tokens(
+    detail_level: StudyDetailLevel,
+    source_chunk: list[TranscriptSegment],
+) -> int:
+    strategy = _study_strategy(detail_level)
+    block_minutes = max((source_chunk[-1].end - source_chunk[0].start) / 60, 0.25)
+    return min(4000, max(1600, round(strategy.block_base_tokens * 0.45 + block_minutes * 360)))
+
+
+def _learning_block_interpretation_tokens(
+    detail_level: StudyDetailLevel,
+    source_chunk: list[TranscriptSegment],
+) -> int:
+    strategy = _study_strategy(detail_level)
+    block_minutes = max((source_chunk[-1].end - source_chunk[0].start) / 60, 0.25)
+    return min(strategy.block_max_tokens, max(1800, round(strategy.block_base_tokens * 0.75 + block_minutes * 700)))
+
+
+def _learning_block_high_fidelity_tokens(
+    strategy: StudyGenerationStrategy,
+    source_chunk: list[TranscriptSegment],
+) -> int:
+    block_minutes = max((source_chunk[-1].end - source_chunk[0].start) / 60, 0.25)
+    return min(
+        strategy.block_max_tokens,
+        max(2200, round(strategy.block_base_tokens + block_minutes * strategy.block_tokens_per_minute)),
+    )
+
+
+def _serializable_learning_block_structure(structure: dict) -> dict:
     return {
-        "id": f"block-{index + 1}",
-        "start": source_chunk[0].start,
-        "end": source_chunk[-1].end,
-        "title": str(payload.get("title") or fallback["title"]).strip(),
-        "summary": str(payload.get("summary") or fallback["summary"]).strip(),
-        "priority": priority,
-        "key_points": [str(item).strip() for item in _ensure_list(payload.get("key_points")) if str(item).strip()],
-        "detailed_notes": str(payload.get("detailed_notes") or fallback["detailed_notes"]).strip(),
-        "high_fidelity_text": str(payload.get("high_fidelity_text") or fallback["high_fidelity_text"]).strip(),
+        "title": str(structure.get("title") or "").strip(),
+        "summary": str(structure.get("summary") or "").strip(),
+        "priority": str(structure.get("priority") or "").strip(),
+        "key_points": _ensure_list(structure.get("key_points")),
+        "terms": [str(item).strip() for item in _ensure_list(structure.get("terms")) if str(item).strip()],
+        "open_questions": [
+            str(item).strip()
+            for item in _ensure_list(structure.get("open_questions"))
+            if str(item).strip()
+        ],
     }
+
+
+def _normalize_key_points(value: object) -> list[str]:
+    points: list[str] = []
+    for item in _ensure_list(value):
+        if isinstance(item, dict):
+            text = str(item.get("text") or item.get("claim") or item.get("summary") or "").strip()
+        else:
+            text = str(item).strip()
+        if text:
+            points.append(text)
+    return points
 
 
 def _generate_outline_with_provider(
@@ -1898,6 +2462,68 @@ def _blocks_from_time_map(ranges: list[TimeRange]) -> list[dict]:
     ]
 
 
+def _chunks_for_time_range(
+    source_transcript: list[TranscriptSegment],
+    translated_by_start: dict[float, TranscriptSegment],
+    time_range: TimeRange,
+) -> tuple[list[TranscriptSegment], list[TranscriptSegment]]:
+    source_chunk = [
+        segment
+        for segment in source_transcript
+        if _segment_overlaps_range(segment, time_range.start, time_range.end)
+    ]
+    if not source_chunk:
+        source_chunk = [
+            segment
+            for segment in source_transcript
+            if time_range.start <= segment.start <= time_range.end
+        ][:1]
+    translated_chunk = [
+        translated_by_start.get(round(segment.start, 2))
+        or TranscriptSegment(start=segment.start, end=segment.end, text=segment.text)
+        for segment in source_chunk
+    ]
+    return source_chunk, translated_chunk
+
+
+def _existing_structure_for_range(study: StudyMaterial, index: int, time_range: TimeRange) -> dict:
+    block = _block_from_time_range(index, time_range)
+    outline_points = _outline_key_points_for_range(study, index, time_range)
+    if outline_points:
+        block["key_points"] = outline_points
+    return block
+
+
+def _outline_key_points_for_range(study: StudyMaterial, index: int, time_range: TimeRange) -> list[str]:
+    block_id = f"block-{index + 1}"
+    for node in study.outline:
+        if block_id in node.id or _outline_node_matches_range(node, time_range):
+            points = [child.title for child in node.children if child.title.strip()]
+            if not points:
+                points = [node.summary] if node.summary.strip() else []
+            return points
+    return []
+
+
+def _outline_node_matches_range(node: OutlineNode, time_range: TimeRange) -> bool:
+    return abs(node.start - time_range.start) < 1 and abs(node.end - time_range.end) < 1
+
+
+def _existing_detailed_notes_for_range(study: StudyMaterial, index: int, time_range: TimeRange) -> str:
+    text = study.detailed_notes.strip()
+    if not text:
+        return time_range.summary
+    expected_prefix = f"{_format_time(time_range.start)}-{_format_time(time_range.end)}"
+    for section in re.split(r"\n{2,}", text):
+        first_line, _, body = section.partition("\n")
+        if first_line.startswith(expected_prefix):
+            return body.strip() or first_line.strip()
+    if len(study.time_map) == 1:
+        _, separator, body = text.partition("\n")
+        return body.strip() if separator else text
+    return time_range.summary
+
+
 def _block_from_time_range(index: int, time_range: TimeRange) -> dict:
     return {
         "id": f"block-{index + 1}",
@@ -1929,6 +2555,8 @@ def _merge_study_section(
         next_study.prerequisites = generated.prerequisites
         next_study.thought_prompts = generated.thought_prompts
         next_study.review_suggestions = generated.review_suggestions
+        next_study.beginner_focus = generated.beginner_focus
+        next_study.experienced_guidance = generated.experienced_guidance
     elif section == "outline":
         next_study.outline = generated.outline
     elif section == "detailed":
@@ -2035,7 +2663,6 @@ def _fallback_learning_block(
     output_language: OutputLanguage,
 ) -> dict:
     display_chunk = translated_chunk or source_chunk
-    title_prefix = "第" if output_language == "zh-CN" else "セクション" if output_language == "ja" else "Block"
     title = (
         f"第 {index + 1} 段：{_first_words(display_chunk[0].text, 8)}"
         if output_language == "zh-CN"
@@ -2082,64 +2709,86 @@ def _one_line_from_context(
     context_summary: str,
 ) -> str:
     clean_summary = " ".join(context_summary.split())
+    if output_language == "zh-CN":
+        return f"这门课程围绕「{title}」展开。"
+    if output_language == "ja":
+        return f"このコースは「{title}」を中心に展開されています。"
     if len(clean_summary) > 64:
         clean_summary = clean_summary[:61].rstrip() + "..."
-    if output_language == "zh-CN":
-        return f"{len(blocks)} 个学习块：{clean_summary}"
-    if output_language == "ja":
-        return f"{len(blocks)} 個の学習ブロック：{clean_summary}"
     return f"{len(blocks)} learning blocks: {clean_summary}"
 
 
-def _system_prompt(output_language: OutputLanguage) -> str:
-    if output_language == "zh-CN":
-        language_instruction = (
-            "Output every user-facing field in Simplified Chinese. If the transcript is in "
-            "English or any other language, translate the learning material into natural "
-            "Simplified Chinese while preserving the original timestamps and factual detail. "
-            "The high_fidelity_text should be a detailed Chinese learning version, not a terse summary."
-        )
-    elif output_language == "ja":
-        language_instruction = (
-            "Output every user-facing field in Japanese. If the transcript is in English "
-            "or any other language, translate the learning material into natural Japanese "
-            "while preserving the original timestamps and factual detail. The high_fidelity_text "
-            "should be a detailed Japanese learning version, not a terse summary."
-        )
-    else:
-        language_instruction = "Output every user-facing field in English."
-    return (
-        language_instruction
-        + " "
-        "You create timestamp-linked study material for working professionals. "
-        "Use only transcript-derived content for course claims. Separate any AI-added "
-        "context into prerequisites, thought_prompts, or review_suggestions. Return "
-        "valid JSON matching this schema: one_line string, time_map array of "
-        "{start,end,title,summary,priority}, outline recursive nodes "
-        "{id,start,end,title,summary,children}, detailed_notes string, "
-        "high_fidelity_text string, translated_transcript array of "
-        "{start,end,text}, prerequisites array, thought_prompts array, "
-        "review_suggestions array. The translated_transcript must preserve the same "
-        "segment count, start, and end values as the input transcript when possible. "
-        "The high_fidelity_text must preserve detail and avoid over-compression."
-    )
-
-
-def _user_prompt(
+def _partial_one_line_from_context(
     title: str,
-    transcript: list[TranscriptSegment],
     output_language: OutputLanguage,
+    context_summary: str,
 ) -> str:
-    lines = [
-        f"Title: {title}",
-        f"Output language: {output_language}",
-        "Transcript:",
-        *[
-            f"[{_format_time(segment.start)}-{_format_time(segment.end)}] {segment.text}"
-            for segment in transcript
-        ],
+    if output_language == "zh-CN":
+        return "正在生成学习地图。"
+    if output_language == "ja":
+        return "学習マップを生成中です。"
+    clean_summary = " ".join((context_summary or title).split()) or title
+    if len(clean_summary) > 64:
+        clean_summary = clean_summary[:61].rstrip() + "..."
+    return f"Generating study map: {clean_summary}"
+
+
+def _context_summary_with_metadata(
+    context_summary: str,
+    metadata: VideoMetadata | None,
+) -> str:
+    metadata_reference = _metadata_prompt_reference(metadata).strip()
+    if not metadata_reference:
+        return context_summary
+    return f"{context_summary.strip()}\n\n{metadata_reference}".strip()
+
+
+def _metadata_prompt_reference(metadata: VideoMetadata | None) -> str:
+    if not metadata:
+        return ""
+    fields = [
+        ("id", metadata.id),
+        ("metadata_title", metadata.title),
+        ("duration_seconds", _format_metadata_duration(metadata.duration)),
+        ("uploader", metadata.uploader),
+        ("channel", metadata.channel),
+        ("creator", metadata.creator),
+        ("description", _truncate_prompt_text(metadata.description, 1200)),
+        ("playlist_title", metadata.playlist_title),
+        ("playlist_index", metadata.playlist_index),
+        ("webpage_url", metadata.webpage_url),
+        ("extractor", metadata.extractor),
+        ("language", metadata.language),
+        ("subtitles", ", ".join(metadata.subtitles) if metadata.subtitles else None),
+        ("automatic_captions", ", ".join(metadata.automatic_captions) if metadata.automatic_captions else None),
     ]
-    return "\n".join(lines)
+    lines = [f"- {key}: {value}" for key, value in fields if value]
+    if not lines:
+        return ""
+    return "Trusted video metadata:\n" + "\n".join(lines) + "\n\n"
+
+
+def _format_metadata_duration(duration: float | None) -> str | None:
+    if duration is None:
+        return None
+    return f"{duration:g}"
+
+
+def _truncate_prompt_text(value: str | None, limit: int) -> str | None:
+    if not value:
+        return None
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _send_partial_study(
+    partial_study: PartialStudyCallback | None,
+    study: StudyMaterial,
+) -> None:
+    if partial_study:
+        partial_study(study.model_copy(deep=True))
 
 
 def _target_language_name(output_language: OutputLanguage) -> str:
@@ -2158,21 +2807,6 @@ def _chunk_segments(
         transcript[index : index + target_size]
         for index in range(0, len(transcript), target_size)
     ]
-
-
-def _sample_transcript_for_context(transcript: list[TranscriptSegment]) -> str:
-    if len(transcript) <= 80:
-        sampled = transcript
-    else:
-        sampled = [
-            *transcript[:30],
-            *transcript[len(transcript) // 2 : len(transcript) // 2 + 20],
-            *transcript[-30:],
-        ]
-    return "\n".join(
-        f"[{_format_time(segment.start)}-{_format_time(segment.end)}] {segment.text}"
-        for segment in sampled
-    )
 
 
 def _report(
@@ -2209,29 +2843,6 @@ def _loads_json_content(content: str) -> object:
     if fence_match:
         stripped = fence_match.group(1).strip()
     return json.loads(stripped)
-
-
-def _normalize_study_payload(payload: object) -> dict:
-    if not isinstance(payload, dict):
-        raise TypeError("Study payload must be a JSON object")
-
-    normalized = dict(payload)
-    normalized["time_map"] = [
-        _normalize_time_range(range_payload)
-        for range_payload in _ensure_list(normalized.get("time_map"))
-        if isinstance(range_payload, dict)
-    ]
-    normalized["outline"] = [
-        _normalize_outline_node(node)
-        for node in _ensure_list(normalized.get("outline"))
-        if isinstance(node, dict)
-    ]
-    normalized["translated_transcript"] = [
-        segment
-        for segment in _ensure_list(normalized.get("translated_transcript"))
-        if isinstance(segment, dict)
-    ]
-    return normalized
 
 
 def _normalize_time_range(payload: dict) -> dict:

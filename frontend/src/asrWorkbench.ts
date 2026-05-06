@@ -169,6 +169,18 @@ export function sortAsrReviewSuggestions(
   return indexed.map((entry) => entry.suggestion);
 }
 
+export function sortAsrNavigationSuggestions(
+  suggestions: AsrCorrectionSuggestion[],
+): AsrCorrectionSuggestion[] {
+  return [...suggestions].sort(
+    (left, right) =>
+      left.segment_index - right.segment_index ||
+      left.start - right.start ||
+      left.end - right.end ||
+      left.original_text.localeCompare(right.original_text),
+  );
+}
+
 export function filterAsrSuggestionsByConfidence(
   suggestions: AsrCorrectionSuggestion[],
   thresholdPercent: number,

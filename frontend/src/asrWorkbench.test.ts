@@ -8,6 +8,7 @@ import {
   filterAsrSuggestionsByConfidence,
   previewTextToEditorText,
   reconcilePreviewEditedSuggestions,
+  sortAsrNavigationSuggestions,
   sortAsrReviewSuggestions,
   transcriptToEditorText,
 } from "./asrWorkbench";
@@ -162,6 +163,23 @@ describe("ASR workbench transcript editor helpers", () => {
       "high",
       "middle",
       "low",
+    ]);
+  });
+
+  test("sorts navigation suggestions by transcript order", () => {
+    const later = { ...asrSuggestion("later", 0.99), segment_index: 4, start: 40, end: 44 };
+    const earlier = { ...asrSuggestion("earlier", 0.91), segment_index: 1, start: 10, end: 14 };
+    const adjacent = { ...asrSuggestion("adjacent", 0.95), segment_index: 2, start: 20, end: 24 };
+
+    expect(sortAsrReviewSuggestions([later, earlier, adjacent], true).map((suggestion) => suggestion.id)).toEqual([
+      "later",
+      "adjacent",
+      "earlier",
+    ]);
+    expect(sortAsrNavigationSuggestions([later, earlier, adjacent]).map((suggestion) => suggestion.id)).toEqual([
+      "earlier",
+      "adjacent",
+      "later",
     ]);
   });
 

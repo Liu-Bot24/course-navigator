@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from time import sleep
 
@@ -7,7 +8,7 @@ import course_navigator.app as app_module
 from course_navigator.app import create_app
 from course_navigator.config import OnlineAsrSettings, Settings
 from course_navigator.library import CourseLibrary
-from course_navigator.models import CourseItem, TranscriptSegment, VideoMetadata
+from course_navigator.models import CourseItem, StudyMaterial, TranscriptSegment, VideoMetadata
 from course_navigator.ytdlp import YtDlpError
 
 
@@ -77,6 +78,10 @@ def test_extract_route_saves_course_item(tmp_path):
     assert payload["id"] == "abc123"
     assert payload["title"] == "Sample Lesson"
     assert payload["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+    assert payload["metadata"]["uploader"] == "Sample Teacher"
+    assert payload["metadata"]["channel"] == "Sample Channel"
+    assert payload["metadata"]["creator"] == "Sample Creator"
+    assert payload["metadata"]["description"] == "A course summary mentioning D-tail terminology."
     assert payload["transcript"][1]["text"] == "Important detail."
 
     list_response = client.get("/api/items")
@@ -766,6 +771,126 @@ def test_generate_study_route_updates_item(tmp_path):
     assert item_response.json()["study"]["high_fidelity_text"]
 
 
+def test_generate_study_route_passes_saved_metadata_to_ai(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_generate_study_material(**kwargs):
+        captured["metadata"] = kwargs["metadata"]
+        return StudyMaterial(
+            one_line="学习地图。",
+            time_map=[],
+            outline=[],
+            detailed_notes="解读",
+            high_fidelity_text="详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fake_generate_study_material)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post("/api/items/abc123/study", json={"output_language": "zh-CN"})
+
+    assert response.status_code == 200
+    assert captured["metadata"].uploader == "Sample Teacher"
+    assert captured["metadata"].description == "A course summary mentioning D-tail terminology."
+
+
+def test_generate_study_route_uses_request_detail_level(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_generate_study_material(**kwargs):
+        captured["detail_level"] = kwargs["detail_level"]
+        return StudyMaterial(
+            one_line="学习地图。",
+            time_map=[],
+            outline=[],
+            detailed_notes="解读",
+            high_fidelity_text="详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fake_generate_study_material)
+    client = make_client(tmp_path, settings=Settings(data_dir=tmp_path, study_detail_level="faithful"))
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post("/api/items/abc123/study", json={"output_language": "zh-CN", "detail_level": "standard"})
+
+    assert response.status_code == 200
+    assert captured["detail_level"] == "standard"
+
+
+def test_study_job_passes_saved_metadata_to_ai(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_generate_study_material(**kwargs):
+        captured["metadata"] = kwargs["metadata"]
+        return StudyMaterial(
+            one_line="学习地图。",
+            time_map=[],
+            outline=[],
+            detailed_notes="解读",
+            high_fidelity_text="详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fake_generate_study_material)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN"})
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    assert captured["metadata"].uploader == "Sample Teacher"
+    assert captured["metadata"].description == "A course summary mentioning D-tail terminology."
+
+
+def test_study_job_uses_request_detail_level(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_generate_study_material(**kwargs):
+        captured["detail_level"] = kwargs["detail_level"]
+        return StudyMaterial(
+            one_line="学习地图。",
+            time_map=[],
+            outline=[],
+            detailed_notes="解读",
+            high_fidelity_text="详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fake_generate_study_material)
+    client = make_client(tmp_path, settings=Settings(data_dir=tmp_path, study_detail_level="faithful"))
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "detail_level": "standard"})
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    assert captured["detail_level"] == "standard"
+
+
 def test_generate_study_route_accepts_chinese_output_language(tmp_path):
     client = make_client(tmp_path)
     client.post(
@@ -803,8 +928,63 @@ def test_study_job_generates_in_background(tmp_path):
     assert item_response.json()["study"]["high_fidelity_text"]
 
 
+def test_study_job_saves_partial_study_sections_before_completion(tmp_path, monkeypatch):
+    def fake_generate(**kwargs):
+        kwargs["partial_study"](
+            StudyMaterial(
+                one_line="先出的导览。",
+                time_map=[],
+                outline=[],
+                detailed_notes="",
+                high_fidelity_text="",
+                prerequisites=["先出的预备知识"],
+            )
+        )
+        sleep(0.08)
+        return StudyMaterial(
+            one_line="最终学习地图。",
+            time_map=[],
+            outline=[],
+            detailed_notes="最终解读",
+            high_fidelity_text="最终详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fake_generate)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN"})
+    job_id = response.json()["job_id"]
+    partial_seen = False
+    for _ in range(20):
+        item_response = client.get("/api/items/abc123")
+        study = item_response.json()["study"]
+        if study and study["prerequisites"] == ["先出的预备知识"]:
+            partial_seen = True
+            break
+        sleep(0.01)
+
+    assert partial_seen
+
+    payload = client.get(f"/api/jobs/{job_id}").json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    assert client.get("/api/items/abc123").json()["study"]["high_fidelity_text"] == "最终详解"
+
+
 def test_translation_job_writes_translated_transcript(tmp_path, monkeypatch):
+    captured = {}
+
     def fake_translate(**kwargs):
+        captured["metadata"] = kwargs["metadata"]
         translated = [
             TranscriptSegment(start=segment.start, end=segment.end, text=f"译文 {segment.text}")
             for segment in kwargs["transcript"]
@@ -820,6 +1000,18 @@ def test_translation_job_writes_translated_transcript(tmp_path, monkeypatch):
         "/api/extract",
         json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
     )
+    item = CourseLibrary(tmp_path).get("abc123")
+    assert item is not None
+    item.study = StudyMaterial(
+        one_line="已有导览",
+        time_map=[],
+        outline=[],
+        detailed_notes="已有解读",
+        high_fidelity_text="已有详解",
+        beginner_focus=["已有初学建议"],
+        experienced_guidance=["已有进阶建议"],
+    )
+    CourseLibrary(tmp_path).save(item)
 
     response = client.post("/api/items/abc123/translation-jobs", json={"output_language": "zh-CN"})
 
@@ -838,6 +1030,10 @@ def test_translation_job_writes_translated_transcript(tmp_path, monkeypatch):
     assert translated[0]["text"] == "译文 Opening idea."
     assert item_response.json()["study"]["translated_title"] == "示例课程"
     assert item_response.json()["study"]["context_summary"] == "翻译阶段上下文摘要"
+    assert item_response.json()["study"]["beginner_focus"] == ["已有初学建议"]
+    assert item_response.json()["study"]["experienced_guidance"] == ["已有进阶建议"]
+    assert captured["metadata"].uploader == "Sample Teacher"
+    assert captured["metadata"].description == "A course summary mentioning D-tail terminology."
 
 
 def test_incomplete_cached_translation_is_hidden_from_response(tmp_path, monkeypatch):
@@ -903,6 +1099,42 @@ def test_transcript_update_saves_corrected_source_and_clears_cached_translation(
     payload = updated.json()
     assert payload["transcript"][0]["text"] == "Opening idea corrected."
     assert payload["study"]["translated_transcript"] == []
+
+
+def test_study_generation_uses_saved_corrected_transcript(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_generate_study_material(**kwargs):
+        captured["transcript"] = kwargs["transcript"]
+        return StudyMaterial(
+            one_line="已使用校正字幕生成学习地图。",
+            time_map=[],
+            outline=[],
+            detailed_notes="",
+            high_fidelity_text="",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fake_generate_study_material)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    client.put(
+        "/api/items/abc123/transcript",
+        json={
+            "transcript": [
+                {"start": 0, "end": 4, "text": "Opening idea corrected."},
+                {"start": 4, "end": 8, "text": "Important detail corrected."},
+            ]
+        },
+    )
+
+    response = client.post("/api/items/abc123/study", json={"output_language": "zh-CN"})
+
+    assert response.status_code == 200
+    assert captured["transcript"][0].text == "Opening idea corrected."
+    assert captured["transcript"][1].text == "Important detail corrected."
 
 
 def test_asr_correction_job_uses_selected_profile_and_exposes_suggestions(tmp_path, monkeypatch):
@@ -1396,6 +1628,59 @@ def test_import_local_video_copies_file_to_workspace_downloads_and_creates_cours
     assert (workspace_dir / "downloads" / "Local-Lesson.mp4").read_bytes() == b"local video"
     assert not (process_dir / "downloads").exists()
     assert client.get("/api/items/Local-Lesson/video").content == b"local video"
+
+
+def test_existing_empty_workspace_receives_legacy_items_and_downloads(tmp_path):
+    legacy_dir = tmp_path / "legacy"
+    workspace_dir = tmp_path / "workspace"
+    workspace_dir.mkdir(parents=True)
+    CourseLibrary(legacy_dir).save(
+        CourseItem(
+            id="legacy-lesson",
+            source_url="https://example.com/lesson",
+            title="Legacy Lesson",
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+    legacy_downloads = legacy_dir / "downloads"
+    legacy_downloads.mkdir(parents=True)
+    (legacy_downloads / "legacy-lesson.mp4").write_bytes(b"video")
+
+    make_client(legacy_dir, workspace_dir=workspace_dir)
+
+    assert (workspace_dir / "items" / "legacy-lesson.json").exists()
+    assert (workspace_dir / "downloads" / "legacy-lesson.mp4").read_bytes() == b"video"
+
+
+def test_startup_backfills_missing_study_guidance_fields(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    items_dir = workspace_dir / "items"
+    items_dir.mkdir(parents=True)
+    item_path = items_dir / "legacy-study.json"
+    item_path.write_text(
+        json.dumps(
+            {
+                "id": "legacy-study",
+                "source_url": "https://example.com/legacy-study",
+                "title": "Legacy Study",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "study": {
+                    "one_line": "旧导览",
+                    "time_map": [],
+                    "outline": [],
+                    "detailed_notes": "",
+                    "high_fidelity_text": "",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    make_client(tmp_path / "process", workspace_dir=workspace_dir)
+
+    payload = json.loads(item_path.read_text(encoding="utf-8"))
+    assert payload["study"]["beginner_focus"] == []
+    assert payload["study"]["experienced_guidance"] == []
 
 
 def test_delete_local_video_rejects_local_imports_without_removing_file(tmp_path):

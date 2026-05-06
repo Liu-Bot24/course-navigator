@@ -58,6 +58,7 @@ from .models import (
     OnlineAsrSettingsResponse,
     OnlineAsrSettingsUpdate,
     StudyJobStatus,
+    StudyDetailLevel,
     StudyMaterial,
     StudyRequest,
     TranscriptSegment,
@@ -93,6 +94,7 @@ def create_app(
     _prepare_workspace(active_workspace_dir, active_data_dir)
     library = CourseLibrary(active_workspace_dir)
     _normalize_library_video_paths(library, active_workspace_dir)
+    _backfill_study_guidance_fields(library)
     ytdlp_runner = runner or YtDlpRunner()
     _backfill_local_video_items(library, active_workspace_dir, ytdlp_runner)
     jobs: dict[str, StudyJobStatus] = {}
@@ -464,17 +466,19 @@ def create_app(
             raise HTTPException(status_code=404, detail="Course item not found")
         output_language = request.output_language if request else "zh-CN"
         section = request.section if request else "all"
+        detail_level = request.detail_level if request and request.detail_level else settings_state["value"].study_detail_level
         if section == "all":
             study = generate_study_material(
                 title=item.title,
                 transcript=item.transcript,
                 provider=settings_state["value"].provider_set,
                 output_language=output_language,
-                detail_level=settings_state["value"].study_detail_level,
+                detail_level=detail_level,
                 existing_translation=item.study.translated_transcript if item.study else None,
                 existing_context_summary=item.study.context_summary if item.study else None,
                 existing_translated_title=item.study.translated_title if item.study else None,
                 source_language=item.metadata.language if item.metadata else None,
+                metadata=item.metadata,
             )
         else:
             study = regenerate_study_section(
@@ -484,8 +488,9 @@ def create_app(
                 provider=settings_state["value"].provider_set,
                 output_language=output_language,
                 section=section,
-                detail_level=settings_state["value"].study_detail_level,
+                detail_level=detail_level,
                 source_language=item.metadata.language if item.metadata else None,
+                metadata=item.metadata,
             )
         item.study = study
         library.save(item)
@@ -512,7 +517,8 @@ def create_app(
             jobs[job_id] = job
         output_language = request.output_language if request else "zh-CN"
         section = request.section if request else "all"
-        study_executor.submit(_run_study_job, job_id, item_id, output_language, section)
+        detail_level = request.detail_level if request and request.detail_level else settings_state["value"].study_detail_level
+        study_executor.submit(_run_study_job, job_id, item_id, output_language, section, detail_level)
         return job
 
     @app.post("/api/items/{item_id}/translation-jobs")
@@ -851,7 +857,7 @@ def create_app(
                 error=str(exc),
             )
 
-    def _run_study_job(job_id: str, item_id: str, output_language: str, section: str) -> None:
+    def _run_study_job(job_id: str, item_id: str, output_language: str, section: str, detail_level: StudyDetailLevel) -> None:
         _set_job(
             job_id,
             status="running",
@@ -889,7 +895,19 @@ def create_app(
                 prerequisites=existing.prerequisites if existing else [],
                 thought_prompts=existing.thought_prompts if existing else [],
                 review_suggestions=existing.review_suggestions if existing else [],
+                beginner_focus=existing.beginner_focus if existing else [],
+                experienced_guidance=existing.experienced_guidance if existing else [],
             )
+            library.save(item)
+
+        def save_partial_study(study: StudyMaterial) -> None:
+            with deleted_items_lock:
+                if item_id in deleted_items:
+                    return
+            item = library.get(item_id)
+            if not item:
+                return
+            item.study = study
             library.save(item)
 
         try:
@@ -905,13 +923,15 @@ def create_app(
                     transcript=item.transcript,
                     provider=settings_state["value"].provider_set,
                     output_language=output_language,  # type: ignore[arg-type]
-                    detail_level=settings_state["value"].study_detail_level,
+                    detail_level=detail_level,
                     progress=update_progress,
                     partial_translation=save_partial_translation,
+                    partial_study=save_partial_study,
                     existing_translation=existing_translation,
                     existing_context_summary=existing_context_summary,
                     existing_translated_title=existing_translated_title,
                     source_language=item.metadata.language if item.metadata else None,
+                    metadata=item.metadata,
                 )
             else:
                 study = regenerate_study_section(
@@ -921,9 +941,10 @@ def create_app(
                     provider=settings_state["value"].provider_set,
                     output_language=output_language,  # type: ignore[arg-type]
                     section=section,  # type: ignore[arg-type]
-                    detail_level=settings_state["value"].study_detail_level,
+                    detail_level=detail_level,
                     progress=update_progress,
                     source_language=item.metadata.language if item.metadata else None,
+                    metadata=item.metadata,
                 )
             with deleted_items_lock:
                 if item_id in deleted_items:
@@ -1031,6 +1052,7 @@ def create_app(
                 title_translation=save_translated_title,
                 context_summary_created=save_context_summary,
                 source_language=item.metadata.language if item.metadata else None,
+                metadata=item.metadata,
             )
             with deleted_items_lock:
                 if item_id in deleted_items:
@@ -1197,9 +1219,8 @@ def create_app(
 
 
 def _prepare_workspace(workspace_dir: Path, legacy_data_dir: Path) -> None:
-    workspace_existed = workspace_dir.exists()
     workspace_dir.mkdir(parents=True, exist_ok=True)
-    if workspace_dir.resolve() == legacy_data_dir.resolve() or workspace_existed:
+    if workspace_dir.resolve() == legacy_data_dir.resolve():
         return
     _copy_legacy_child_dir(legacy_data_dir / "items", workspace_dir / "items")
     _copy_legacy_child_dir(legacy_data_dir / "downloads", workspace_dir / "downloads")
@@ -1218,6 +1239,16 @@ def _normalize_library_video_paths(library: CourseLibrary, workspace_dir: Path) 
         normalized = _normalized_local_video_reference(workspace_dir, item)
         if normalized is not None and str(normalized) != str(item.local_video_path):
             item.local_video_path = normalized
+            library.save(item)
+
+
+def _backfill_study_guidance_fields(library: CourseLibrary) -> None:
+    for item in library.list_items():
+        study = item.study
+        if not study:
+            continue
+        fields_set = getattr(study, "model_fields_set", set())
+        if "beginner_focus" not in fields_set or "experienced_guidance" not in fields_set:
             library.save(item)
 
 
@@ -1778,6 +1809,8 @@ def _study_with_translation(
         prerequisites=existing.prerequisites if existing else [],
         thought_prompts=existing.thought_prompts if existing else [],
         review_suggestions=existing.review_suggestions if existing else [],
+        beginner_focus=existing.beginner_focus if existing else [],
+        experienced_guidance=existing.experienced_guidance if existing else [],
     )
 
 
