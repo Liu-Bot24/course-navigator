@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   deleteLocalVideo,
   extractCourse,
+  getOnlineAsrSettings,
   getModelSettings,
   getAsrCorrectionResult,
   getStudyJob,
@@ -273,6 +274,44 @@ describe("App language defaults", () => {
 
     expect(await screen.findByText("无法读取本地视频音频")).toBeTruthy();
     expect(screen.queryByText("[object Object]")).toBeNull();
+  });
+
+  it("does not start online ASR when no online ASR service is configured", async () => {
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => undefined);
+    vi.mocked(getOnlineAsrSettings).mockResolvedValueOnce({
+      provider: "none",
+      openai: { has_api_key: false, api_key_preview: null },
+      groq: { has_api_key: false, api_key_preview: null },
+      xai: { has_api_key: false, api_key_preview: null },
+      custom: { base_url: null, model: null, has_api_key: false, api_key_preview: null },
+    });
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "local-video",
+        source_url: "local-video://local-video",
+        title: "Local Video",
+        duration: 67.5,
+        created_at: new Date().toISOString(),
+        transcript: [],
+        metadata: null,
+        study: null,
+        local_video_path: "downloads/local-video.mp4",
+      },
+    ]);
+
+    render(<App />);
+
+    expect((await screen.findAllByText("Local Video")).length).toBeGreaterThan(0);
+    const sourceSelect = screen.getByRole("combobox", { name: "字幕来源" }) as HTMLSelectElement;
+    fireEvent.change(sourceSelect, { target: { value: "online_asr" } });
+
+    await waitFor(() => {
+      expect(alertSpy).toHaveBeenCalledWith("尚未配置在线 ASR 模型。请先在模型设置中选择并保存在线 ASR 服务，或将字幕来源改为本地 ASR。");
+    });
+    expect(sourceSelect.value).toBe("subtitles");
+    fireEvent.click(screen.getByRole("button", { name: "获取字幕" }));
+    expect(startExtractJob).not.toHaveBeenCalled();
+    alertSpy.mockRestore();
   });
 
   it("keeps local video playback selected after fetching subtitles", async () => {
@@ -788,6 +827,9 @@ describe("App language defaults", () => {
     expect(screen.getByText("模型档案")).toBeTruthy();
     expect(screen.getByText("OpenAI 格式")).toBeTruthy();
     expect(screen.getByText("Anthropic 格式")).toBeTruthy();
+    const modelApiKey = screen.getByLabelText("API Key") as HTMLInputElement;
+    expect(modelApiKey.value).toBe("sk...test");
+    expect(modelApiKey.placeholder).toBe("");
     expect(screen.getByText("高级调用参数")).toBeTruthy();
     expect(screen.queryByText("上下文窗口上限（选填）")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /高级调用参数/ }));
@@ -832,7 +874,10 @@ describe("App language defaults", () => {
     fireEvent.click(await screen.findByRole("button", { name: "模型设置" }));
     fireEvent.click(await screen.findByRole("button", { name: /在线 ASR/ }));
     fireEvent.change(screen.getByLabelText("在线 ASR 服务"), { target: { value: "xai" } });
-    fireEvent.change(await screen.findByLabelText("在线 ASR API Key"), { target: { value: "xai-new-key" } });
+    const onlineAsrKey = await screen.findByLabelText("在线 ASR API Key") as HTMLInputElement;
+    expect(onlineAsrKey.value).toBe("xai...test");
+    expect(onlineAsrKey.placeholder).toBe("");
+    fireEvent.change(onlineAsrKey, { target: { value: "xai-new-key" } });
     fireEvent.click(screen.getByRole("button", { name: "保存档案" }));
 
     await waitFor(() => {
@@ -922,6 +967,7 @@ describe("App language defaults", () => {
     const activeProfile = screen.getByLabelText("正在编辑") as HTMLSelectElement;
     const profileName = screen.getByLabelText("档案名称") as HTMLInputElement;
     const baseUrl = screen.getByLabelText("接口地址") as HTMLInputElement;
+    const apiKey = screen.getByLabelText("API Key") as HTMLInputElement;
     const model = screen.getByLabelText("模型") as HTMLInputElement;
     fireEvent.click(screen.getByRole("button", { name: /高级调用参数/ }));
     const contextWindow = screen.getByLabelText("上下文窗口上限（选填）") as HTMLInputElement;
@@ -930,6 +976,8 @@ describe("App language defaults", () => {
     expect(activeProfile.options[activeProfile.selectedIndex]?.textContent).toBe("未命名档案");
     expect(profileName.value).toBe("");
     expect(baseUrl.value).toBe("");
+    expect(apiKey.value).toBe("");
+    expect(apiKey.placeholder).toBe("");
     expect(model.value).toBe("");
     expect(contextWindow.value).toBe("");
     expect(maxTokens.value).toBe("");

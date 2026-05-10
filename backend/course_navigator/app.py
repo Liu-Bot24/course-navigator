@@ -115,9 +115,10 @@ def create_app(
         extract_executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Course Navigator", version="0.1.0", lifespan=lifespan)
+    allowed_origins = _web_origins(active_settings.web_host, active_settings.web_port)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_origins=allowed_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -1224,6 +1225,15 @@ def _prepare_workspace(workspace_dir: Path, legacy_data_dir: Path) -> None:
         return
     _copy_legacy_child_dir(legacy_data_dir / "items", workspace_dir / "items")
     _copy_legacy_child_dir(legacy_data_dir / "downloads", workspace_dir / "downloads")
+
+
+def _web_origins(host: str, port: int) -> list[str]:
+    hosts = {host}
+    if host == "127.0.0.1":
+        hosts.add("localhost")
+    if host == "localhost":
+        hosts.add("127.0.0.1")
+    return [f"http://{candidate}:{port}" for candidate in sorted(hosts)]
 
 
 def _copy_legacy_child_dir(source: Path, target: Path) -> None:

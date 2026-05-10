@@ -1363,6 +1363,28 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
     assert "COURSE_NAVIGATOR_TASK_PARAMETERS" in written
 
 
+def test_create_app_allows_configured_web_origin(tmp_path):
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            web_host="127.0.0.1",
+            web_port=61234,
+        ),
+    )
+
+    response = client.options(
+        "/api/items",
+        headers={
+            "Origin": "http://127.0.0.1:61234",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:61234"
+
+
 def test_asr_search_settings_can_be_read_and_updated_without_exposing_keys(tmp_path):
     env_path = tmp_path / ".env"
     client = make_client(

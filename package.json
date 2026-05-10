@@ -13,7 +13,12 @@
     "test:frontend": "vitest run",
     "test:backend": ".venv/bin/pytest backend/tests -q",
     "test:all": "npm run test:frontend && npm run test:backend",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "launcher:dev": "npm --prefix launcher run tauri:dev",
+    "launcher:build": "npm --prefix launcher run tauri:build",
+    "launcher:test": "npm --prefix launcher run test",
+    "launcher:web": "npm --prefix launcher run dev",
+    "launcher:build:web": "npm --prefix launcher run build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",

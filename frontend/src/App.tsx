@@ -269,7 +269,7 @@ const COPY = {
     learningModelHelp: "生成每个语义学习块的解读、详解和高保真文本，负责内容质量。",
     globalModelHelp: "生成上下文摘要、语义分块、导览、大纲和跨块整合，需要更强的长上下文能力。",
     onlineAsrSettingsTitle: "在线 ASR",
-    onlineAsrSettingsHelp: "用于在没有站方字幕时通过在线语音识别生成带时间戳字幕。预设服务只需要填写 API Key；自定义接口会自动识别分段、词级时间戳、SRT 或 VTT 返回。",
+    onlineAsrSettingsHelp: "用于在没有站方字幕时通过在线语音识别生成带时间戳字幕。预设服务只需要填写 API Key；自定义接口需兼容 OpenAI audio transcriptions。",
     onlineAsrProvider: "在线 ASR 服务",
     onlineAsrProviderNone: "不使用在线 ASR",
     onlineAsrProviderOpenAI: "OpenAI Whisper",
@@ -280,10 +280,11 @@ const COPY = {
     onlineAsrCustomBaseUrl: "自定义接口地址",
     onlineAsrCustomModel: "自定义模型名称",
     onlineAsrPresetHelp: "选择在线 ASR 作为字幕来源时，会自动抽取音频、压缩并分块转写。",
-    onlineAsrCustomHelp: "自定义接口会自动兼容分段时间戳、词级时间戳、SRT 和 VTT；纯文本转写不能作为字幕。",
+    onlineAsrCustomHelp: "可填完整 /audio/transcriptions 地址，或兼容服务的 /v1 Base URL；响应需包含分段/词级时间戳、SRT 或 VTT，纯文本不能生成可对齐字幕。",
     onlineAsrProviderSaved: "在线 ASR 服务已保存",
+    onlineAsrNotConfigured: "尚未配置在线 ASR 模型。请先在模型设置中选择并保存在线 ASR 服务，或将字幕来源改为本地 ASR。",
     advancedModelSettings: "高级调用参数",
-    advancedModelSettingsHelp: "留空使用代码默认值。这里覆盖具体任务调用；不熟悉模型参数时建议保持默认。",
+    advancedModelSettingsHelp: "未设置时使用推荐默认参数。这里覆盖具体任务调用；不熟悉模型参数时建议保持默认。",
     modelCapabilitySettings: "模型能力覆盖",
     taskStrategySettings: "任务策略覆盖",
     taskStrategyHelp: "按任务分别覆盖 Temperature 和最大输出。错误设置可能导致输出变短、JSON 解析失败、成本上升或结果不稳定。",
@@ -306,8 +307,6 @@ const COPY = {
     modelFetchFailed: "模型列表获取失败",
     noModelCandidates: "没有可用模型",
     modelApiKey: "API Key",
-    modelApiKeyHint: "留空则保留当前 Key",
-    apiKeyOptionalHint: "未配置，可留空",
     modelConfigured: "已配置",
     modelNotConfigured: "未配置",
     closeDialog: "关闭",
@@ -559,7 +558,7 @@ const COPY = {
     learningModelHelp: "Generates interpretation, detailed notes, and high-fidelity text for each semantic block.",
     globalModelHelp: "Context summary, semantic segmentation, guide, outline, and cross-block synthesis.",
     onlineAsrSettingsTitle: "Online ASR",
-    onlineAsrSettingsHelp: "Use an online speech-to-text service to generate timestamped subtitles when source subtitles are unavailable. Preset services only need an API key; custom endpoints auto-detect segment timestamps, word timestamps, SRT, or VTT responses.",
+    onlineAsrSettingsHelp: "Use an online speech-to-text service to generate timestamped subtitles when source subtitles are unavailable. Preset services only need an API key; custom endpoints must be compatible with OpenAI audio transcriptions.",
     onlineAsrProvider: "Online ASR service",
     onlineAsrProviderNone: "Do not use online ASR",
     onlineAsrProviderOpenAI: "OpenAI Whisper",
@@ -570,10 +569,11 @@ const COPY = {
     onlineAsrCustomBaseUrl: "Custom base URL",
     onlineAsrCustomModel: "Custom model name",
     onlineAsrPresetHelp: "When Online ASR is selected as the subtitle source, audio is extracted, compressed, split, and transcribed automatically.",
-    onlineAsrCustomHelp: "Custom endpoints auto-detect segment timestamps, word timestamps, SRT, and VTT. Plain text responses cannot be used as subtitles.",
+    onlineAsrCustomHelp: "Enter a full /audio/transcriptions URL or a compatible /v1 base URL. Responses need segment/word timestamps, SRT, or VTT; plain text cannot produce aligned subtitles.",
     onlineAsrProviderSaved: "Online ASR service saved",
+    onlineAsrNotConfigured: "Online ASR is not configured. Choose and save an Online ASR service in Model Settings, or switch subtitle source to Local ASR.",
     advancedModelSettings: "Advanced call parameters",
-    advancedModelSettingsHelp: "Blank fields use code defaults. These values override individual task calls.",
+    advancedModelSettingsHelp: "Unset fields use recommended defaults. These values override individual task calls.",
     modelCapabilitySettings: "Model capability overrides",
     taskStrategySettings: "Task strategy overrides",
     taskStrategyHelp: "Override temperature and max output per task. Bad values can shorten output, break JSON, raise cost, or reduce stability.",
@@ -596,8 +596,6 @@ const COPY = {
     modelFetchFailed: "Failed to fetch models",
     noModelCandidates: "No models found",
     modelApiKey: "API Key",
-    modelApiKeyHint: "Leave blank to keep current key",
-    apiKeyOptionalHint: "Not configured, optional",
     modelConfigured: "Configured",
     modelNotConfigured: "Not configured",
     closeDialog: "Close",
@@ -1038,6 +1036,7 @@ export function App() {
       openLocalSubtitlePicker();
       return;
     }
+    if (shouldBlockOnlineAsrSource()) return;
     const existing = findExistingItemForUrl(items, normalizedUrl);
     const nextSourceMode = preferredSourceModeForSource(normalizedUrl, existing);
     setError(null);
@@ -1079,6 +1078,7 @@ export function App() {
       openLocalSubtitlePicker();
       return;
     }
+    if (shouldBlockOnlineAsrSource()) return;
     const normalizedUrl = url.trim() || selected?.source_url.trim() || "";
     if (!normalizedUrl) return;
     const existing = findExistingItemForUrl(items, normalizedUrl);
@@ -1109,10 +1109,22 @@ export function App() {
   }
 
   function handleSubtitleSourceChange(nextSource: SubtitleSourceChoice) {
+    if (nextSource === "online_asr" && onlineAsrSettings?.provider === "none") {
+      window.alert(copy.onlineAsrNotConfigured);
+      return;
+    }
     setSubtitleSource(nextSource);
     if (nextSource === "local_upload") {
       window.setTimeout(() => openLocalSubtitlePicker(), 0);
     }
+  }
+
+  function shouldBlockOnlineAsrSource() {
+    if (subtitleSource !== "online_asr" || onlineAsrSettings?.provider !== "none") {
+      return false;
+    }
+    window.alert(copy.onlineAsrNotConfigured);
+    return true;
   }
 
   function openLocalSubtitlePicker() {
@@ -3823,7 +3835,6 @@ function AsrWorkbench({
                     <input
                       autoComplete="off"
                       value={searchDraft.api_key}
-                      placeholder={searchDraft.api_key_preview ? copy.modelApiKeyHint : copy.apiKeyOptionalHint}
                       onChange={(event) => setSearchDraft((current) => ({
                         ...current,
                         api_key: event.target.value,
@@ -4569,7 +4580,6 @@ function SettingsModal({
                       <input
                         value={onlineAsrDraft.custom_model}
                         onChange={(event) => updateOnlineAsrDraft({ custom_model: event.target.value })}
-                        placeholder="whisper-large-v3"
                       />
                     </label>
                   ) : null}
@@ -4594,7 +4604,6 @@ function SettingsModal({
                       onChange={(event) =>
                         updateOnlineAsrDraft(onlineAsrApiKeyUpdate(onlineAsrDraft.provider, event.target.value))
                       }
-                      placeholder={onlineAsrApiKeyPreview(onlineAsrDraft) ? copy.modelApiKeyHint : copy.apiKeyOptionalHint}
                     />
                     <small>
                       {onlineAsrDraft.provider === "custom" ? copy.onlineAsrCustomHelp : copy.onlineAsrPresetHelp}
@@ -4651,7 +4660,6 @@ function SettingsModal({
             autoComplete="off"
             value={selectedProfile?.api_key ?? ""}
             onChange={(event) => updateSelectedProfile({ api_key: event.target.value })}
-            placeholder={selectedProfile?.api_key_preview ? copy.modelApiKeyHint : copy.apiKeyOptionalHint}
           />
         </label>
         <label className="settings-field">
@@ -5746,16 +5754,6 @@ function onlineAsrApiKeyValue(draft: OnlineAsrDraft): string {
     groq: draft.groq_api_key,
     xai: draft.xai_api_key,
     custom: draft.custom_api_key,
-  }[draft.provider];
-}
-
-function onlineAsrApiKeyPreview(draft: OnlineAsrDraft): string | null {
-  return {
-    none: null,
-    openai: draft.openai_api_key_preview,
-    groq: draft.groq_api_key_preview,
-    xai: draft.xai_api_key_preview,
-    custom: draft.custom_api_key_preview,
   }[draft.provider];
 }
 

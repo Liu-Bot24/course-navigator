@@ -1,0 +1,20 @@
+[package]
+name = "course-navigator-launcher"
+version = "0.1.0"
+description = "Course Navigator Mac Launcher"
+authors = ["Course Navigator"]
+edition = "2021"
+
+[lib]
+name = "course_navigator_launcher_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["image-png", "tray-icon"] }
+thiserror = "2"
+open = "5"
