@@ -284,6 +284,39 @@ def test_anthropic_provider_base_url_adds_v1_for_official_endpoint(monkeypatch):
     assert captured["headers"]["anthropic-version"] == "2023-06-01"
 
 
+def test_anthropic_provider_base_url_adds_v1_for_anthropic_path_prefix(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "ok"}]}
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"] = url
+        return Response()
+
+    monkeypatch.setattr("course_navigator.ai.httpx.post", fake_post)
+
+    text = _chat_text(
+        LlmProvider(
+            base_url="https://token-plan-cn.xiaomimimo.com/anthropic",
+            api_key="sk-test",
+            model="mimo-v2.5-pro",
+            provider_type="anthropic",
+        ),
+        [{"role": "user", "content": "Health check"}],
+        temperature=0,
+        max_tokens=16,
+        timeout=30,
+    )
+
+    assert text == "ok"
+    assert captured["url"] == "https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages"
+
+
 def test_long_transcript_uses_role_specific_model_slots(monkeypatch):
     transcript = [
         TranscriptSegment(start=index * 2, end=index * 2 + 2, text=f"source line {index}")
@@ -420,6 +453,65 @@ def test_transcript_translation_repairs_source_echo_segments(monkeypatch):
         f"译文 this source sentence should become translated {index}"
         for index in range(5)
     ]
+
+
+def test_transcript_translation_repairs_malformed_model_json(monkeypatch):
+    calls = []
+
+    def fake_chat_text(provider, messages, **kwargs):
+        calls.append(messages[-1]["content"])
+        if "Malformed payload:" in messages[-1]["content"]:
+            return (
+                '{"translated_transcript":['
+                '{"start":0,"end":1,"text":"今天我们介绍 Imagen 2.0。"}'
+                "]} "
+            )
+        return '{"translated_transcript":[{"start":0,"end":1,"text":"今天我们介绍'
+
+    monkeypatch.setattr(ai, "_chat_text", fake_chat_text)
+
+    translated = ai._translate_chunk_with_provider(
+        title="This is ChatGPT Images 2.0",
+        chunk=[TranscriptSegment(start=0, end=1, text="Today, we are launching Imagen 2.0.")],
+        provider=LlmProvider(
+            base_url="https://example.test/anthropic",
+            api_key="sk-test",
+            model="mimo-v2.5-pro",
+            provider_type="anthropic",
+        ),
+        context_summary="The video introduces Imagen 2.0.",
+        output_language="zh-CN",
+    )
+
+    assert any("Malformed payload:" in call for call in calls)
+    assert translated == [TranscriptSegment(start=0, end=1, text="今天我们介绍 Imagen 2.0。")]
+
+
+def test_translation_context_repairs_malformed_model_json(monkeypatch):
+    calls = []
+
+    def fake_chat_text(provider, messages, **kwargs):
+        calls.append(messages[-1]["content"])
+        if "Malformed payload:" in messages[-1]["content"]:
+            return '{"summary":"这段课程介绍 ChatGPT Images 2.0 和 Imagen 2.0。"}'
+        return '{"summary":"这段课程介绍 ChatGPT Images'
+
+    monkeypatch.setattr(ai, "_chat_text", fake_chat_text)
+
+    summary = ai._generate_translation_context(
+        title="This is ChatGPT Images 2.0",
+        transcript=[TranscriptSegment(start=0, end=1, text="Today, we are launching Imagen 2.0.")],
+        provider=LlmProvider(
+            base_url="https://example.test/anthropic",
+            api_key="sk-test",
+            model="mimo-v2.5-pro",
+            provider_type="anthropic",
+        ),
+        output_language="zh-CN",
+    )
+
+    assert any("Malformed payload:" in call for call in calls)
+    assert summary == "这段课程介绍 ChatGPT Images 2.0 和 Imagen 2.0。"
 
 
 def test_transcript_translation_repairs_short_source_echo_segments():

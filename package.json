@@ -1,6 +1,6 @@
 {
   "name": "course-navigator",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -16,6 +16,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "launcher:dev": "npm --prefix launcher run tauri:dev",
     "launcher:build": "npm --prefix launcher run tauri:build",
+    "launcher:dmg": "npm --prefix launcher run dmg",
     "launcher:test": "npm --prefix launcher run test",
     "launcher:web": "npm --prefix launcher run dev",
     "launcher:build:web": "npm --prefix launcher run build"

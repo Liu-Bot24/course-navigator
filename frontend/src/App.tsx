@@ -245,7 +245,7 @@ const COPY = {
     extractAuth: "提取登录",
     cookieSource: "Cookie 来源",
     cookieFile: "Cookie 文件",
-    browserCookieHint: "chrome 或 chrome:Default",
+    browserCookieHint: "chrome、safari、firefox 或 chrome:Default",
     interfaceLanguage: "界面",
     outputLanguage: "输出",
     displayMode: "显示模式",
@@ -534,7 +534,7 @@ const COPY = {
     extractAuth: "Auth",
     cookieSource: "Cookie source",
     cookieFile: "Cookie file",
-    browserCookieHint: "chrome or chrome:Default",
+    browserCookieHint: "chrome, safari, firefox, or chrome:Default",
     interfaceLanguage: "Interface",
     outputLanguage: "Output",
     displayMode: "Display mode",
@@ -797,7 +797,7 @@ const COPY = {
 
 const DEFAULT_LAYOUT = {
   leftWidth: 270,
-  rightWidth: 600,
+  rightWidth: 500,
   playerHeight: 440,
 };
 const MIN_LEFT_WIDTH = 210;
@@ -1847,15 +1847,7 @@ export function App() {
     setSettingsBusy(true);
     setSettingsMessage(null);
     try {
-      const next = await saveModelSettings({
-        profiles: settingsDraft.profiles.map(modelProfileDraftToInput),
-        translation_model_id: settingsDraft.translation_model_id,
-        learning_model_id: settingsDraft.learning_model_id,
-        global_model_id: settingsDraft.global_model_id,
-        asr_model_id: settingsDraft.asr_model_id,
-        study_detail_level: settingsDraft.study_detail_level,
-        task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
-      });
+      const next = await saveModelSettings(settingsDraftToInput(settingsDraft));
       const nextOnlineAsr = await saveOnlineAsrSettings(onlineAsrDraftToInput(onlineAsrDraft));
       setModelSettings(next);
       setSettingsDraft(draftFromModelSettings(next, settingsDraft.active_profile_id));
@@ -1890,15 +1882,7 @@ export function App() {
     try {
       const source: ModelSettingsInput = modelSettings
         ? modelSettingsToInput(modelSettings)
-        : {
-            profiles: settingsDraft.profiles.map(modelProfileDraftToInput),
-            translation_model_id: settingsDraft.translation_model_id,
-            learning_model_id: settingsDraft.learning_model_id,
-            global_model_id: settingsDraft.global_model_id,
-            asr_model_id: settingsDraft.asr_model_id,
-            study_detail_level: settingsDraft.study_detail_level,
-            task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
-          };
+        : settingsDraftToInput(settingsDraft);
       const next = await saveModelSettings({ ...source, [role]: profileId });
       setModelSettings(next);
       setSettingsDraft((current) => ({
@@ -1928,15 +1912,7 @@ export function App() {
     try {
       const source: ModelSettingsInput = modelSettings
         ? modelSettingsToInput(modelSettings)
-        : {
-            profiles: settingsDraft.profiles.map(modelProfileDraftToInput),
-            translation_model_id: settingsDraft.translation_model_id,
-            learning_model_id: settingsDraft.learning_model_id,
-            global_model_id: settingsDraft.global_model_id,
-            asr_model_id: settingsDraft.asr_model_id,
-            study_detail_level: settingsDraft.study_detail_level,
-            task_parameters: taskParameterDraftsToInput(settingsDraft.task_parameters),
-          };
+        : settingsDraftToInput(settingsDraft);
       const next = await saveModelSettings({ ...source, asr_model_id: profileId });
       setModelSettings(next);
       setSettingsDraft(draftFromModelSettings(next, settingsDraft.active_profile_id));
@@ -4264,13 +4240,41 @@ function draftFromModelSettings(settings: ModelSettings, preferredActiveProfileI
 function modelProfileDraftToInput(profile: ModelProfileDraft): ModelProfileInput {
   return {
     id: profile.id,
-    name: profile.name,
+    name: profile.name.trim(),
     provider_type: profile.provider_type,
-    base_url: profile.base_url,
-    model: profile.model,
+    base_url: profile.base_url.trim(),
+    model: profile.model.trim(),
     context_window: parsePositiveIntegerInput(profile.context_window),
     max_tokens: parsePositiveIntegerInput(profile.max_tokens),
     api_key: secretInputValue(profile.api_key, profile.api_key_preview),
+  };
+}
+
+function modelProfileDraftsToInput(profiles: ModelProfileDraft[]): ModelProfileInput[] {
+  return profiles.filter((profile) => !isBlankModelProfileDraft(profile)).map(modelProfileDraftToInput);
+}
+
+function isBlankModelProfileDraft(profile: ModelProfileDraft): boolean {
+  return (
+    !profile.name.trim() &&
+    !profile.base_url.trim() &&
+    !profile.model.trim() &&
+    !profile.api_key.trim() &&
+    !profile.api_key_preview &&
+    !profile.context_window.trim() &&
+    !profile.max_tokens.trim()
+  );
+}
+
+function settingsDraftToInput(draft: SettingsDraft): ModelSettingsInput {
+  return {
+    profiles: modelProfileDraftsToInput(draft.profiles),
+    translation_model_id: draft.translation_model_id,
+    learning_model_id: draft.learning_model_id,
+    global_model_id: draft.global_model_id,
+    asr_model_id: draft.asr_model_id,
+    study_detail_level: draft.study_detail_level,
+    task_parameters: taskParameterDraftsToInput(draft.task_parameters),
   };
 }
 

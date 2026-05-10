@@ -1,6 +1,6 @@
 {
   "name": "course-navigator-launcher",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,8 +8,10 @@
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "tauri": "tauri",
+    "prepare:runtime": "bash ../scripts/prepare-mac-runtime-source.sh",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "npm run prepare:runtime && tauri build",
+    "dmg": "bash ../scripts/build-mac-dmg.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

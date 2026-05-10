@@ -350,7 +350,17 @@ def _chat_json(
         timeout=timeout,
         task_key=task_key,
     )
-    return _loads_json_content(content)
+    try:
+        return _loads_json_content(content)
+    except json.JSONDecodeError as exc:
+        return _repair_json_content(
+            provider,
+            messages,
+            content,
+            error=exc,
+            timeout=timeout,
+            task_key=task_key,
+        )
 
 
 def _chat_text(
@@ -450,7 +460,7 @@ def _anthropic_endpoint_url(base_url: str, endpoint: str) -> str:
         return base
     if base.endswith("/v1"):
         return f"{base}/{endpoint}"
-    if re.search(r"api\.anthropic\.com$", base) or re.search(r"api\.minimaxi\.com/anthropic$", base):
+    if re.search(r"api\.anthropic\.com$", base) or base.endswith("/anthropic"):
         return f"{base}/v1/{endpoint}"
     return f"{base}/{endpoint}"
 
@@ -2943,6 +2953,61 @@ def _loads_json_content(content: str) -> object:
     if fence_match:
         stripped = fence_match.group(1).strip()
     return json.loads(stripped)
+
+
+def _repair_json_content(
+    provider: LlmProvider,
+    original_messages: list[dict[str, str]],
+    content: str,
+    *,
+    error: json.JSONDecodeError,
+    timeout: float,
+    task_key: TaskParameterKey | None,
+) -> object:
+    instruction_reference = "\n\n".join(
+        f"{message['role'].upper()}:\n{message['content']}"
+        for message in original_messages
+    )
+    repaired = _chat_text(
+        provider,
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You repair malformed JSON for a video learning app. Return valid JSON only. "
+                    "Preserve the schema requested by the original instruction. Do not add explanations. "
+                    "Do not add new facts. If an array item is incomplete, discard that item."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"The JSON parser failed with: {error.msg} at line {error.lineno}, column {error.colno}.\n"
+                    "Repair the malformed payload so it satisfies the original instruction.\n\n"
+                    f"Original instruction:\n{_trim_for_json_repair(instruction_reference, 12000)}\n\n"
+                    f"Malformed payload:\n{_trim_for_json_repair(content)}"
+                ),
+            },
+        ],
+        temperature=0,
+        max_tokens=max(1000, min(max(provider.max_tokens or 5000, 3000), 8000)),
+        timeout=timeout,
+        task_key=task_key,
+    )
+    try:
+        return _loads_json_content(repaired)
+    except json.JSONDecodeError as repair_exc:
+        raise ValueError(
+            "模型返回了无法解析的 JSON，自动修复也失败；"
+            f"原始错误在 line {error.lineno}, column {error.colno}: {error.msg}; "
+            f"修复后错误在 line {repair_exc.lineno}, column {repair_exc.colno}: {repair_exc.msg}"
+        ) from repair_exc
+
+
+def _trim_for_json_repair(content: str, limit: int = 24000) -> str:
+    if len(content) <= limit:
+        return content
+    return f"{content[: limit // 2]}\n...truncated middle...\n{content[-limit // 2 :]}"
 
 
 def _normalize_time_range(payload: dict) -> dict:

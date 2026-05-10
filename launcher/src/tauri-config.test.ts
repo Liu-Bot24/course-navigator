@@ -18,7 +18,9 @@ type TauriConfig = {
     windows: TauriWindowConfig[];
   };
   bundle: {
+    category?: string;
     icon: string[];
+    resources?: Record<string, string>;
   };
 };
 
@@ -31,7 +33,14 @@ describe("Tauri app shell", () => {
 
   it("ships as Course Navigator with the product icon assets", () => {
     expect(config.productName).toBe("Course Navigator");
+    expect(config.bundle.category).toBe("Education");
     expect(config.bundle.icon).toEqual(["icons/icon.icns", "icons/icon.png"]);
+  });
+
+  it("bundles the runtime source needed by direct macOS distribution", () => {
+    expect(config.bundle.resources).toEqual({
+      "resources/runtime-source": "runtime-source",
+    });
   });
 
   it("uses a compact default main window that can fit the full launcher", () => {
@@ -58,6 +67,14 @@ describe("Tauri app shell", () => {
     expect(libSource).toContain('"打开网页"');
     expect(libSource).not.toContain('"打开工作台"');
     expect(libSource).not.toContain('MenuItem::with_id(app, "workspace"');
+  });
+
+  it("does not open the browser from the tray when service startup fails", async () => {
+    const libSource = await import("../src-tauri/src/lib.rs?raw").then((module) => module.default as string);
+
+    expect(libSource).toContain("let started = runtime::start_project_services");
+    expect(libSource).toContain("if started.is_ok() && config.open_browser_on_start");
+    expect(libSource).not.toContain("let _ = runtime::start_project_services(state.inner(), &config);");
   });
 
   it("keeps ASR correction under LLM models and online ASR as a direct ASR menu", async () => {

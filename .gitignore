@@ -20,4 +20,8 @@ data/
 downloads/
 .worktrees/
 launcher/src-tauri/gen/
+launcher/src-tauri/resources/runtime-source/**
+!launcher/src-tauri/resources/runtime-source/
+launcher/src-tauri/resources/runtime-source/.env.example
+!launcher/src-tauri/resources/runtime-source/.gitkeep
 launcher/src-tauri/target/

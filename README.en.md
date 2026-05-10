@@ -14,33 +14,19 @@ It is built for learners, researchers, and course-heavy teams who need to unders
 
 ## Highlights
 
-- Build a course library with collections, lesson titles, ordering, local video imports, and video cache management.
-- Import and export lightweight course packages for organized courses, corrected subtitles, translated subtitles, and AI study material.
-- Extract platform subtitles with `yt-dlp`, or use local ASR, online ASR, or local subtitle upload.
-- Manage course records, AI study material, and local video files in a dedicated workspace; runtime extraction files and settings stay in the local runtime directory.
-- Online ASR supports xAI, OpenAI Whisper, Groq Whisper, and custom compatible endpoints.
-- Use direct access, browser login, or cookies files for videos that require authentication.
-- Watch with linked transcript navigation, bilingual subtitle views, and timestamp jumps.
-- Generate a guide, outline, interpretation, and detailed notes in standard or high-fidelity detail.
-- Use beginner and advanced learning suggestions to decide what to focus on, skim, or revisit.
-- Translate subtitles and titles.
-- Review ASR subtitles in a dedicated workbench with before/after views, hover reasons, confidence scores, accept/reject controls, threshold acceptance, and auto-save.
-- Add reference terms, names, product names, and common recognition errors before ASR correction.
-- Optionally validate ASR correction candidates with Tavily or Firecrawl.
-- Use one shared model profile library for translation, study generation, and ASR correction, with OpenAI-compatible and Anthropic formats.
-
-## What's New
-
-- Study maps: add standard and high-fidelity detail modes, plus beginner and advanced guide suggestions for focus, skimming, and review.
-- Local video and workspace: import local videos from the top toolbar, keep course material in the workspace, and delete imported video files with their course.
-- Subtitle sources and ASR: support local subtitle upload, online ASR, local ASR progress, and Simplified Chinese normalization. Online ASR supports xAI, OpenAI Whisper, Groq Whisper, and custom endpoints.
-- Course package sharing: export single courses or full collections with corrected subtitles, translated subtitles, AI study material, notes, collection names, and lesson order.
-- ASR correction: use search validation, keyboard suggestion navigation, Enter-to-accept, hover reason cards, confidence sorting, threshold acceptance, and auto-save after accepting suggestions.
-- Library refinements: collection ordering and deletion are supported, and deleting a course also cleans up related local cache files.
+- Course library and workspace: organize lessons into collections, edit titles and order, import local videos, cache online videos, and keep course records, AI study material, and local video files in one workspace.
+- Course package sharing: import or export single lessons and full collections with corrected subtitles, translated subtitles, AI study material, notes, collection names, and lesson order.
+- Subtitle acquisition: extract platform subtitles with `yt-dlp`, or use local upload, local ASR, online ASR, source-first fallback, and Simplified Chinese normalization.
+- Video access: use direct access for public videos, or reuse browser login and cookies files for sites that require authentication.
+- Playback and review: link video playback with transcripts, jump by timestamp, use bilingual subtitle views, navigate timestamps, and translate subtitles and titles.
+- AI study maps: generate a guide, outline, interpretation, and detailed notes with standard or high-fidelity detail, plus beginner and advanced learning suggestions.
+- ASR correction workbench: use reference terms, targeted AI suggestions, before/after comparison, hover reasons, confidence sorting, threshold acceptance, and auto-save.
+- Search validation: optionally validate ASR correction candidates with Tavily, hosted Firecrawl, or self-hosted Firecrawl.
+- Model profiles: share one model profile library across translation, study generation, and ASR correction, with OpenAI-compatible and Anthropic formats.
 
 ## Requirements
 
-- Node.js 20 or newer, with npm.
+- Node.js 20.19+ on the Node 20 line, or Node.js 22.12+ on Node 22 and newer, with npm.
 - Python 3.11 or newer.
 - `uv` for Python dependency management.
 - `ffmpeg`, optional at startup but required for local video cache, audio extraction, and media conversion.
@@ -78,6 +64,23 @@ http://127.0.0.1:5173
 ```
 
 Press `Ctrl+C` in the terminal to stop both services.
+
+## macOS Local Install
+
+The current macOS installer and Homebrew Cask support Apple Silicon Macs. Intel Mac builds are not provided yet.
+
+If you have Homebrew installed, you can install the app from the GitHub release:
+
+```bash
+brew tap liu-bot24/course-navigator https://github.com/Liu-Bot24/course-navigator
+brew install --cask liu-bot24/course-navigator/course-navigator
+```
+
+You can also download the macOS installer, open the DMG, drag `Course Navigator.app` to `Applications`, and launch it from there.
+
+For an unnotarized build, macOS may require `System Settings` → `Privacy & Security` → `Open Anyway` on first launch. Once you confirm the installer source and approve it, the app opens normally.
+
+See [macOS Local Install](docs/mac-install.en.md) for the full install steps.
 
 ## AI Setup
 
@@ -154,6 +157,15 @@ Course Navigator supports three extraction modes:
 
 Supported sites, subtitle languages, and automatic captions depend on `yt-dlp` and the source platform.
 
+`Browser login` uses `chrome` by default; an empty `Cookie source` is also treated as `chrome`. To choose a specific source, use:
+
+| Cookie source | What it uses |
+| --- | --- |
+| `chrome` | The default Chrome profile, also the initial value |
+| `chrome:Default`, `chrome:Profile 1` | A specific Chrome profile |
+| `safari`, `firefox` | Safari or Firefox login state |
+| `brave`, `chromium`, `edge`, `opera`, `vivaldi`, `whale` | Other currently supported browsers |
+
 ## Subtitle Sources
 
 | Source | Use when |
@@ -162,6 +174,10 @@ Supported sites, subtitle languages, and automatic captions depend on `yt-dlp` a
 | Local ASR | Generate timestamped subtitles on your machine |
 | Online ASR | Generate timestamped subtitles with a configured online speech-to-text service |
 | Local upload | Upload an existing TXT, MD, SRT, VTT, or similar subtitle text file |
+
+Tip: platforms such as Bilibili may require a logged-in session before platform subtitles can be read. If source subtitles fail to load or keep waiting, sign in to the site in Chrome, Safari, Firefox, or another supported browser first, then return to Course Navigator and set video access to `Browser login`; use `Cookies file` if needed.
+
+Tip: embedded players such as YouTube iframes may inherit subtitle or translation overlays injected by browser extensions, including Immersive Translate or automatic caption translators. If Course Navigator shows two caption layers or double translation, open the video on YouTube, disable that extension's automatic translation or caption enhancement for the site, then refresh the Course Navigator player.
 
 ## Course Management
 
@@ -220,7 +236,7 @@ npm run dev
 
 ## Privacy And Data
 
-Course Navigator stores course records, generated study material, imported videos, and local video caches in your course workspace. Subtitle extraction files, ASR work files, and local settings are kept in the local runtime data directory. The first time the new workspace is used, Course Navigator copies course records and local video caches from the old data directory into the workspace.
+Course Navigator stores course records, generated study material, imported videos, and local video caches in your course workspace. Subtitle extraction files, ASR work files, and local settings are kept in the local runtime data directory. When upgrading to workspace storage, Course Navigator keeps existing course material and migrates it to the new material location.
 
 When you use AI translation, study generation, or ASR correction, the relevant transcript text and context are sent to the model provider you configured. When search-assisted ASR correction is enabled, search queries are sent to the search provider you configured. Keep API keys on your own machine and use providers you trust.
 

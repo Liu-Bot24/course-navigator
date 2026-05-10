@@ -218,6 +218,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(ActivationPolicy::Regular);
 
+            config::prepare_bundled_runtime(app.handle()).map_err(std::io::Error::other)?;
             let menu = build_tray_menu(app.handle())?;
             let tray_icon = template_tray_icon();
             configure_main_window(app.handle());
@@ -237,8 +238,8 @@ pub fn run() {
                     "start" => {
                         let config = config::load_config();
                         if let Some(state) = app.try_state::<runtime::ServiceState>() {
-                            let _ = runtime::start_project_services(state.inner(), &config);
-                            if config.open_browser_on_start {
+                            let started = runtime::start_project_services(state.inner(), &config);
+                            if started.is_ok() && config.open_browser_on_start {
                                 let _ = open::that(format!(
                                     "http://{}:{}",
                                     config.web_host, config.web_port

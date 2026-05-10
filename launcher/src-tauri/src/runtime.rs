@@ -1,5 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -14,6 +18,7 @@ const LAUNCHCTL_PATH: &str = "/bin/launchctl";
 const LSOF_PATH: &str = "/usr/sbin/lsof";
 const LOGIN_SHELL_PATH: &str = "/bin/zsh";
 const PS_PATH: &str = "/bin/ps";
+const DEPENDENCY_MARKER_FILE: &str = ".course-navigator-deps.json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCommand {
@@ -59,8 +64,7 @@ impl ServiceState {
 }
 
 pub fn configured_services_listening(config: &LauncherConfig) -> bool {
-    endpoint_listening(&config.api_host, config.api_port)
-        && endpoint_listening(&config.web_host, config.web_port)
+    course_api_ready(config) && course_web_ready(config)
 }
 
 pub fn any_configured_service_listening(config: &LauncherConfig) -> bool {
@@ -96,20 +100,35 @@ pub fn web_command(config: &LauncherConfig) -> RuntimeCommand {
 }
 
 pub fn check_dependencies() -> Vec<DependencyStatus> {
-    [
-        ("node", "运行前端开发服务"),
-        ("npm", "安装和启动前端依赖"),
-        ("uv", "安装和启动 Python 后端"),
-        ("ffmpeg", "本地视频缓存、音频提取和媒体转换"),
-        ("yt-dlp", "在线课程字幕提取和视频缓存"),
+    vec![
+        DependencyStatus {
+            name: "node".into(),
+            available: command_exists("node")
+                && node_version().is_some_and(|version| node_version_supported(&version)),
+            purpose: "运行前端服务，需要 Node.js 20.19+（20 系列）或 22.12+（22 及更新版本）"
+                .into(),
+        },
+        DependencyStatus {
+            name: "npm".into(),
+            available: command_exists("npm"),
+            purpose: "安装和启动前端依赖".into(),
+        },
+        DependencyStatus {
+            name: "uv".into(),
+            available: command_exists("uv"),
+            purpose: "安装和启动 Python 后端".into(),
+        },
+        DependencyStatus {
+            name: "ffmpeg".into(),
+            available: command_exists("ffmpeg"),
+            purpose: "本地视频缓存、音频提取和媒体转换；不使用这些功能时可稍后安装".into(),
+        },
+        DependencyStatus {
+            name: "yt-dlp".into(),
+            available: command_exists("yt-dlp") || command_exists("uv"),
+            purpose: "在线课程字幕提取和视频缓存；会随 Python 依赖安装".into(),
+        },
     ]
-    .into_iter()
-    .map(|(name, purpose)| DependencyStatus {
-        name: name.into(),
-        available: command_exists(name),
-        purpose: purpose.into(),
-    })
-    .collect()
 }
 
 pub fn start_project_services(state: &ServiceState, config: &LauncherConfig) -> Result<(), String> {
@@ -134,6 +153,7 @@ pub fn start_project_services(state: &ServiceState, config: &LauncherConfig) -> 
             "检测到 API 或网页端口已被占用，但服务不完整；请先停止旧服务或换端口。".to_string(),
         );
     }
+    ensure_project_dependencies(project_root)?;
 
     let api = api_command(config);
     let web = web_command(config);
@@ -236,7 +256,8 @@ fn stop_configured_listeners(config: &LauncherConfig, signal: StopSignal) -> Res
         }
         for pid in listening_pids(port) {
             let command = process_command(pid);
-            if is_project_service_command(&command, config, port) {
+            let cwd = process_cwd(pid);
+            if is_project_service_command_with_cwd(&command, cwd.as_deref(), config, port) {
                 if let Some(pgid) = process_group_id(pid) {
                     insert_service_group(&mut groups, pgid, current_pgid);
                 } else {
@@ -405,6 +426,22 @@ fn process_command(pid: u32) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn process_cwd(pid: u32) -> Option<String> {
+    let output = Command::new(LSOF_PATH)
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_lsof_cwd(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_lsof_cwd(raw: &str) -> Option<String> {
+    raw.lines()
+        .find_map(|line| line.strip_prefix('n').map(str::to_string))
+}
+
 fn process_group_id(pid: u32) -> Option<u32> {
     let output = Command::new(PS_PATH)
         .args(["-p", &pid.to_string(), "-o", "pgid="])
@@ -416,7 +453,15 @@ fn process_group_id(pid: u32) -> Option<u32> {
         .ok()
 }
 
-fn is_project_service_command(command: &str, config: &LauncherConfig, port: u16) -> bool {
+fn is_project_service_command_with_cwd(
+    command: &str,
+    cwd: Option<&str>,
+    config: &LauncherConfig,
+    port: u16,
+) -> bool {
+    if !matches_project_root(command, cwd, config) {
+        return false;
+    }
     if port == config.api_port
         && command.contains("course_navigator.app:app")
         && command_contains_port(command, port)
@@ -426,6 +471,21 @@ fn is_project_service_command(command: &str, config: &LauncherConfig, port: u16)
     port == config.web_port
         && (command.contains("vite") || command.contains("npm run dev"))
         && command_contains_port(command, port)
+}
+
+fn matches_project_root(command: &str, cwd: Option<&str>, config: &LauncherConfig) -> bool {
+    let root = config.project_root.trim();
+    if root.is_empty() {
+        return false;
+    }
+    if command.contains(root) {
+        return true;
+    }
+    let root_path = Path::new(root);
+    cwd.is_some_and(|cwd| {
+        let cwd_path = Path::new(cwd);
+        cwd_path == root_path || cwd_path.starts_with(root_path)
+    })
 }
 
 fn command_contains_port(command: &str, port: u16) -> bool {
@@ -468,6 +528,173 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn ensure_project_dependencies(project_root: &Path) -> Result<(), String> {
+    let missing_commands = ["node", "npm", "uv"]
+        .into_iter()
+        .filter(|name| !command_exists(name))
+        .collect::<Vec<_>>();
+    if !missing_commands.is_empty() {
+        return Err(format!(
+            "缺少运行依赖: {}。请安装后再启动。",
+            missing_commands.join(", ")
+        ));
+    }
+    ensure_supported_node_version()?;
+
+    for command in project_setup_commands(project_root) {
+        run_setup_command(project_root, &command)?;
+    }
+    write_dependency_marker(project_root)?;
+    Ok(())
+}
+
+fn project_setup_commands(project_root: &Path) -> Vec<RuntimeCommand> {
+    let mut commands = Vec::new();
+    let python_fingerprint = dependency_fingerprint(project_root, &["pyproject.toml", "uv.lock"]);
+    let node_fingerprint =
+        dependency_fingerprint(project_root, &["package.json", "package-lock.json"]);
+    if !project_root.join(".venv").exists()
+        || !dependency_marker_matches(project_root, "python", &python_fingerprint)
+    {
+        commands.push(RuntimeCommand {
+            program: LOGIN_SHELL_PATH.into(),
+            args: vec!["-lic".into(), "uv sync".into()],
+        });
+    }
+    if !project_root.join("node_modules").exists()
+        || !dependency_marker_matches(project_root, "node", &node_fingerprint)
+    {
+        commands.push(RuntimeCommand {
+            program: LOGIN_SHELL_PATH.into(),
+            args: vec![
+                "-lic".into(),
+                "if [ -f package-lock.json ]; then npm ci; else npm install; fi".into(),
+            ],
+        });
+    }
+    commands
+}
+
+fn ensure_supported_node_version() -> Result<(), String> {
+    let Some(version) = node_version() else {
+        return Err(
+            "无法读取 Node.js 版本。请安装 Node.js 20.19+（20 系列）或 22.12+（22 及更新版本）。"
+                .into(),
+        );
+    };
+    if node_version_supported(&version) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Node.js 版本过低: {version}。请安装 Node.js 20.19+（20 系列）或 22.12+（22 及更新版本）。"
+        ))
+    }
+}
+
+fn node_version() -> Option<String> {
+    let output = Command::new(LOGIN_SHELL_PATH)
+        .args(["-lic", "node -p \"process.versions.node\""])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+fn node_version_supported(version: &str) -> bool {
+    let parts = version
+        .trim_start_matches('v')
+        .split('.')
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    let [major, minor, ..] = parts.as_slice() else {
+        return false;
+    };
+    (*major == 20 && *minor >= 19) || (*major == 22 && *minor >= 12) || *major > 22
+}
+
+fn dependency_marker_matches(project_root: &Path, key: &str, fingerprint: &str) -> bool {
+    let Ok(raw) = fs::read_to_string(project_root.join(DEPENDENCY_MARKER_FILE)) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .is_some_and(|stored| stored == fingerprint)
+}
+
+fn write_dependency_marker(project_root: &Path) -> Result<(), String> {
+    let marker = serde_json::json!({
+        "python": dependency_fingerprint(project_root, &["pyproject.toml", "uv.lock"]),
+        "node": dependency_fingerprint(project_root, &["package.json", "package-lock.json"]),
+    });
+    let raw = serde_json::to_string_pretty(&marker)
+        .map_err(|error| format!("无法序列化依赖状态: {error}"))?;
+    fs::write(
+        project_root.join(DEPENDENCY_MARKER_FILE),
+        format!("{raw}\n"),
+    )
+    .map_err(|error| format!("无法写入依赖状态: {error}"))
+}
+
+fn dependency_fingerprint(project_root: &Path, files: &[&str]) -> String {
+    let mut hasher = DefaultHasher::new();
+    for file in files {
+        file.hash(&mut hasher);
+        match fs::read(project_root.join(file)) {
+            Ok(bytes) => bytes.hash(&mut hasher),
+            Err(_) => "missing".hash(&mut hasher),
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn run_setup_command(project_root: &Path, command: &RuntimeCommand) -> Result<(), String> {
+    let output = Command::new(&command.program)
+        .args(&command.args)
+        .current_dir(project_root)
+        .output()
+        .map_err(|error| format!("准备运行依赖失败: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!(
+        "准备运行依赖失败: {}",
+        command_failure_summary(&stderr, &stdout)
+    ))
+}
+
+fn command_failure_summary(stderr: &str, stdout: &str) -> String {
+    let summary = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if summary.is_empty() {
+        "命令没有返回错误详情".to_string()
+    } else {
+        summary
+    }
+}
+
 fn service_command(program: &str) -> Command {
     let mut command = Command::new(program);
     set_service_process_group(&mut command);
@@ -495,6 +722,36 @@ pub fn endpoint_listening(host: &str, port: u16) -> bool {
     addresses
         .into_iter()
         .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok())
+}
+
+fn course_api_ready(config: &LauncherConfig) -> bool {
+    http_get(&config.api_host, config.api_port, "/api/health").is_some_and(|response| {
+        http_response_ok(&response)
+            && (response.contains("\"name\":\"Course Navigator\"")
+                || response.contains("\"name\": \"Course Navigator\""))
+    })
+}
+
+fn course_web_ready(config: &LauncherConfig) -> bool {
+    http_get(&config.web_host, config.web_port, "/").is_some_and(|response| {
+        http_response_ok(&response) && response.contains("<title>Course Navigator</title>")
+    })
+}
+
+fn http_response_ok(response: &str) -> bool {
+    response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
+}
+
+fn http_get(host: &str, port: u16, path: &str) -> Option<String> {
+    let address = (host, port).to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(220)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    Some(response)
 }
 
 #[cfg(test)]
@@ -560,42 +817,104 @@ mod tests {
         let command =
             "/repo/.venv/bin/python /repo/.venv/bin/uvicorn course_navigator.app:app --port 8100";
 
-        assert!(is_project_service_command(command, &config(), 8100));
+        assert!(is_project_service_command_with_cwd(
+            command,
+            None,
+            &config(),
+            8100
+        ));
     }
 
     #[test]
     fn project_service_command_matches_configured_vite_port() {
         let command = "node /repo/node_modules/.bin/vite --host 127.0.0.1 --port 5188";
 
-        assert!(is_project_service_command(command, &config(), 5188));
+        assert!(is_project_service_command_with_cwd(
+            command,
+            None,
+            &config(),
+            5188
+        ));
     }
 
     #[test]
     fn project_service_command_matches_npm_dev_parent() {
         let command = "npm run dev --port 5188 --host 127.0.0.1";
 
-        assert!(is_project_service_command(command, &config(), 5188));
+        assert!(is_project_service_command_with_cwd(
+            command,
+            Some("/repo"),
+            &config(),
+            5188
+        ));
     }
 
     #[test]
     fn project_service_command_matches_uvicorn_parent() {
         let command = "uv run uvicorn course_navigator.app:app --app-dir backend --host 127.0.0.1 --port 8100";
 
-        assert!(is_project_service_command(command, &config(), 8100));
+        assert!(is_project_service_command_with_cwd(
+            command,
+            Some("/repo"),
+            &config(),
+            8100
+        ));
     }
 
     #[test]
     fn project_service_command_rejects_unrelated_port_owner() {
         let command = "/usr/bin/python -m http.server 8100";
 
-        assert!(!is_project_service_command(command, &config(), 8100));
+        assert!(!is_project_service_command_with_cwd(
+            command,
+            Some("/repo"),
+            &config(),
+            8100
+        ));
     }
 
     #[test]
     fn project_service_command_rejects_unrelated_project_root_listener() {
         let command = "/repo/.venv/bin/python -m http.server 8100";
 
-        assert!(!is_project_service_command(command, &config(), 8100));
+        assert!(!is_project_service_command_with_cwd(
+            command,
+            None,
+            &config(),
+            8100
+        ));
+    }
+
+    #[test]
+    fn project_service_command_rejects_matching_vite_port_from_other_project() {
+        let command = "npm run dev --port 5188 --host 127.0.0.1";
+
+        assert!(!is_project_service_command_with_cwd(
+            command,
+            Some("/other-project"),
+            &config(),
+            5188
+        ));
+    }
+
+    #[test]
+    fn lsof_cwd_parser_extracts_name_line() {
+        let raw = "p12345\nn/Users/example/Course Navigator\n";
+
+        assert_eq!(
+            parse_lsof_cwd(raw),
+            Some("/Users/example/Course Navigator".to_string())
+        );
+    }
+
+    #[test]
+    fn node_version_gate_matches_vite_requirement() {
+        assert!(!node_version_supported("20.18.1"));
+        assert!(node_version_supported("20.19.0"));
+        assert!(!node_version_supported("21.7.0"));
+        assert!(!node_version_supported("22.11.0"));
+        assert!(node_version_supported("22.12.0"));
+        assert!(node_version_supported("23.0.0"));
     }
 
     #[test]
@@ -703,5 +1022,81 @@ mod tests {
                 "course-navigator-api-1777838763".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn project_setup_commands_install_missing_python_and_node_dependencies() {
+        let root = temp_project_dir("setup-missing");
+        std::fs::write(root.join("package-lock.json"), "{}").expect("package lock");
+
+        let commands = project_setup_commands(&root);
+
+        assert_eq!(
+            commands,
+            vec![
+                RuntimeCommand {
+                    program: LOGIN_SHELL_PATH.into(),
+                    args: vec!["-lic".into(), "uv sync".into()],
+                },
+                RuntimeCommand {
+                    program: LOGIN_SHELL_PATH.into(),
+                    args: vec![
+                        "-lic".into(),
+                        "if [ -f package-lock.json ]; then npm ci; else npm install; fi".into()
+                    ],
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_setup_commands_skip_existing_dependency_directories() {
+        let root = temp_project_dir("setup-ready");
+        std::fs::create_dir_all(root.join(".venv")).expect("venv");
+        std::fs::create_dir_all(root.join("node_modules")).expect("node modules");
+        std::fs::write(root.join("pyproject.toml"), "[project]\n").expect("pyproject");
+        std::fs::write(root.join("uv.lock"), "uv").expect("uv lock");
+        std::fs::write(root.join("package.json"), "{}").expect("package");
+        std::fs::write(root.join("package-lock.json"), "{}").expect("package lock");
+        write_dependency_marker(&root).expect("marker");
+
+        assert!(project_setup_commands(&root).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_setup_commands_rerun_when_lockfiles_change() {
+        let root = temp_project_dir("setup-stale");
+        std::fs::create_dir_all(root.join(".venv")).expect("venv");
+        std::fs::create_dir_all(root.join("node_modules")).expect("node modules");
+        std::fs::write(root.join("pyproject.toml"), "[project]\n").expect("pyproject");
+        std::fs::write(root.join("uv.lock"), "uv-v1").expect("uv lock");
+        std::fs::write(root.join("package.json"), "{}").expect("package");
+        std::fs::write(root.join("package-lock.json"), "{\"version\":1}").expect("package lock");
+        write_dependency_marker(&root).expect("marker");
+
+        std::fs::write(root.join("uv.lock"), "uv-v2").expect("update uv lock");
+        std::fs::write(root.join("package-lock.json"), "{\"version\":2}")
+            .expect("update package lock");
+
+        let commands = project_setup_commands(&root);
+
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].args.iter().any(|arg| arg == "uv sync"));
+        assert!(commands[1].args.iter().any(|arg| arg.contains("npm ci")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn temp_project_dir(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "course-navigator-runtime-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp project");
+        root
     }
 }

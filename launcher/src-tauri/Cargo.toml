@@ -1,6 +1,6 @@
 [package]
 name = "course-navigator-launcher"
-version = "0.1.0"
+version = "0.1.2"
 description = "Course Navigator Mac Launcher"
 authors = ["Course Navigator"]
 edition = "2021"

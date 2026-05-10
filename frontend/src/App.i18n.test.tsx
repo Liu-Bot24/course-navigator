@@ -136,6 +136,17 @@ describe("App language defaults", () => {
     expect(screen.queryByPlaceholderText("en")).toBeNull();
   });
 
+  it("uses a compact default study rail width", async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "翻译字幕" })).toBeTruthy();
+    });
+
+    const workspace = document.querySelector(".workspace") as HTMLElement;
+    expect(workspace.style.getPropertyValue("--right-rail-width")).toBe("500px");
+  });
+
   it("shows app captions on YouTube embeds without adding a native caption shield", async () => {
     vi.mocked(listItems).mockResolvedValueOnce([
       {
@@ -993,6 +1004,52 @@ describe("App language defaults", () => {
     });
 
     expect(baseUrl.placeholder).toBe("https://api.anthropic.com/v1");
+  });
+
+  it("ignores untouched blank model profile drafts when saving settings", async () => {
+    vi.mocked(saveModelSettings).mockImplementationOnce(async (input) => ({
+      profiles: input.profiles.map((profile) => ({
+        id: profile.id,
+        name: profile.name,
+        provider_type: profile.provider_type,
+        base_url: profile.base_url,
+        model: profile.model,
+        context_window: profile.context_window,
+        max_tokens: profile.max_tokens,
+        has_api_key: Boolean(profile.api_key),
+        api_key_preview: profile.api_key ? "sk...test" : null,
+      })),
+      translation_model_id: input.translation_model_id,
+      learning_model_id: input.learning_model_id,
+      global_model_id: input.global_model_id,
+      asr_model_id: input.asr_model_id,
+      study_detail_level: input.study_detail_level,
+      task_parameters: input.task_parameters,
+    }));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "模型设置" })).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "模型设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "新增档案" }));
+    fireEvent.change(screen.getByLabelText("正在编辑"), { target: { value: "default" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存档案" }));
+
+    await waitFor(() => {
+      expect(saveModelSettings).toHaveBeenCalledTimes(1);
+    });
+    const payload = vi.mocked(saveModelSettings).mock.calls[0][0];
+    expect(payload.profiles).toHaveLength(1);
+    expect(payload.profiles).toEqual([
+      expect.objectContaining({
+        id: "default",
+        base_url: "https://api.primary.example/v1",
+        model: "provider/primary-chat",
+      }),
+    ]);
   });
 
   it("treats provider format as a profile option and allows decimal temperature input", async () => {

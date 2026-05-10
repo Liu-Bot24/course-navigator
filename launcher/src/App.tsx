@@ -148,7 +148,11 @@ export function App() {
 
   async function handleStart() {
     setNotice(null);
-    setStatus((current) => ({ ...current, state: "starting", message: "正在启动或复用本地服务..." }));
+    setStatus((current) => ({
+      ...current,
+      state: "starting",
+      message: "正在准备本地运行环境并启动服务，首次启动可能需要几分钟...",
+    }));
     const nextStatus = await startServices();
     setStatus(nextStatus);
   }
@@ -596,16 +600,19 @@ function ModelArchiveDialog({
 
   async function saveLlmArchive() {
     setLocalError(null);
-    if (!llmDraft.profiles.length) {
+    const profilesToSave = llmDraft.profiles.filter((profile) => !isBlankLlmProfileDraft(profile));
+    if (!profilesToSave.length) {
       setLocalError("至少需要一个 LLM 模型档案。");
       return;
     }
-    if (llmDraft.profiles.some((profile) => !profile.baseUrl.trim() || !profile.model.trim())) {
-      setLocalError("LLM 档案需要接口地址和模型名称。");
+    const incompleteProfile = profilesToSave.find((profile) => !profile.baseUrl.trim() || !profile.model.trim());
+    if (incompleteProfile) {
+      setLlmDraft((current) => ({ ...current, activeProfileId: incompleteProfile.id }));
+      setLocalError(`${profileLabel(incompleteProfile)} 需要接口地址和模型名称。`);
       return;
     }
     const input = modelConfigToInput(modelConfig);
-    input.profiles = llmDraft.profiles.map((profile) => ({
+    input.profiles = profilesToSave.map((profile) => ({
       id: profile.id,
       name: profile.name.trim() || modelLabelFromName(profile.model),
       providerType: profile.providerType,
@@ -1063,6 +1070,18 @@ function profileLabel(profile: Pick<ModelConfig["profiles"][number], "name" | "m
   return profile.name.trim() || (profile.model.trim() ? modelLabelFromName(profile.model) : "未命名档案");
 }
 
+function isBlankLlmProfileDraft(profile: LlmProfileDraft): boolean {
+  return (
+    !profile.name.trim() &&
+    !profile.baseUrl.trim() &&
+    !profile.model.trim() &&
+    !profile.apiKey.trim() &&
+    !profile.apiKeyPreview &&
+    profile.contextWindow == null &&
+    profile.maxTokens == null
+  );
+}
+
 function modelLabelFromName(model: string) {
   return model.split("/").pop()?.replace(/[-_]/g, " ").trim() || "未命名模型";
 }
@@ -1133,5 +1152,5 @@ function onlineAsrDraftWithKey(
 }
 
 function providerBaseUrlPlaceholder(providerType: ModelProviderType) {
-  return providerType === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
+  return providerType === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1";
 }

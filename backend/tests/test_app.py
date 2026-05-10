@@ -1579,6 +1579,37 @@ def test_model_list_endpoint_adds_v1_for_anthropic_base(tmp_path, monkeypatch):
     assert captured["headers"]["anthropic-version"] == "2023-06-01"
 
 
+def test_model_list_endpoint_adds_v1_for_anthropic_path_prefix(tmp_path, monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "mimo-v2.5-pro"}]}
+
+    def fake_get(url, headers, timeout):
+        captured["url"] = url
+        return Response()
+
+    monkeypatch.setattr("course_navigator.app.httpx.get", fake_get)
+    client = make_client(tmp_path)
+
+    response = client.post(
+        "/api/settings/models",
+        json={
+            "provider_type": "anthropic",
+            "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic",
+            "api_key": "sk-request",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["models"] == ["mimo-v2.5-pro"]
+    assert captured["url"] == "https://token-plan-cn.xiaomimimo.com/anthropic/v1/models"
+
+
 def test_download_route_updates_local_video_path(tmp_path):
     client = make_client(tmp_path)
     client.post(

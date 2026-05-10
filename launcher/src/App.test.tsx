@@ -185,6 +185,7 @@ describe("App", () => {
     expect(screen.getByLabelText("模型").getAttribute("placeholder")).toBeNull();
     expect(screen.getByLabelText("API Key").getAttribute("placeholder")).toBeNull();
     fireEvent.change(screen.getByLabelText("接口格式"), { target: { value: "anthropic" } });
+    expect(screen.getByLabelText("接口地址").getAttribute("placeholder")).toBe("https://api.anthropic.com/v1");
     expect(screen.getByLabelText("模型").getAttribute("placeholder")).toBeNull();
     fireEvent.change(screen.getByLabelText("接口格式"), { target: { value: "openai" } });
     fireEvent.change(screen.getByLabelText("档案名称"), { target: { value: "New Profile" } });
@@ -204,6 +205,27 @@ describe("App", () => {
         }),
       ]),
     );
+  });
+
+  it("ignores untouched blank LLM profile drafts when saving a filled profile", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "模型档案" }));
+    fireEvent.click(screen.getByRole("button", { name: "新增档案" }));
+    fireEvent.change(screen.getByLabelText("正在编辑"), { target: { value: "default" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存档案" }));
+
+    await waitFor(() => expect(apiMocks.saveModelConfig).toHaveBeenCalledTimes(1));
+    expect(apiMocks.saveModelConfig.mock.calls[0][0].profiles).toHaveLength(2);
+    expect(apiMocks.saveModelConfig.mock.calls[0][0].profiles).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          baseUrl: "",
+          model: "",
+        }),
+      ]),
+    );
+    expect(screen.queryByText("LLM 档案需要接口地址和模型名称。")).toBeNull();
   });
 
   it("edits only the selected online ASR provider in the archive", async () => {
