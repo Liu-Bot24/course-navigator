@@ -28,9 +28,16 @@ brew tap liu-bot24/course-navigator https://github.com/Liu-Bot24/course-navigato
 brew install --cask liu-bot24/course-navigator/course-navigator
 ```
 
+通过 Homebrew 安装后，后续升级可以先退出 Course Navigator，再运行：
+
+```bash
+brew update
+brew upgrade --cask liu-bot24/course-navigator/course-navigator
+```
+
 也可以手动安装：
 
-1. 打开 `Course Navigator-<version>-macos-arm64.dmg`。
+1. 打开 `Course.Navigator-<version>-macos-arm64.dmg`。
 2. 将 `Course Navigator.app` 拖到 `Applications`。
 3. 从 `Applications` 打开 Course Navigator。
 

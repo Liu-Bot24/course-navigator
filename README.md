@@ -76,6 +76,13 @@ brew tap liu-bot24/course-navigator https://github.com/Liu-Bot24/course-navigato
 brew install --cask liu-bot24/course-navigator/course-navigator
 ```
 
+以后通过 Homebrew 升级：
+
+```bash
+brew update
+brew upgrade --cask liu-bot24/course-navigator/course-navigator
+```
+
 也可以下载 macOS 安装包，打开 DMG 后将 `Course Navigator.app` 拖到 `Applications`，再从应用程序中启动。
 
 未公证版本首次打开时，macOS 可能需要你在 `系统设置` → `隐私与安全性` 中选择 `仍要打开`。确认安装包来源可信后，通过一次即可正常使用。

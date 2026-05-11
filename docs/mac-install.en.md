@@ -28,9 +28,16 @@ brew tap liu-bot24/course-navigator https://github.com/Liu-Bot24/course-navigato
 brew install --cask liu-bot24/course-navigator/course-navigator
 ```
 
+After installing with Homebrew, quit Course Navigator before upgrading:
+
+```bash
+brew update
+brew upgrade --cask liu-bot24/course-navigator/course-navigator
+```
+
 You can also install it manually:
 
-1. Open `Course Navigator-<version>-macos-arm64.dmg`.
+1. Open `Course.Navigator-<version>-macos-arm64.dmg`.
 2. Drag `Course Navigator.app` to `Applications`.
 3. Launch Course Navigator from `Applications`.
 

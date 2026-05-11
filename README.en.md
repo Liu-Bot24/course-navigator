@@ -76,6 +76,13 @@ brew tap liu-bot24/course-navigator https://github.com/Liu-Bot24/course-navigato
 brew install --cask liu-bot24/course-navigator/course-navigator
 ```
 
+To upgrade later with Homebrew:
+
+```bash
+brew update
+brew upgrade --cask liu-bot24/course-navigator/course-navigator
+```
+
 You can also download the macOS installer, open the DMG, drag `Course Navigator.app` to `Applications`, and launch it from there.
 
 For an unnotarized build, macOS may require `System Settings` → `Privacy & Security` → `Open Anyway` on first launch. Once you confirm the installer source and approve it, the app opens normally.
