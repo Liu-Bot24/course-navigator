@@ -15,6 +15,7 @@ backend/**/__pycache__/
 .ruff_cache/
 .mypy_cache/
 .course-navigator/
+.course-navigator-deps.json
 course-navigator-workspace/
 data/
 downloads/

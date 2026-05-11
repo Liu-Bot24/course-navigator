@@ -124,6 +124,7 @@ brew install --cask liu-bot24/course-navigator/course-navigator
 | `COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL` | 自定义在线 ASR 接口地址 | 空 |
 | `COURSE_NAVIGATOR_CUSTOM_ASR_MODEL` | 自定义在线 ASR 模型名称 | 空 |
 | `COURSE_NAVIGATOR_CUSTOM_ASR_API_KEY` | 自定义在线 ASR API Key | 空 |
+| `COURSE_NAVIGATOR_ASR_CACHE_AUTO_CLEANUP_ENABLED` | ASR 过程音频缓存超过 500M 时是否自动清理 | `true` |
 
 Firecrawl 可使用官方服务或自托管服务：
 

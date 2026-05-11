@@ -202,6 +202,20 @@ class OnlineAsrSettingsUpdate(BaseModel):
     custom: OnlineAsrCustomSettingsUpdate | None = None
 
 
+class AsrCacheSettingsResponse(BaseModel):
+    size_bytes: int = Field(ge=0)
+    threshold_bytes: int = Field(ge=1)
+    auto_cleanup_enabled: bool = True
+
+
+class AsrCacheSettingsUpdate(BaseModel):
+    auto_cleanup_enabled: bool
+
+
+class AsrCacheCleanupResponse(AsrCacheSettingsResponse):
+    cleaned_bytes: int = Field(ge=0)
+
+
 class AsrCorrectionRequest(BaseModel):
     output_language: OutputLanguage = "zh-CN"
     transcript: list[TranscriptSegment] | None = None

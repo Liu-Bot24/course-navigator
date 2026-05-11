@@ -124,6 +124,7 @@ The app also reads optional environment settings:
 | `COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL` | Custom online ASR endpoint | Empty |
 | `COURSE_NAVIGATOR_CUSTOM_ASR_MODEL` | Custom online ASR model name | Empty |
 | `COURSE_NAVIGATOR_CUSTOM_ASR_API_KEY` | Custom online ASR API key | Empty |
+| `COURSE_NAVIGATOR_ASR_CACHE_AUTO_CLEANUP_ENABLED` | Automatically cleans ASR audio work cache when it grows past 500 MB | `true` |
 
 Firecrawl can use the hosted service or a self-hosted service:
 

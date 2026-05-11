@@ -1,3 +1,4 @@
+mod asr_cache;
 mod config;
 mod model_config;
 mod models;
@@ -265,6 +266,20 @@ pub fn run() {
                     id if id.starts_with("online_asr:") => {
                         handle_model_menu_event(app, id);
                     }
+                    "asr_cache:cleanup" => {
+                        let config = config::load_config();
+                        let _ = asr_cache::cleanup(&config);
+                        let _ = refresh_tray_menu(app);
+                    }
+                    "asr_cache:auto_cleanup" => {
+                        let config = config::load_config();
+                        let status = asr_cache::load_status(&config);
+                        let _ = asr_cache::set_auto_cleanup(
+                            &config,
+                            !status.auto_cleanup_enabled,
+                        );
+                        let _ = refresh_tray_menu(app);
+                    }
                     _ => {}
                 })
                 .build(app)?;
@@ -350,6 +365,8 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let web_url = format!("http://{}:{}", config.web_host, config.web_port);
     let api_url = format!("http://{}:{}", config.api_host, config.api_port);
     let model_menu = build_model_submenu(app, &config)?;
+    let asr_cache_status = build_asr_cache_status_item(app, &config)?;
+    let asr_auto_cleanup_menu = build_asr_auto_cleanup_submenu(app, &config)?;
 
     let product = MenuItem::with_id(app, "product", "Course Navigator", false, None::<&str>)?;
     let subtitle = MenuItem::with_id(app, "subtitle", "视频学习工作台", false, None::<&str>)?;
@@ -379,8 +396,10 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &separator_two,
             &start,
             &stop,
-            &separator_three,
             &model_menu,
+            &separator_three,
+            &asr_cache_status,
+            &asr_auto_cleanup_menu,
             &separator_four,
             &web,
             &api,
@@ -388,6 +407,44 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &quit,
         ],
     )
+}
+
+fn build_asr_cache_status_item(
+    app: &tauri::AppHandle,
+    config: &LauncherConfig,
+) -> tauri::Result<MenuItem<tauri::Wry>> {
+    let status = asr_cache::load_status(config);
+    MenuItem::with_id(
+        app,
+        "asr_cache:size",
+        format!(
+            "ASR 缓存: {}",
+            asr_cache::format_cache_size(status.size_bytes)
+        ),
+        false,
+        None::<&str>,
+    )
+}
+
+fn build_asr_auto_cleanup_submenu(
+    app: &tauri::AppHandle,
+    config: &LauncherConfig,
+) -> tauri::Result<Submenu<tauri::Wry>> {
+    let status = asr_cache::load_status(config);
+    let cleanup_menu = Submenu::with_id(app, "asr_cache:auto", "自动清理", true)?;
+    let cleanup_now =
+        MenuItem::with_id(app, "asr_cache:cleanup", "立即清理", true, None::<&str>)?;
+    let auto_cleanup = CheckMenuItem::with_id(
+        app,
+        "asr_cache:auto_cleanup",
+        "超过 500M 自动清理",
+        true,
+        status.auto_cleanup_enabled,
+        None::<&str>,
+    )?;
+    cleanup_menu.append(&cleanup_now)?;
+    cleanup_menu.append(&auto_cleanup)?;
+    Ok(cleanup_menu)
 }
 
 fn build_model_submenu(

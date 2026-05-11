@@ -7,9 +7,10 @@ VERSION="$(node -e "console.log(require('$ROOT_DIR/launcher/src-tauri/tauri.conf
 ARCH="$(uname -m)"
 APP_PATH="$ROOT_DIR/launcher/src-tauri/target/release/bundle/macos/$APP_NAME.app"
 OUTPUT_DIR="$ROOT_DIR/dist/mac"
-DMG_BASENAME="$APP_NAME-$VERSION-macos-$ARCH.dmg"
+DMG_FILE_STEM="${APP_NAME// /.}-$VERSION-macos-$ARCH"
+DMG_BASENAME="$DMG_FILE_STEM.dmg"
 DMG_PATH="$OUTPUT_DIR/$DMG_BASENAME"
-TMP_DMG_PATH="$OUTPUT_DIR/$APP_NAME-$VERSION-macos-$ARCH.tmp.dmg"
+TMP_DMG_PATH="$OUTPUT_DIR/$DMG_FILE_STEM.tmp.dmg"
 MOUNT_DIR=""
 
 cleanup() {

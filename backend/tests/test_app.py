@@ -642,6 +642,67 @@ def test_extract_route_can_force_asr_source(tmp_path):
     assert response.json()["transcript"][0]["text"] == "Forced ASR line."
 
 
+def test_extract_route_auto_cleans_asr_audio_when_cache_exceeds_threshold(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "ASR_CACHE_AUTO_CLEANUP_THRESHOLD_BYTES", 5, raising=False)
+
+    class AudioProducingAsrRunner(FakeRunner):
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise AssertionError("subtitle extraction should not run when ASR is forced")
+
+        def extract_asr(self, request, target_dir: Path, item_id: str):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / f"{item_id}.wav").write_bytes(b"123456")
+            return [TranscriptSegment(start=0, end=3, text="Forced ASR line.")]
+
+    client = make_client(tmp_path, runner=AudioProducingAsrRunner())
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "url": "https://learn.deeplearning.ai/courses/example",
+            "mode": "normal",
+            "subtitle_source": "asr",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["transcript_source"] == "asr"
+    assert not (tmp_path / "subtitles" / "abc123" / "abc123.wav").exists()
+
+
+def test_extract_route_keeps_asr_audio_when_auto_cleanup_is_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "ASR_CACHE_AUTO_CLEANUP_THRESHOLD_BYTES", 5, raising=False)
+
+    class AudioProducingAsrRunner(FakeRunner):
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise AssertionError("subtitle extraction should not run when ASR is forced")
+
+        def extract_asr(self, request, target_dir: Path, item_id: str):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / f"{item_id}.wav").write_bytes(b"123456")
+            return [TranscriptSegment(start=0, end=3, text="Forced ASR line.")]
+
+    client = make_client(
+        tmp_path,
+        runner=AudioProducingAsrRunner(),
+        settings=Settings(data_dir=tmp_path, asr_cache_auto_cleanup_enabled=False),
+    )
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "url": "https://learn.deeplearning.ai/courses/example",
+            "mode": "normal",
+            "subtitle_source": "asr",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["transcript_source"] == "asr"
+    assert (tmp_path / "subtitles" / "abc123" / "abc123.wav").exists()
+    assert client.get("/api/settings/asr-cache").json()["size_bytes"] == 6
+
+
 def test_extract_job_can_force_asr_source_with_progress(tmp_path):
     class ForceAsrRunner(FakeRunner):
         def extract_subtitles(self, request, target_dir: Path, metadata=None):
@@ -1494,6 +1555,57 @@ def test_online_asr_settings_can_disable_provider(tmp_path):
     written = env_path.read_text(encoding="utf-8")
     assert "COURSE_NAVIGATOR_ONLINE_ASR_PROVIDER=\"none\"" in written
     assert "COURSE_NAVIGATOR_XAI_ASR_API_KEY=\"xai-secret-value\"" in written
+
+
+def test_asr_cache_status_reports_audio_cache_and_default_auto_cleanup(tmp_path):
+    subtitle_dir = tmp_path / "subtitles" / "abc123"
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    (subtitle_dir / "abc123.wav").write_bytes(b"a" * 10)
+    (subtitle_dir / "abc123.online-asr.mp3").write_bytes(b"b" * 7)
+    (subtitle_dir / "abc123.en.vtt").write_text("WEBVTT", encoding="utf-8")
+    client = make_client(tmp_path)
+
+    response = client.get("/api/settings/asr-cache")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["size_bytes"] == 17
+    assert payload["threshold_bytes"] == 500 * 1024 * 1024
+    assert payload["auto_cleanup_enabled"] is True
+
+
+def test_asr_cache_cleanup_removes_audio_files_but_keeps_subtitle_files(tmp_path):
+    subtitle_dir = tmp_path / "subtitles" / "abc123"
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = subtitle_dir / "abc123.wav"
+    mp3_path = subtitle_dir / "abc123.online-asr.mp3"
+    vtt_path = subtitle_dir / "abc123.en.vtt"
+    wav_path.write_bytes(b"a" * 10)
+    mp3_path.write_bytes(b"b" * 7)
+    vtt_path.write_text("WEBVTT", encoding="utf-8")
+    client = make_client(tmp_path)
+
+    response = client.post("/api/settings/asr-cache/cleanup")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cleaned_bytes"] == 17
+    assert payload["size_bytes"] == 0
+    assert not wav_path.exists()
+    assert not mp3_path.exists()
+    assert vtt_path.exists()
+
+
+def test_asr_cache_auto_cleanup_setting_persists_to_env(tmp_path):
+    env_path = tmp_path / ".env"
+    client = make_client(tmp_path, env_path=env_path)
+
+    response = client.put("/api/settings/asr-cache", json={"auto_cleanup_enabled": False})
+
+    assert response.status_code == 200
+    assert response.json()["auto_cleanup_enabled"] is False
+    written = env_path.read_text(encoding="utf-8")
+    assert "COURSE_NAVIGATOR_ASR_CACHE_AUTO_CLEANUP_ENABLED=\"false\"" in written
 
 
 def test_model_list_endpoint_uses_saved_profile_key(tmp_path, monkeypatch):

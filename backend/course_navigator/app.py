@@ -32,6 +32,9 @@ from .config import (
 )
 from .library import CourseLibrary
 from .models import (
+    AsrCacheCleanupResponse,
+    AsrCacheSettingsResponse,
+    AsrCacheSettingsUpdate,
     CourseItem,
     CourseImportResponse,
     CourseItemUpdate,
@@ -78,6 +81,8 @@ LOCAL_VIDEO_EXTENSIONS = {
     ".avi",
     ".wmv",
 }
+ASR_CACHE_AUTO_CLEANUP_THRESHOLD_BYTES = 500 * 1024 * 1024
+ASR_CACHE_AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".opus", ".wav", ".webm"}
 
 
 def create_app(
@@ -92,6 +97,7 @@ def create_app(
     active_data_dir = data_dir or active_settings.data_dir
     active_workspace_dir = workspace_dir or active_settings.workspace_dir or active_data_dir
     _prepare_workspace(active_workspace_dir, active_data_dir)
+    _maybe_auto_cleanup_asr_cache(active_data_dir, active_settings)
     library = CourseLibrary(active_workspace_dir)
     _normalize_library_video_paths(library, active_workspace_dir)
     _backfill_study_guidance_fields(library)
@@ -322,6 +328,8 @@ def create_app(
         with deleted_items_lock:
             deleted_items.discard(item.id)
         library.save(item)
+        if transcript_source in {"asr", "online_asr"}:
+            _maybe_auto_cleanup_asr_cache(active_data_dir, settings_state["value"])
         return item
 
     def _extract_and_save_local_video_course(
@@ -367,6 +375,7 @@ def create_app(
             }
         )
         library.save(next_item)
+        _maybe_auto_cleanup_asr_cache(active_data_dir, settings_state["value"])
         return _normalize_item_for_response(next_item)
 
     def _local_video_item_for_request(request: ExtractRequest) -> CourseItem | None:
@@ -679,6 +688,34 @@ def create_app(
         if env_path:
             _write_model_env(env_path, next_settings)
         return _online_asr_settings_response(next_settings)
+
+    @app.get("/api/settings/asr-cache")
+    def get_asr_cache_settings() -> AsrCacheSettingsResponse:
+        return _asr_cache_settings_response(active_data_dir, settings_state["value"])
+
+    @app.put("/api/settings/asr-cache")
+    def update_asr_cache_settings(request: AsrCacheSettingsUpdate) -> AsrCacheSettingsResponse:
+        current = settings_state["value"]
+        next_settings = current.model_copy(
+            update={"asr_cache_auto_cleanup_enabled": request.auto_cleanup_enabled}
+        )
+        settings_state["value"] = next_settings
+        if env_path:
+            _write_model_env(env_path, next_settings)
+        if next_settings.asr_cache_auto_cleanup_enabled:
+            _maybe_auto_cleanup_asr_cache(active_data_dir, next_settings)
+        return _asr_cache_settings_response(active_data_dir, next_settings)
+
+    @app.post("/api/settings/asr-cache/cleanup")
+    def cleanup_asr_cache() -> AsrCacheCleanupResponse:
+        cleaned_bytes = _cleanup_asr_cache(active_data_dir)
+        settings = settings_state["value"]
+        return AsrCacheCleanupResponse(
+            size_bytes=_asr_cache_size_bytes(active_data_dir),
+            threshold_bytes=ASR_CACHE_AUTO_CLEANUP_THRESHOLD_BYTES,
+            auto_cleanup_enabled=settings.asr_cache_auto_cleanup_enabled,
+            cleaned_bytes=cleaned_bytes,
+        )
 
     @app.put("/api/settings/model")
     def update_model_settings(request: ModelSettingsUpdate) -> ModelSettingsResponse:
@@ -1856,6 +1893,74 @@ def _delete_download_files_for_item(workspace_dir: Path, item_id: str) -> None:
             _delete_download_path(workspace_dir, path)
 
 
+def _asr_cache_settings_response(data_dir: Path, settings: Settings) -> AsrCacheSettingsResponse:
+    return AsrCacheSettingsResponse(
+        size_bytes=_asr_cache_size_bytes(data_dir),
+        threshold_bytes=ASR_CACHE_AUTO_CLEANUP_THRESHOLD_BYTES,
+        auto_cleanup_enabled=settings.asr_cache_auto_cleanup_enabled,
+    )
+
+
+def _maybe_auto_cleanup_asr_cache(data_dir: Path, settings: Settings) -> None:
+    if not settings.asr_cache_auto_cleanup_enabled:
+        return
+    if _asr_cache_size_bytes(data_dir) <= ASR_CACHE_AUTO_CLEANUP_THRESHOLD_BYTES:
+        return
+    _cleanup_asr_cache(data_dir)
+
+
+def _asr_cache_size_bytes(data_dir: Path) -> int:
+    total = 0
+    for path in _iter_asr_cache_files(data_dir):
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _cleanup_asr_cache(data_dir: Path) -> int:
+    cleaned_bytes = 0
+    root = _asr_cache_root(data_dir)
+    for path in list(_iter_asr_cache_files(data_dir)):
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError:
+            continue
+        cleaned_bytes += size
+    _prune_empty_dirs(root)
+    return cleaned_bytes
+
+
+def _iter_asr_cache_files(data_dir: Path):
+    root = _asr_cache_root(data_dir)
+    if not root.exists():
+        return
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in ASR_CACHE_AUDIO_SUFFIXES:
+            yield path
+
+
+def _asr_cache_root(data_dir: Path) -> Path:
+    return data_dir / "subtitles"
+
+
+def _prune_empty_dirs(root: Path) -> None:
+    if not root.exists():
+        return
+    directories = [path for path in root.rglob("*") if path.is_dir()]
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+
+
 def _model_settings_response(settings: Settings) -> ModelSettingsResponse:
     profiles = settings.effective_model_profiles
     return ModelSettingsResponse(
@@ -2070,6 +2175,9 @@ def _write_model_env(path: Path, settings: Settings) -> None:
         "COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL": settings.online_asr.custom.base_url or "",
         "COURSE_NAVIGATOR_CUSTOM_ASR_MODEL": settings.online_asr.custom.model or "",
         "COURSE_NAVIGATOR_CUSTOM_ASR_API_KEY": settings.online_asr.custom.api_key or "",
+        "COURSE_NAVIGATOR_ASR_CACHE_AUTO_CLEANUP_ENABLED": (
+            "true" if settings.asr_cache_auto_cleanup_enabled else "false"
+        ),
         "COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL": settings.study_detail_level,
         "COURSE_NAVIGATOR_TASK_PARAMETERS": json.dumps(task_parameters_payload, ensure_ascii=False),
     }

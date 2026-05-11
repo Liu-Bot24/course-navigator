@@ -40,9 +40,11 @@ import type {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  cleanupAsrCache,
   deleteCourse,
   deleteLocalVideo,
   extractCourse,
+  getAsrCacheSettings,
   getAsrCorrectionResult,
   getAsrSearchSettings,
   getModelSettings,
@@ -56,6 +58,7 @@ import {
   previewCourse,
   saveModelSettings,
   saveAsrSearchSettings,
+  saveAsrCacheSettings,
   saveOnlineAsrSettings,
   saveTranscript,
   startExtractJob,
@@ -82,6 +85,7 @@ import { parseUploadedSubtitleText } from "./subtitleUpload";
 import type {
   AsrCorrectionSearchConfig,
   AsrCorrectionSuggestion,
+  AsrCacheSettings,
   AsrSearchProvider,
   AsrSearchSettings,
   AsrSearchSettingsInput,
@@ -268,9 +272,10 @@ const COPY = {
     translationModelHelp: "字幕逐句翻译和标题翻译，优先使用便宜、快速、稳定的小模型。",
     learningModelHelp: "生成每个语义学习块的解读、详解和高保真文本，负责内容质量。",
     globalModelHelp: "生成上下文摘要、语义分块、导览、大纲和跨块整合，需要更强的长上下文能力。",
-    onlineAsrSettingsTitle: "在线 ASR",
-    onlineAsrSettingsHelp: "用于在没有站方字幕时通过在线语音识别生成带时间戳字幕。预设服务只需要填写 API Key；自定义接口需兼容 OpenAI audio transcriptions。",
+    onlineAsrSettingsTitle: "ASR",
+    onlineAsrSettingsHelp: "用于没有站方字幕时，通过语音识别生成带时间戳字幕。",
     onlineAsrProvider: "在线 ASR 服务",
+    onlineAsrProviderHelp: "预设服务只需填写 API Key；自定义接口需兼容 OpenAI audio transcriptions。",
     onlineAsrProviderNone: "不使用在线 ASR",
     onlineAsrProviderOpenAI: "OpenAI Whisper",
     onlineAsrProviderGroq: "Groq Whisper",
@@ -283,6 +288,10 @@ const COPY = {
     onlineAsrCustomHelp: "可填完整 /audio/transcriptions 地址，或兼容服务的 /v1 Base URL；响应需包含分段/词级时间戳、SRT 或 VTT，纯文本不能生成可对齐字幕。",
     onlineAsrProviderSaved: "在线 ASR 服务已保存",
     onlineAsrNotConfigured: "尚未配置在线 ASR 模型。请先在模型设置中选择并保存在线 ASR 服务，或将字幕来源改为本地 ASR。",
+    asrCacheCleanupTitle: "ASR 缓存清理",
+    asrCacheAutoCleanup: "超过 500M 自动清理ASR缓存",
+    asrCacheCleanupNow: "立即清理",
+    asrCacheCleaned: "ASR 缓存已清理",
     advancedModelSettings: "高级调用参数",
     advancedModelSettingsHelp: "未设置时使用推荐默认参数。这里覆盖具体任务调用；不熟悉模型参数时建议保持默认。",
     modelCapabilitySettings: "模型能力覆盖",
@@ -557,9 +566,10 @@ const COPY = {
     translationModelHelp: "Sentence-by-sentence subtitle and title translation; best with a fast, cheaper model.",
     learningModelHelp: "Generates interpretation, detailed notes, and high-fidelity text for each semantic block.",
     globalModelHelp: "Context summary, semantic segmentation, guide, outline, and cross-block synthesis.",
-    onlineAsrSettingsTitle: "Online ASR",
-    onlineAsrSettingsHelp: "Use an online speech-to-text service to generate timestamped subtitles when source subtitles are unavailable. Preset services only need an API key; custom endpoints must be compatible with OpenAI audio transcriptions.",
+    onlineAsrSettingsTitle: "ASR",
+    onlineAsrSettingsHelp: "Use speech recognition to generate timestamped subtitles when source subtitles are unavailable.",
     onlineAsrProvider: "Online ASR service",
+    onlineAsrProviderHelp: "Preset services only need an API key; custom endpoints must be compatible with OpenAI audio transcriptions.",
     onlineAsrProviderNone: "Do not use online ASR",
     onlineAsrProviderOpenAI: "OpenAI Whisper",
     onlineAsrProviderGroq: "Groq Whisper",
@@ -572,6 +582,10 @@ const COPY = {
     onlineAsrCustomHelp: "Enter a full /audio/transcriptions URL or a compatible /v1 base URL. Responses need segment/word timestamps, SRT, or VTT; plain text cannot produce aligned subtitles.",
     onlineAsrProviderSaved: "Online ASR service saved",
     onlineAsrNotConfigured: "Online ASR is not configured. Choose and save an Online ASR service in Model Settings, or switch subtitle source to Local ASR.",
+    asrCacheCleanupTitle: "ASR cache cleanup",
+    asrCacheAutoCleanup: "Automatically clean ASR cache over 500 MB",
+    asrCacheCleanupNow: "Clean now",
+    asrCacheCleaned: "ASR cache cleaned",
     advancedModelSettings: "Advanced call parameters",
     advancedModelSettingsHelp: "Unset fields use recommended defaults. These values override individual task calls.",
     modelCapabilitySettings: "Model capability overrides",
@@ -882,6 +896,8 @@ export function App() {
   const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(EMPTY_SETTINGS_DRAFT);
   const [onlineAsrSettings, setOnlineAsrSettings] = useState<OnlineAsrSettings | null>(null);
   const [onlineAsrDraft, setOnlineAsrDraft] = useState<OnlineAsrDraft>(EMPTY_ONLINE_ASR_DRAFT);
+  const [asrCacheSettings, setAsrCacheSettings] = useState<AsrCacheSettings | null>(null);
+  const [asrCacheBusy, setAsrCacheBusy] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [roleSettingsBusy, setRoleSettingsBusy] = useState(false);
@@ -945,6 +961,9 @@ export function App() {
         setOnlineAsrSettings(settings);
         setOnlineAsrDraft(draftFromOnlineAsrSettings(settings));
       })
+      .catch(() => undefined);
+    getAsrCacheSettings()
+      .then(setAsrCacheSettings)
       .catch(() => undefined);
   }, []);
 
@@ -1874,6 +1893,39 @@ export function App() {
     }
   }
 
+  async function handleAsrCacheAutoCleanupChange(enabled: boolean) {
+    setAsrCacheSettings((current) =>
+      current ? { ...current, auto_cleanup_enabled: enabled } : current,
+    );
+    setAsrCacheBusy(true);
+    setSettingsMessage(null);
+    try {
+      const next = await saveAsrCacheSettings({ auto_cleanup_enabled: enabled });
+      setAsrCacheSettings(next);
+    } catch (err) {
+      setSettingsMessage(errorMessage(err, copy.unknownError));
+      setAsrCacheSettings((current) =>
+        current ? { ...current, auto_cleanup_enabled: !enabled } : current,
+      );
+    } finally {
+      setAsrCacheBusy(false);
+    }
+  }
+
+  async function handleAsrCacheCleanup() {
+    setAsrCacheBusy(true);
+    setSettingsMessage(null);
+    try {
+      const next = await cleanupAsrCache();
+      setAsrCacheSettings(next);
+      setSettingsMessage(copy.asrCacheCleaned);
+    } catch (err) {
+      setSettingsMessage(errorMessage(err, copy.unknownError));
+    } finally {
+      setAsrCacheBusy(false);
+    }
+  }
+
   async function handleSaveModelRole(role: ModelRoleKey, profileId: string) {
     const previousRoleId = settingsDraft[role];
     setSettingsDraft((current) => ({ ...current, [role]: profileId }));
@@ -2008,8 +2060,10 @@ export function App() {
             copy={copy}
             draft={settingsDraft}
             onlineAsrDraft={onlineAsrDraft}
+            asrCacheSettings={asrCacheSettings}
             modelSettings={modelSettings}
             busy={settingsBusy}
+            asrCacheBusy={asrCacheBusy}
             message={settingsMessage}
             roleBusy={roleSettingsBusy}
             roleMessage={roleSettingsMessage}
@@ -2028,6 +2082,8 @@ export function App() {
             onDraftChange={setSettingsDraft}
             onOnlineAsrDraftChange={setOnlineAsrDraft}
             onOnlineAsrProviderChange={handleOnlineAsrProviderChange}
+            onAsrCacheAutoCleanupChange={handleAsrCacheAutoCleanupChange}
+            onAsrCacheCleanup={handleAsrCacheCleanup}
             onRoleChange={handleSaveModelRole}
             onSave={handleSaveSettings}
           />
@@ -2221,8 +2277,10 @@ export function App() {
           copy={copy}
           draft={settingsDraft}
           onlineAsrDraft={onlineAsrDraft}
+          asrCacheSettings={asrCacheSettings}
           modelSettings={modelSettings}
           busy={settingsBusy}
+          asrCacheBusy={asrCacheBusy}
           message={settingsMessage}
           roleBusy={roleSettingsBusy}
           roleMessage={roleSettingsMessage}
@@ -2241,6 +2299,8 @@ export function App() {
           onDraftChange={setSettingsDraft}
           onOnlineAsrDraftChange={setOnlineAsrDraft}
           onOnlineAsrProviderChange={handleOnlineAsrProviderChange}
+          onAsrCacheAutoCleanupChange={handleAsrCacheAutoCleanupChange}
+          onAsrCacheCleanup={handleAsrCacheCleanup}
           onRoleChange={handleSaveModelRole}
           onSave={handleSaveSettings}
         />
@@ -4363,8 +4423,10 @@ function SettingsModal({
   copy,
   draft,
   onlineAsrDraft,
+  asrCacheSettings,
   modelSettings,
   busy,
+  asrCacheBusy,
   message,
   roleBusy,
   roleMessage,
@@ -4373,6 +4435,8 @@ function SettingsModal({
   onDraftChange,
   onOnlineAsrDraftChange,
   onOnlineAsrProviderChange,
+  onAsrCacheAutoCleanupChange,
+  onAsrCacheCleanup,
   onRoleChange,
   onSave,
 }: {
@@ -4380,8 +4444,10 @@ function SettingsModal({
   copy: (typeof COPY)[UiLanguage];
   draft: SettingsDraft;
   onlineAsrDraft: OnlineAsrDraft;
+  asrCacheSettings: AsrCacheSettings | null;
   modelSettings: ModelSettings | null;
   busy: boolean;
+  asrCacheBusy: boolean;
   message: string | null;
   roleBusy: boolean;
   roleMessage: string | null;
@@ -4390,6 +4456,8 @@ function SettingsModal({
   onDraftChange: (draft: SettingsDraft) => void;
   onOnlineAsrDraftChange: (draft: OnlineAsrDraft) => void;
   onOnlineAsrProviderChange: (provider: OnlineAsrProvider) => void;
+  onAsrCacheAutoCleanupChange: (enabled: boolean) => void;
+  onAsrCacheCleanup: () => void;
   onRoleChange: (role: ModelRoleKey, profileId: string) => void;
   onSave: () => void;
 }) {
@@ -4564,40 +4632,48 @@ function SettingsModal({
             {onlineAsrOpen ? (
               <>
                 <p>{copy.onlineAsrSettingsHelp}</p>
-                <div className="settings-grid compact-settings-grid">
-                  <label className="settings-field">
+                <div className="settings-module">
+                  <div className="settings-module-head">
                     <span>{copy.onlineAsrProvider}</span>
-                    <select
-                      value={onlineAsrDraft.provider}
-                      onChange={(event) => onOnlineAsrProviderChange(event.target.value as OnlineAsrProvider)}
-                    >
-                      <option value="none">{copy.onlineAsrProviderNone}</option>
-                      <option value="openai">{copy.onlineAsrProviderOpenAI}</option>
-                      <option value="groq">{copy.onlineAsrProviderGroq}</option>
-                      <option value="xai">{copy.onlineAsrProviderXai}</option>
-                      <option value="custom">{copy.onlineAsrProviderCustom}</option>
-                    </select>
-                  </label>
+                    <small>{copy.onlineAsrPresetHelp}</small>
+                  </div>
+                  <div className="settings-grid compact-settings-grid">
+                    <label className="settings-field">
+                      <select
+                        aria-label={copy.onlineAsrProvider}
+                        value={onlineAsrDraft.provider}
+                        onChange={(event) => onOnlineAsrProviderChange(event.target.value as OnlineAsrProvider)}
+                      >
+                        <option value="none">{copy.onlineAsrProviderNone}</option>
+                        <option value="openai">{copy.onlineAsrProviderOpenAI}</option>
+                        <option value="groq">{copy.onlineAsrProviderGroq}</option>
+                        <option value="xai">{copy.onlineAsrProviderXai}</option>
+                        <option value="custom">{copy.onlineAsrProviderCustom}</option>
+                      </select>
+                    </label>
+                    {onlineAsrDraft.provider === "custom" ? (
+                      <label className="settings-field">
+                        <input
+                          aria-label={copy.onlineAsrCustomModel}
+                          placeholder={copy.onlineAsrCustomModel}
+                          value={onlineAsrDraft.custom_model}
+                          onChange={(event) => updateOnlineAsrDraft({ custom_model: event.target.value })}
+                        />
+                      </label>
+                    ) : null}
+                  </div>
                   {onlineAsrDraft.provider === "custom" ? (
                     <label className="settings-field">
-                      <span>{copy.onlineAsrCustomModel}</span>
+                      <span>{copy.onlineAsrCustomBaseUrl}</span>
                       <input
-                        value={onlineAsrDraft.custom_model}
-                        onChange={(event) => updateOnlineAsrDraft({ custom_model: event.target.value })}
+                        value={onlineAsrDraft.custom_base_url}
+                        onChange={(event) => updateOnlineAsrDraft({ custom_base_url: event.target.value })}
+                        placeholder="https://api.example.com/v1/audio/transcriptions"
                       />
+                      <small>{copy.onlineAsrCustomHelp}</small>
                     </label>
                   ) : null}
                 </div>
-                {onlineAsrDraft.provider === "custom" ? (
-                  <label className="settings-field">
-                    <span>{copy.onlineAsrCustomBaseUrl}</span>
-                    <input
-                      value={onlineAsrDraft.custom_base_url}
-                      onChange={(event) => updateOnlineAsrDraft({ custom_base_url: event.target.value })}
-                      placeholder="https://api.example.com/v1/audio/transcriptions"
-                    />
-                  </label>
-                ) : null}
                 {onlineAsrDraft.provider !== "none" ? (
                   <label className="settings-field">
                     <span>{copy.onlineAsrApiKey}</span>
@@ -4609,11 +4685,34 @@ function SettingsModal({
                         updateOnlineAsrDraft(onlineAsrApiKeyUpdate(onlineAsrDraft.provider, event.target.value))
                       }
                     />
-                    <small>
-                      {onlineAsrDraft.provider === "custom" ? copy.onlineAsrCustomHelp : copy.onlineAsrPresetHelp}
-                    </small>
+                    <small>{copy.onlineAsrProviderHelp}</small>
                   </label>
                 ) : null}
+                <div className="settings-module">
+                  <div className="settings-module-head">
+                    <span>{copy.asrCacheCleanupTitle}</span>
+                  </div>
+                  <div className="asr-cache-controls">
+                    <label className="settings-checkbox-field">
+                      <input
+                        type="checkbox"
+                        checked={asrCacheSettings?.auto_cleanup_enabled ?? true}
+                        disabled={asrCacheBusy}
+                        onChange={(event) => onAsrCacheAutoCleanupChange(event.currentTarget.checked)}
+                      />
+                      <span>{copy.asrCacheAutoCleanup}</span>
+                    </label>
+                    <button
+                      type="button"
+                      className="secondary-action compact-action"
+                      disabled={asrCacheBusy}
+                      onClick={onAsrCacheCleanup}
+                    >
+                      {asrCacheBusy ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
+                      {copy.asrCacheCleanupNow}
+                    </button>
+                  </div>
+                </div>
               </>
             ) : null}
           </div>

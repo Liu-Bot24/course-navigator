@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   deleteLocalVideo,
   extractCourse,
+  getAsrCacheSettings,
   getOnlineAsrSettings,
   getModelSettings,
   getAsrCorrectionResult,
@@ -12,6 +13,7 @@ import {
   listItems,
   previewCourse,
   saveAsrSearchSettings,
+  saveAsrCacheSettings,
   saveOnlineAsrSettings,
   saveModelSettings,
   saveTranscript,
@@ -25,6 +27,12 @@ import { App } from "./App";
 import type { CourseItem, StudyJobStatus } from "./types";
 
 vi.mock("./api", () => ({
+  cleanupAsrCache: vi.fn().mockResolvedValue({
+    size_bytes: 0,
+    threshold_bytes: 524288000,
+    auto_cleanup_enabled: true,
+    cleaned_bytes: 0,
+  }),
   deleteCourse: vi.fn(),
   deleteLocalVideo: vi.fn(),
   downloadVideo: vi.fn(),
@@ -67,6 +75,11 @@ vi.mock("./api", () => ({
     tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
     firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
   }),
+  getAsrCacheSettings: vi.fn().mockResolvedValue({
+    size_bytes: 0,
+    threshold_bytes: 524288000,
+    auto_cleanup_enabled: true,
+  }),
   importCoursePackage: vi.fn(),
   importLocalVideo: vi.fn(),
   itemVideoPath: (itemId: string) => `/api/items/${itemId}/video`,
@@ -74,6 +87,11 @@ vi.mock("./api", () => ({
   listItems: vi.fn().mockResolvedValue([]),
   saveModelSettings: vi.fn(),
   saveAsrSearchSettings: vi.fn(),
+  saveAsrCacheSettings: vi.fn().mockResolvedValue({
+    size_bytes: 0,
+    threshold_bytes: 524288000,
+    auto_cleanup_enabled: true,
+  }),
   saveOnlineAsrSettings: vi.fn().mockResolvedValue({
     provider: "xai",
     openai: { has_api_key: false, api_key_preview: null },
@@ -883,7 +901,7 @@ describe("App language defaults", () => {
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "模型设置" }));
-    fireEvent.click(await screen.findByRole("button", { name: /在线 ASR/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "ASR" }));
     fireEvent.change(screen.getByLabelText("在线 ASR 服务"), { target: { value: "xai" } });
     const onlineAsrKey = await screen.findByLabelText("在线 ASR API Key") as HTMLInputElement;
     expect(onlineAsrKey.value).toBe("xai...test");

@@ -99,6 +99,7 @@ class Settings(BaseModel):
     asr_model_id: str = "default"
     asr_search: AsrSearchSettings = Field(default_factory=AsrSearchSettings)
     online_asr: OnlineAsrSettings = Field(default_factory=OnlineAsrSettings)
+    asr_cache_auto_cleanup_enabled: bool = True
     study_detail_level: StudyDetailLevel = "faithful"
     task_parameters: dict[TaskParameterKey, TaskParameterOverride] = Field(default_factory=dict)
 
@@ -177,6 +178,7 @@ def load_settings() -> Settings:
         asr_model_id=os.getenv("COURSE_NAVIGATOR_ASR_MODEL_ID", "default"),
         asr_search=_load_asr_search_settings(),
         online_asr=_load_online_asr_settings(),
+        asr_cache_auto_cleanup_enabled=_env_bool("COURSE_NAVIGATOR_ASR_CACHE_AUTO_CLEANUP_ENABLED", True),
         study_detail_level=os.getenv("COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL", "faithful"),  # type: ignore[arg-type]
         task_parameters=_load_task_parameters(os.getenv("COURSE_NAVIGATOR_TASK_PARAMETERS")),
     )

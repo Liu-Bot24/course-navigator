@@ -1,4 +1,6 @@
 import type {
+  AsrCacheCleanupResult,
+  AsrCacheSettings,
   AsrCorrectionResult,
   AsrCorrectionSearchConfig,
   AsrSearchSettings,
@@ -175,6 +177,23 @@ export async function saveOnlineAsrSettings(input: OnlineAsrSettingsInput): Prom
   return requestJson<OnlineAsrSettings>("/settings/online-asr", {
     method: "PUT",
     body: JSON.stringify(input),
+  });
+}
+
+export async function getAsrCacheSettings(): Promise<AsrCacheSettings> {
+  return requestJson<AsrCacheSettings>("/settings/asr-cache");
+}
+
+export async function saveAsrCacheSettings(input: { auto_cleanup_enabled: boolean }): Promise<AsrCacheSettings> {
+  return requestJson<AsrCacheSettings>("/settings/asr-cache", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function cleanupAsrCache(): Promise<AsrCacheCleanupResult> {
+  return requestJson<AsrCacheCleanupResult>("/settings/asr-cache/cleanup", {
+    method: "POST",
   });
 }
 

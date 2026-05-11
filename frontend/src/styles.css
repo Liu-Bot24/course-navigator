@@ -440,6 +440,58 @@ button:disabled {
   line-height: 1.45;
 }
 
+.settings-module {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-module-head {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-module-head span {
+  color: #344054;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.settings-module-head small {
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.asr-cache-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.settings-checkbox-field {
+  display: inline-flex;
+  min-width: min(100%, 260px);
+  gap: 8px;
+  align-items: center;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.settings-checkbox-field input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #2454d6;
+}
+
+.compact-action {
+  height: 30px;
+  white-space: nowrap;
+}
+
 .settings-mini-title {
   margin: 2px 0 0;
   color: #111827;

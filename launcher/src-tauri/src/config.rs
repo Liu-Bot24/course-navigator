@@ -39,11 +39,14 @@ pub fn prepare_bundled_runtime(app: &AppHandle) -> Result<(), String> {
 
     let support_dir = application_support_dir();
     let target_root = runtime_project_dir_for_support(&support_dir);
+    let mut config = load_config();
+    if !should_use_bundled_runtime(&config, &target_root) {
+        return Ok(());
+    }
     if runtime_source_needs_install(&resource_root, &target_root)? {
         copy_runtime_source(&resource_root, &target_root)?;
     }
 
-    let mut config = load_config();
     if Path::new(&config.project_root) != target_root {
         config.project_root = target_root.display().to_string();
     }
@@ -59,6 +62,11 @@ pub fn prepare_bundled_runtime(app: &AppHandle) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn should_use_bundled_runtime(config: &LauncherConfig, target_root: &Path) -> bool {
+    let project_root = Path::new(&config.project_root);
+    !project_root.exists() || project_root == target_root
 }
 
 pub fn load_config() -> LauncherConfig {
@@ -389,6 +397,67 @@ mod tests {
             default_workspace_dir(project_root, support_dir),
             project_root.join("course-navigator-workspace")
         );
+    }
+
+    #[test]
+    fn bundled_runtime_keeps_an_existing_project_root() {
+        let root = std::env::temp_dir().join(format!(
+            "course-navigator-project-root-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let project_root = root.join("project");
+        let target_root = root.join("support/runtime/project");
+        fs::create_dir_all(&project_root).expect("project root");
+        fs::create_dir_all(&target_root).expect("target root");
+        let config = LauncherConfig {
+            project_root: project_root.display().to_string(),
+            api_host: "127.0.0.1".into(),
+            api_port: 8000,
+            web_host: "127.0.0.1".into(),
+            web_port: 5173,
+            workspace_dir: "/tmp/workspace".into(),
+            open_browser_on_start: true,
+        };
+
+        assert!(!should_use_bundled_runtime(&config, &target_root));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bundled_runtime_is_used_when_project_root_is_missing_or_already_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "course-navigator-runtime-choice-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let target_root = root.join("support/runtime/project");
+        fs::create_dir_all(&target_root).expect("target root");
+        let base = LauncherConfig {
+            project_root: root.join("missing").display().to_string(),
+            api_host: "127.0.0.1".into(),
+            api_port: 8000,
+            web_host: "127.0.0.1".into(),
+            web_port: 5173,
+            workspace_dir: "/tmp/workspace".into(),
+            open_browser_on_start: true,
+        };
+
+        assert!(should_use_bundled_runtime(&base, &target_root));
+        assert!(should_use_bundled_runtime(
+            &LauncherConfig {
+                project_root: target_root.display().to_string(),
+                ..base
+            },
+            &target_root
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

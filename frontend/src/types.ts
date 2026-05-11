@@ -189,6 +189,16 @@ export type OnlineAsrSettingsInput = {
   custom?: OnlineAsrCustomSettingsInput;
 };
 
+export type AsrCacheSettings = {
+  size_bytes: number;
+  threshold_bytes: number;
+  auto_cleanup_enabled: boolean;
+};
+
+export type AsrCacheCleanupResult = AsrCacheSettings & {
+  cleaned_bytes: number;
+};
+
 export type AsrCorrectionSource = "model" | "search";
 export type AsrCorrectionStatus = "pending" | "accepted" | "rejected";
 
