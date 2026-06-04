@@ -9,6 +9,7 @@ import type {
   CourseItem,
   CourseSharePackage,
   ExtractMode,
+  LocalVideoImportMode,
   ModelSettings,
   ModelSettingsInput,
   ModelProviderType,
@@ -21,6 +22,7 @@ import type {
   StudyMaterial,
   TranscriptSource,
   TranscriptSegment,
+  VideoSourceBindingInput,
 } from "./types";
 
 export function apiPath(path: string): string {
@@ -53,6 +55,32 @@ export async function importLocalVideo(file: File): Promise<CourseItem> {
     throw new Error(payload?.detail ?? `Request failed: ${response.status}`);
   }
   return response.json() as Promise<CourseItem>;
+}
+
+export async function importLocalVideosFromPicker(mode: LocalVideoImportMode): Promise<CourseItem[]> {
+  return requestJson<CourseItem[]>("/local-video-file-picker", {
+    method: "POST",
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export async function bindVideoSource(itemId: string, input: VideoSourceBindingInput): Promise<CourseItem> {
+  return requestJson<CourseItem>(`/items/${itemId}/video-source`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function bindVideoSourceFromPicker(itemId: string): Promise<CourseItem> {
+  return requestJson<CourseItem>(`/items/${itemId}/video-source-picker`, {
+    method: "POST",
+  });
+}
+
+export async function importWorkspaceVideoFromPicker(itemId: string): Promise<CourseItem> {
+  return requestJson<CourseItem>(`/items/${itemId}/workspace-video-picker`, {
+    method: "POST",
+  });
 }
 
 export async function extractCourse(input: {
@@ -208,6 +236,7 @@ export async function updateCourseItem(
   input: {
     title?: string;
     translated_title?: string | null;
+    collection_group_title?: string | null;
     collection_title?: string | null;
     course_index?: number | null;
     sort_order?: number | null;

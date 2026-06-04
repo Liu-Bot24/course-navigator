@@ -1,7 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  bindVideoSource,
+  bindVideoSourceFromPicker,
   deleteLocalVideo,
   extractCourse,
   getAsrCacheSettings,
@@ -10,6 +13,7 @@ import {
   getAsrCorrectionResult,
   getStudyJob,
   importLocalVideo,
+  importWorkspaceVideoFromPicker,
   listItems,
   previewCourse,
   saveAsrSearchSettings,
@@ -33,6 +37,8 @@ vi.mock("./api", () => ({
     auto_cleanup_enabled: true,
     cleaned_bytes: 0,
   }),
+  bindVideoSource: vi.fn(),
+  bindVideoSourceFromPicker: vi.fn(),
   deleteCourse: vi.fn(),
   deleteLocalVideo: vi.fn(),
   downloadVideo: vi.fn(),
@@ -82,6 +88,7 @@ vi.mock("./api", () => ({
   }),
   importCoursePackage: vi.fn(),
   importLocalVideo: vi.fn(),
+  importWorkspaceVideoFromPicker: vi.fn(),
   itemVideoPath: (itemId: string) => `/api/items/${itemId}/video`,
   listAvailableModels: vi.fn(),
   listItems: vi.fn().mockResolvedValue([]),
@@ -113,8 +120,12 @@ describe("App language defaults", () => {
     vi.clearAllMocks();
     installTestLocalStorage();
     window.localStorage.removeItem("course-navigator-manual-collections");
+    window.localStorage.removeItem("course-navigator-manual-collection-groups");
     window.localStorage.removeItem("course-navigator-collapsed-collections");
+    window.localStorage.removeItem("course-navigator-collapsed-collection-groups");
     window.localStorage.removeItem("course-navigator-collection-order");
+    window.localStorage.removeItem("course-navigator-collection-group-order");
+    window.localStorage.removeItem("course-navigator-collection-group-assignments");
     window.localStorage.removeItem("course-navigator-time-map-auto-open");
     window.localStorage.removeItem("course-navigator-last-selected-course");
     window.localStorage.removeItem("course-navigator-asr-save-accepted-changes");
@@ -277,6 +288,421 @@ describe("App language defaults", () => {
     expect((cacheButton as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByRole("button", { name: "移除缓存" })).toBeNull();
     expect(deleteLocalVideo).not.toHaveBeenCalled();
+  });
+
+  it("offers binding a video source for imported artifacts without a video file", async () => {
+    const importedItem: CourseItem = {
+      id: "shared-course",
+      source_url: "local-video://original-shared-course",
+      title: "Shared Lesson",
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "Corrected opening." }],
+      metadata: null,
+      study: {
+        one_line: "已有导览",
+        translated_title: null,
+        time_map: [],
+        outline: [],
+        detailed_notes: "已有解读",
+        high_fidelity_text: "已有详解",
+        translated_transcript: [],
+        prerequisites: [],
+        thought_prompts: [],
+        review_suggestions: [],
+      },
+      local_video_path: null,
+    };
+    const linkedItem: CourseItem = {
+      ...importedItem,
+      source_url: "external-video://shared-course",
+      video_source_type: "external",
+      local_video_path: "/Volumes/NAS/Shared Lesson.mp4",
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([importedItem]);
+    vi.mocked(bindVideoSourceFromPicker).mockResolvedValueOnce(linkedItem);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "绑定视频源" }));
+    fireEvent.click(await screen.findByRole("button", { name: "选择本地或 NAS 文件" }));
+
+    await waitFor(() => {
+      expect(bindVideoSourceFromPicker).toHaveBeenCalledWith("shared-course");
+    });
+    expect(await screen.findByRole("heading", { name: "Shared Lesson" })).toBeTruthy();
+    expect((screen.getByRole("button", { name: "本地" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("treats imported local-video artifacts without a path as unbound instead of workspace-cached", async () => {
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "shared-course",
+        source_url: "local-video://original-shared-course",
+        title: "Shared Lesson",
+        duration: 12,
+        created_at: new Date().toISOString(),
+        transcript: [{ start: 0, end: 2, text: "Corrected opening." }],
+        metadata: null,
+        study: null,
+        local_video_path: null,
+      },
+    ]);
+
+    render(<App />);
+
+    const cacheButton = await screen.findByRole("button", { name: "缓存" });
+    expect((cacheButton as HTMLButtonElement).disabled).toBe(true);
+    expect(cacheButton.getAttribute("title")).toBe("缓存");
+    expect(await screen.findByRole("button", { name: "导入" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "绑定视频源" })).toBeTruthy();
+  });
+
+  it("imports a missing course video into Workspace from the detail toolbar", async () => {
+    const importedItem: CourseItem = {
+      id: "shared-course",
+      source_url: "local-video://original-shared-course",
+      title: "Shared Lesson",
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "Corrected opening." }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    const workspaceItem: CourseItem = {
+      ...importedItem,
+      source_url: "local-video://shared-course",
+      video_source_type: "workspace",
+      local_video_path: "downloads/shared-course.mp4",
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([importedItem]);
+    vi.mocked(importWorkspaceVideoFromPicker).mockResolvedValueOnce(workspaceItem);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "导入" }));
+
+    await waitFor(() => {
+      expect(importWorkspaceVideoFromPicker).toHaveBeenCalledWith("shared-course");
+    });
+    expect((await screen.findByRole("button", { name: "本地" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("lets an external linked video source change to an online link", async () => {
+    const externalItem: CourseItem = {
+      id: "external-course",
+      source_url: "external-video://external-course",
+      title: "External Lesson",
+      duration: 67.5,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "Opening." }],
+      metadata: null,
+      study: null,
+      video_source_type: "external",
+      local_video_path: "/Volumes/NAS/External Lesson.mp4",
+    };
+    const remoteItem: CourseItem = {
+      ...externalItem,
+      source_url: "https://example.com/new-video",
+      video_source_type: "remote",
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([externalItem]);
+    vi.mocked(bindVideoSource).mockResolvedValueOnce(remoteItem);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "更换视频源" }));
+    fireEvent.change(await screen.findByLabelText("线上视频链接"), { target: { value: "https://example.com/new-video" } });
+    fireEvent.click(screen.getByRole("button", { name: "使用线上链接" }));
+
+    await waitFor(() => {
+      expect(bindVideoSource).toHaveBeenCalledWith("external-course", {
+        source_type: "remote",
+        url: "https://example.com/new-video",
+      });
+    });
+  });
+
+  it("keeps direct video source changes disabled for workspace-managed videos", async () => {
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "workspace-video",
+        source_url: "local-video://workspace-video",
+        title: "Workspace Video",
+        duration: 67.5,
+        created_at: new Date().toISOString(),
+        transcript: [],
+        metadata: null,
+        study: null,
+        video_source_type: "workspace",
+        local_video_path: "downloads/workspace-video.mp4",
+      },
+    ]);
+
+    render(<App />);
+
+    const changeButton = await screen.findByRole("button", { name: "更换视频源" });
+    expect((changeButton as HTMLButtonElement).disabled).toBe(true);
+    expect(bindVideoSource).not.toHaveBeenCalled();
+    expect(bindVideoSourceFromPicker).not.toHaveBeenCalled();
+  });
+
+  it("opens a collapsed video source binding manager grouped by collection", async () => {
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "missing-course",
+        source_url: "local-video://missing-course",
+        title: "Missing Lesson",
+        collection_title: "Batch Course",
+        course_index: 1,
+        duration: 12,
+        created_at: new Date().toISOString(),
+        transcript: [],
+        metadata: null,
+        study: null,
+        local_video_path: null,
+      },
+      {
+        id: "remote-course",
+        source_url: "https://example.com/remote",
+        title: "Remote Lesson",
+        collection_title: "Batch Course",
+        course_index: 2,
+        duration: 12,
+        created_at: new Date().toISOString(),
+        transcript: [],
+        metadata: null,
+        study: null,
+        video_source_type: "remote",
+        local_video_path: null,
+      },
+      {
+        id: "external-course",
+        source_url: "external-video://external-course",
+        title: "External Lesson",
+        collection_title: "Batch Course",
+        course_index: 3,
+        duration: 12,
+        created_at: new Date().toISOString(),
+        transcript: [],
+        metadata: null,
+        study: null,
+        video_source_type: "external",
+        local_video_path: "/Volumes/NAS/External Lesson.mp4",
+      },
+      {
+        id: "workspace-course",
+        source_url: "local-video://workspace-course",
+        title: "Workspace Lesson",
+        collection_title: "Batch Course",
+        course_index: 4,
+        duration: 12,
+        created_at: new Date().toISOString(),
+        transcript: [],
+        metadata: null,
+        study: null,
+        video_source_type: "workspace",
+        local_video_path: "downloads/workspace-course.mp4",
+      },
+    ]);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "管理视频源绑定" }));
+    const dialog = await screen.findByRole("dialog", { name: "管理视频源绑定" });
+    const modal = within(dialog);
+
+    expect(modal.queryByText("逐行绑定或更换视频源；不会自动匹配，也不会批量提交。")).toBeNull();
+    expect(modal.getByRole("button", { name: "展开 Batch Course" })).toBeTruthy();
+    expect(modal.queryByText("Missing Lesson")).toBeNull();
+
+    fireEvent.click(modal.getByRole("button", { name: "展开 Batch Course" }));
+
+    expect(modal.getByText("Missing Lesson")).toBeTruthy();
+    expect(modal.getByText("Remote Lesson")).toBeTruthy();
+    expect(modal.getByText("External Lesson")).toBeTruthy();
+    expect(modal.getByText("Workspace Lesson")).toBeTruthy();
+    expect(modal.getByText("暂未绑定")).toBeTruthy();
+    expect(modal.queryByText("未绑定")).toBeNull();
+    expect(modal.getByText("在线视频")).toBeTruthy();
+    expect(modal.getByText("文件链接")).toBeTruthy();
+    expect(modal.getByText("本地视频")).toBeTruthy();
+    expect(modal.getAllByText(/暂未绑定|在线视频|文件链接|本地视频/).every((node) =>
+      node.classList.contains("video-source-status"),
+    )).toBe(true);
+    expect((modal.getByLabelText("视频源 Workspace Lesson") as HTMLInputElement).readOnly).toBe(true);
+    expect(modal.queryByRole("button", { name: "绑定 Workspace Lesson" })).toBeNull();
+    expect(modal.queryByRole("button", { name: "更换 Workspace Lesson" })).toBeNull();
+    const missingBindButton = modal.getByRole("button", { name: "绑定 Missing Lesson" });
+    const deleteWorkspaceButton = modal.getByRole("button", { name: "删除 Workspace Lesson" });
+    expect(missingBindButton.parentElement?.classList.contains("split")).toBe(true);
+    expect(deleteWorkspaceButton.parentElement?.classList.contains("single")).toBe(true);
+  });
+
+  it("edits centralized video source rows one at a time", async () => {
+    const missingImportItem: CourseItem = {
+      id: "missing-import-course",
+      source_url: "local-video://missing-course",
+      title: "Missing Import Lesson",
+      collection_title: "Batch Course",
+      course_index: 1,
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    const missingBindItem: CourseItem = {
+      ...missingImportItem,
+      id: "missing-bind-course",
+      title: "Missing Bind Lesson",
+      course_index: 2,
+    };
+    const remoteItem: CourseItem = {
+      id: "remote-course",
+      source_url: "https://example.com/remote",
+      title: "Remote Lesson",
+      collection_title: "Batch Course",
+      course_index: 3,
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      video_source_type: "remote",
+      local_video_path: null,
+    };
+    const externalItem: CourseItem = {
+      id: "external-course",
+      source_url: "external-video://external-course",
+      title: "External Lesson",
+      collection_title: "Batch Course",
+      course_index: 4,
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      video_source_type: "external",
+      local_video_path: "/Volumes/NAS/External Lesson.mp4",
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([missingImportItem, missingBindItem, remoteItem, externalItem]);
+    vi.mocked(importWorkspaceVideoFromPicker).mockResolvedValueOnce({
+      ...missingImportItem,
+      source_url: "local-video://missing-import-course",
+      video_source_type: "workspace",
+      local_video_path: "downloads/missing-import-course.mp4",
+    });
+    vi.mocked(bindVideoSourceFromPicker).mockResolvedValueOnce({
+      ...missingBindItem,
+      source_url: "external-video://missing-bind-course",
+      video_source_type: "external",
+      local_video_path: "/Volumes/NAS/Missing Bind Lesson.mp4",
+    }).mockResolvedValueOnce({
+      ...externalItem,
+      source_url: "external-video://external-course",
+      video_source_type: "external",
+      local_video_path: "/Volumes/NAS/External Replacement.mp4",
+    });
+    vi.mocked(bindVideoSource).mockResolvedValueOnce({
+      ...remoteItem,
+      source_url: "external-video://remote-course",
+      video_source_type: "external",
+      local_video_path: "/Volumes/NAS/Remote Lesson.mp4",
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "管理视频源绑定" }));
+    const dialog = await screen.findByRole("dialog", { name: "管理视频源绑定" });
+    const modal = within(dialog);
+    fireEvent.click(modal.getByRole("button", { name: "展开 Batch Course" }));
+
+    expect(modal.queryByRole("button", { name: "保存视频源 Remote Lesson" })).toBeNull();
+    fireEvent.click(modal.getByRole("button", { name: "导入 Missing Import Lesson" }));
+    await waitFor(() => {
+      expect(importWorkspaceVideoFromPicker).toHaveBeenCalledWith("missing-import-course");
+    });
+
+    fireEvent.click(modal.getByRole("button", { name: "绑定 Missing Bind Lesson" }));
+    await waitFor(() => {
+      expect(bindVideoSourceFromPicker).toHaveBeenCalledWith("missing-bind-course");
+    });
+
+    fireEvent.click(modal.getByRole("button", { name: "更换 External Lesson" }));
+    await waitFor(() => {
+      expect(bindVideoSourceFromPicker).toHaveBeenCalledWith("external-course");
+    });
+
+    const remoteInput = modal.getByLabelText("视频源 Remote Lesson");
+    fireEvent.click(modal.getByRole("button", { name: "更换 Remote Lesson" }));
+    expect(bindVideoSourceFromPicker).not.toHaveBeenCalledWith("remote-course");
+    expect(modal.getByRole("button", { name: "保存视频源 Remote Lesson" })).toBeTruthy();
+    fireEvent.change(remoteInput, { target: { value: "/Volumes/NAS/Remote Lesson.mp4" } });
+    expect(modal.getByRole("button", { name: "保存视频源 Remote Lesson" })).toBeTruthy();
+    expect(modal.getByRole("button", { name: "取消编辑视频源 Remote Lesson" })).toBeTruthy();
+    fireEvent.click(modal.getByRole("button", { name: "保存视频源 Remote Lesson" }));
+
+    await waitFor(() => {
+      expect(bindVideoSource).toHaveBeenCalledWith("remote-course", {
+        source_type: "external",
+        path: "/Volumes/NAS/Remote Lesson.mp4",
+      });
+    });
+  });
+
+  it("deletes workspace local videos from the binding manager without deleting course materials", async () => {
+    const workspaceItem: CourseItem = {
+      id: "workspace-course",
+      source_url: "local-video://workspace-course",
+      title: "Workspace Lesson",
+      collection_title: "Batch Course",
+      course_index: 1,
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "Opening." }],
+      metadata: null,
+      study: {
+        one_line: "已有导览",
+        translated_title: null,
+        time_map: [],
+        outline: [],
+        detailed_notes: "已有解读",
+        high_fidelity_text: "已有详解",
+        translated_transcript: [],
+        prerequisites: [],
+        thought_prompts: [],
+        review_suggestions: [],
+      },
+      video_source_type: "workspace",
+      local_video_path: "downloads/workspace-course.mp4",
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([workspaceItem]);
+    vi.mocked(deleteLocalVideo).mockResolvedValueOnce({
+      ...workspaceItem,
+      local_video_path: null,
+    });
+    vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "管理视频源绑定" }));
+    const dialog = await screen.findByRole("dialog", { name: "管理视频源绑定" });
+    const modal = within(dialog);
+    fireEvent.click(modal.getByRole("button", { name: "展开 Batch Course" }));
+
+    fireEvent.click(modal.getByRole("button", { name: "删除 Workspace Lesson" }));
+
+    await waitFor(() => {
+      expect(deleteLocalVideo).toHaveBeenCalledWith("workspace-course");
+    });
+    expect(await modal.findByText("暂未绑定")).toBeTruthy();
+    expect(modal.getByText("Workspace Lesson")).toBeTruthy();
+    expect(modal.getByRole("button", { name: "导入 Workspace Lesson" })).toBeTruthy();
+    expect(modal.getByRole("button", { name: "绑定 Workspace Lesson" })).toBeTruthy();
   });
 
   it("shows structured extraction errors instead of object strings", async () => {
@@ -1222,6 +1648,94 @@ describe("App language defaults", () => {
     });
   });
 
+  it("starts study regeneration when mounted under React StrictMode", async () => {
+    const item: CourseItem = {
+      id: "strict-study",
+      source_url: "https://www.youtube.com/watch?v=strict",
+      title: "Strict Study Lesson",
+      duration: 42,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "Opening idea." }],
+      metadata: null,
+      study: {
+        one_line: "课程摘要。",
+        translated_title: null,
+        time_map: [{ start: 0, end: 4, title: "开场", summary: "开场观点。", priority: "focus" }],
+        outline: [],
+        detailed_notes: "旧解读",
+        high_fidelity_text: "旧详解",
+        translated_transcript: [],
+        prerequisites: [],
+        thought_prompts: [],
+        review_suggestions: [],
+      },
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValue([item]);
+    vi.mocked(startStudyJob).mockResolvedValue({
+      job_id: "strict-study-job",
+      item_id: "strict-study",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "全部重新生成" }));
+
+    await waitFor(() => {
+      expect(startStudyJob).toHaveBeenCalledWith("strict-study", "zh-CN", "all", "standard");
+    });
+  });
+
+  it("starts first study map generation when mounted under React StrictMode", async () => {
+    const item: CourseItem = {
+      id: "strict-new-study",
+      source_url: "https://www.youtube.com/watch?v=strict-new",
+      title: "Strict New Study Lesson",
+      duration: 42,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "Opening idea." }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValue([item]);
+    vi.mocked(startStudyJob).mockResolvedValue({
+      job_id: "strict-new-study-job",
+      item_id: "strict-new-study",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "生成学习地图" }));
+
+    await waitFor(() => {
+      expect(startStudyJob).toHaveBeenCalledWith("strict-new-study", "zh-CN", "all", "standard");
+    });
+  });
+
   it("shows beginner and experienced guide suggestions as additional guide modules", async () => {
     const item: CourseItem = {
       id: "abc123",
@@ -1441,7 +1955,372 @@ describe("App language defaults", () => {
       message: "学习材料已生成",
       error: null,
     });
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledTimes(2), { timeout: 3500 });
   });
+
+  it("does not steal course selection while a study job refreshes in the background", async () => {
+    vi.mocked(listItems).mockReset();
+    vi.mocked(startStudyJob).mockReset();
+    vi.mocked(getStudyJob).mockReset();
+    const existingStudy = {
+      one_line: "旧课程导览。",
+      translated_title: null,
+      time_map: [{ start: 0, end: 4, title: "旧学习块", summary: "旧学习块摘要。", priority: "focus" as const }],
+      outline: [],
+      detailed_notes: "",
+      high_fidelity_text: "",
+      translated_transcript: [],
+      prerequisites: [],
+      thought_prompts: [],
+      review_suggestions: [],
+    };
+    const generatingItem: CourseItem = {
+      id: "generating-lesson",
+      source_url: "https://www.youtube.com/watch?v=generating",
+      title: "Generating Lesson",
+      duration: 42,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "Opening idea." }],
+      metadata: null,
+      study: existingStudy,
+      local_video_path: null,
+    };
+    const otherItem: CourseItem = {
+      id: "other-lesson",
+      source_url: "https://www.youtube.com/watch?v=other",
+      title: "Other Lesson",
+      duration: 120,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 5, text: "Other opening." }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    const partialGeneratingItem: CourseItem = {
+      ...generatingItem,
+      study: {
+        ...existingStudy,
+        one_line: "生成中的课程导览。",
+        prerequisites: ["生成中的预备知识"],
+      },
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([generatingItem, otherItem]).mockResolvedValue([partialGeneratingItem, otherItem]);
+    vi.mocked(startStudyJob).mockResolvedValue({
+      job_id: "study-job-1",
+      item_id: "generating-lesson",
+      status: "running",
+      progress: 12,
+      phase: "guide",
+      message: "正在生成学习导览",
+      error: null,
+    });
+    vi.mocked(getStudyJob)
+      .mockResolvedValueOnce({
+        job_id: "study-job-1",
+        item_id: "generating-lesson",
+        status: "running",
+        progress: 18,
+        phase: "guide",
+        message: "正在生成学习导览",
+        error: null,
+      })
+      .mockResolvedValueOnce({
+        job_id: "study-job-1",
+        item_id: "generating-lesson",
+        status: "succeeded",
+        progress: 100,
+        phase: "complete",
+        message: "学习材料已生成",
+        error: null,
+      });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "全部重新生成" }));
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledWith("generating-lesson", "zh-CN", "all", "standard"));
+    fireEvent.click(getLibraryCourseButtons("Other Lesson")[0]);
+
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledTimes(2), { timeout: 3500 });
+    expect(screen.getByRole("heading", { name: "Other Lesson" })).toBeTruthy();
+  });
+
+  it("queues study rebuild clicks across courses and sections in click order", async () => {
+    vi.mocked(listItems).mockReset();
+    vi.mocked(startStudyJob).mockReset();
+    vi.mocked(getStudyJob).mockReset();
+    const lessonA = studyQueueCourse("lesson-a", "Lesson A");
+    const lessonB = studyQueueCourse("lesson-b", "Lesson B");
+    const lessonC = studyQueueCourse("lesson-c", "Lesson C");
+    vi.mocked(listItems).mockResolvedValue([lessonA, lessonB, lessonC]);
+    vi.mocked(startStudyJob).mockImplementation(async (itemId, _outputLanguage, section) => {
+      const requestedSection = section ?? "all";
+      return {
+        job_id: `${itemId}-${requestedSection}`,
+        item_id: itemId,
+        status: "running",
+        progress: 12,
+        phase: requestedSection,
+        message: "正在生成学习地图",
+        error: null,
+      };
+    });
+    vi.mocked(getStudyJob).mockImplementation(async (jobId) => ({
+      job_id: jobId,
+      item_id: jobId.split("-").slice(0, 2).join("-"),
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+    }));
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "大纲" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新生成大纲" }));
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(getLibraryCourseButtons("Lesson B")[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "全部重新生成" }));
+
+    fireEvent.click(getLibraryCourseButtons("Lesson C")[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "详解" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新生成详解" }));
+
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledTimes(3), { timeout: 4200 });
+    expect(startStudyJob).toHaveBeenNthCalledWith(1, "lesson-a", "zh-CN", "outline", "standard");
+    expect(startStudyJob).toHaveBeenNthCalledWith(2, "lesson-b", "zh-CN", "all", "standard");
+    expect(startStudyJob).toHaveBeenNthCalledWith(3, "lesson-c", "zh-CN", "high", "standard");
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledTimes(3), { timeout: 4500 });
+    await waitFor(() => expect(screen.queryByLabelText("学习地图生成队列")).toBeNull(), { timeout: 3500 });
+    expect(screen.getByRole("heading", { name: "Lesson C" })).toBeTruthy();
+  }, 8000);
+
+  it("shows the study map generation queue only when tasks are waiting", async () => {
+    vi.mocked(listItems).mockReset();
+    vi.mocked(startStudyJob).mockReset();
+    vi.mocked(getStudyJob).mockReset();
+    const lessonA = studyQueueCourse("lesson-a", "Lesson A");
+    const lessonB = studyQueueCourse("lesson-b", "Lesson B");
+    const lessonC = studyQueueCourse("lesson-c", "Lesson C");
+    vi.mocked(listItems).mockResolvedValue([lessonA, lessonB, lessonC]);
+    vi.mocked(startStudyJob).mockImplementation(async (itemId, _outputLanguage, section) => {
+      const requestedSection = section ?? "all";
+      return {
+        job_id: `${itemId}-${requestedSection}`,
+        item_id: itemId,
+        status: "running",
+        progress: 12,
+        phase: requestedSection,
+        message: "正在生成学习地图",
+        error: null,
+      };
+    });
+    const lessonAResolver: { current?: (status: StudyJobStatus) => void } = {};
+    vi.mocked(getStudyJob).mockImplementation(
+      () =>
+        new Promise<StudyJobStatus>((resolve) => {
+          lessonAResolver.current = resolve;
+        }),
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "大纲" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新生成大纲" }));
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledTimes(1));
+    expect(document.querySelector(".study-queue-drawer")).toBeNull();
+
+    fireEvent.click(getLibraryCourseButtons("Lesson B")[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "全部重新生成" }));
+
+    fireEvent.click(getLibraryCourseButtons("Lesson C")[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "详解" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新生成详解" }));
+
+    const queueButton = await screen.findByRole("button", { name: "学习地图生成队列 2" });
+    fireEvent.click(queueButton);
+    const drawer = queueButton.closest(".study-queue-drawer") as HTMLElement;
+    expect(within(drawer).queryByText("Lesson A")).toBeNull();
+    expect(within(drawer).getByText("Lesson B")).toBeTruthy();
+    expect(within(drawer).getByText("Lesson C")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "学习地图生成队列 3" })).toBeNull();
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "取消排队任务 Lesson B 全部重新生成" }));
+    fireEvent.click(within(drawer).getByRole("button", { name: "取消排队任务 Lesson C 重新生成详解" }));
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledTimes(1), { timeout: 3500 });
+    const resolveLessonA = lessonAResolver.current;
+    if (!resolveLessonA) {
+      throw new Error("Lesson A resolver was not registered.");
+    }
+    resolveLessonA({
+      job_id: "lesson-a-outline",
+      item_id: "lesson-a",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+    });
+    await waitFor(() => expect(document.querySelector(".study-queue-drawer")).toBeNull(), { timeout: 3500 });
+  }, 8000);
+
+  it("cancels queued study rebuild tasks without stopping later queued work", async () => {
+    vi.mocked(listItems).mockReset();
+    vi.mocked(startStudyJob).mockReset();
+    vi.mocked(getStudyJob).mockReset();
+    const lessonA = studyQueueCourse("lesson-a", "Lesson A");
+    const lessonB = studyQueueCourse("lesson-b", "Lesson B");
+    const lessonC = studyQueueCourse("lesson-c", "Lesson C");
+    vi.mocked(listItems).mockResolvedValue([lessonA, lessonB, lessonC]);
+    vi.mocked(startStudyJob).mockImplementation(async (itemId, _outputLanguage, section) => {
+      const requestedSection = section ?? "all";
+      return {
+        job_id: `${itemId}-${requestedSection}`,
+        item_id: itemId,
+        status: "running",
+        progress: 12,
+        phase: requestedSection,
+        message: "正在生成学习地图",
+        error: null,
+      };
+    });
+    const lessonAResolver: { current?: (status: StudyJobStatus) => void } = {};
+    vi.mocked(getStudyJob).mockImplementation((jobId) => {
+      if (jobId === "lesson-a-outline") {
+        return new Promise<StudyJobStatus>((resolve) => {
+          lessonAResolver.current = resolve;
+        });
+      }
+      return Promise.resolve({
+        job_id: jobId,
+        item_id: "lesson-c",
+        status: "succeeded",
+        progress: 100,
+        phase: "complete",
+        message: "学习材料已生成",
+        error: null,
+      });
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "大纲" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新生成大纲" }));
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(getLibraryCourseButtons("Lesson B")[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "全部重新生成" }));
+
+    fireEvent.click(getLibraryCourseButtons("Lesson C")[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "详解" }));
+    fireEvent.click(await screen.findByRole("button", { name: "重新生成详解" }));
+
+    const queueButton = await screen.findByRole("button", { name: "学习地图生成队列 2" });
+    fireEvent.click(queueButton);
+    const drawer = queueButton.closest(".study-queue-drawer") as HTMLElement;
+
+    expect(within(drawer).queryByText("Lesson A")).toBeNull();
+    fireEvent.click(within(drawer).getByRole("button", { name: "取消排队任务 Lesson B 全部重新生成" }));
+
+    expect(within(drawer).queryByText("Lesson B")).toBeNull();
+    expect(within(drawer).getByText("Lesson C")).toBeTruthy();
+
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledWith("lesson-a-outline"), { timeout: 3500 });
+    const resolveLessonA = lessonAResolver.current;
+    if (!resolveLessonA) {
+      throw new Error("Lesson A resolver was not registered.");
+    }
+    resolveLessonA({
+      job_id: "lesson-a-outline",
+      item_id: "lesson-a",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "学习材料已生成",
+      error: null,
+    });
+
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledTimes(2), { timeout: 3500 });
+    expect(startStudyJob).toHaveBeenNthCalledWith(2, "lesson-c", "zh-CN", "high", "standard");
+    expect(startStudyJob).not.toHaveBeenCalledWith("lesson-b", expect.anything(), expect.anything(), expect.anything());
+  }, 8000);
+
+  it("keeps later study rebuild tasks moving after a failure and lets the failed task be retried", async () => {
+    vi.mocked(listItems).mockReset();
+    vi.mocked(startStudyJob).mockReset();
+    vi.mocked(getStudyJob).mockReset();
+    const lessonA = studyQueueCourse("lesson-a", "Lesson A");
+    const lessonB = studyQueueCourse("lesson-b", "Lesson B");
+    vi.mocked(listItems).mockResolvedValue([lessonA, lessonB]);
+    let studyStartCall = 0;
+    vi.mocked(startStudyJob).mockImplementation(async (itemId, _outputLanguage, section) => {
+      studyStartCall += 1;
+      const requestedSection = section ?? "all";
+      return {
+        job_id: `${itemId}-${requestedSection}-${studyStartCall}`,
+        item_id: itemId,
+        status: "running",
+        progress: 12,
+        phase: requestedSection,
+        message: "正在生成学习地图",
+        error: null,
+      };
+    });
+    vi.mocked(getStudyJob).mockImplementation(async (jobId) => {
+      if (jobId === "lesson-a-all-1") {
+        return {
+          job_id: jobId,
+          item_id: "lesson-a",
+          status: "failed",
+          progress: 100,
+          phase: "failed",
+          message: "学习材料生成失败",
+          error: "详解退化成逐句字幕列表",
+        };
+      }
+      return {
+        job_id: jobId,
+        item_id: jobId.startsWith("lesson-a-") ? "lesson-a" : "lesson-b",
+        status: "succeeded",
+        progress: 100,
+        phase: "complete",
+        message: "学习材料已生成",
+        error: null,
+      };
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "全部重新生成" }));
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(getLibraryCourseButtons("Lesson B")[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "全部重新生成" }));
+
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledTimes(2), { timeout: 3600 });
+    const queueButton = await screen.findByRole("button", { name: "学习地图生成队列" });
+    expect(queueButton.closest(".right-rail")).toBeNull();
+    expect(queueButton.closest(".study-queue-drawer")).toBeTruthy();
+    expect(screen.queryByText(/详解退化成逐句字幕列表/)).toBeNull();
+
+    fireEvent.click(queueButton);
+    const rightRail = document.querySelector(".right-rail") as HTMLElement;
+    expect(within(rightRail).queryByLabelText("学习地图生成队列")).toBeNull();
+    expect((await screen.findAllByText(/学习地图任务失败/)).length).toBeGreaterThan(0);
+    expect(screen.getByText(/详解退化成逐句字幕列表/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "重试失败任务 Lesson A 全部重新生成" }));
+
+    await waitFor(() => expect(startStudyJob).toHaveBeenCalledTimes(3), { timeout: 3500 });
+    expect(startStudyJob).toHaveBeenNthCalledWith(3, "lesson-a", "zh-CN", "all", "standard");
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledTimes(3), { timeout: 4500 });
+  }, 8000);
 
   it("renames a course title from the library", async () => {
     const item = {
@@ -1559,6 +2438,221 @@ describe("App language defaults", () => {
     expect(await screen.findByText("AI Prompting Updated")).toBeTruthy();
   });
 
+  it("creates and deletes categories from the single library create menu", async () => {
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("摄影");
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("课程库")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "新建" }));
+    expect(screen.getByRole("button", { name: "新建专辑" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "新建分类" }));
+
+    expect(screen.getByRole("button", { name: "收起分类 摄影" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "删除分类 摄影" })).toBeTruthy();
+    const emptyCategory = screen.getByText("还没有专辑");
+    expect(emptyCategory.className).toContain("library-category-empty");
+    expect(emptyCategory.className).toContain("library-node-empty");
+    expect(screen.queryByText(/上层专辑/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "删除分类 摄影" }));
+    expect(confirmSpy).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "收起分类 摄影" })).toBeNull();
+    });
+
+    promptSpy.mockRestore();
+    confirmSpy.mockRestore();
+  });
+
+  it("uses one compact empty state style for empty collections and categories", async () => {
+    const promptSpy = vi.spyOn(window, "prompt")
+      .mockReturnValueOnce("空专辑")
+      .mockReturnValueOnce("空分类");
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("课程库")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "新建" }));
+    fireEvent.click(screen.getByRole("button", { name: "新建专辑" }));
+    fireEvent.click(screen.getByRole("button", { name: "新建" }));
+    fireEvent.click(screen.getByRole("button", { name: "新建分类" }));
+
+    expect(screen.getByText("暂无课程").className).toContain("library-node-empty");
+    expect(screen.getByText("还没有专辑").className).toContain("library-node-empty");
+
+    promptSpy.mockRestore();
+  });
+
+  it("creates a category from the collection editor and assigns the collection to it", async () => {
+    const first = {
+      id: "photo-lesson-1",
+      source_url: "https://example.com/photo-lesson-1",
+      title: "Photo Lesson One",
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+      collection_title: "当代经典摄影20讲",
+      course_index: 1,
+      sort_order: 1,
+    };
+    const second = {
+      ...first,
+      id: "photo-lesson-2",
+      source_url: "https://example.com/photo-lesson-2",
+      title: "Photo Lesson Two",
+      collection_title: "摄影审美课",
+      course_index: 1,
+      sort_order: 1,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([first, second]);
+    vi.mocked(updateCourseItem).mockImplementation(async (itemId, input) => ({
+      ...(itemId === "photo-lesson-1" ? first : second),
+      collection_group_title: input.collection_group_title ?? "",
+      collection_title: input.collection_title ?? "",
+      course_index: input.course_index ?? null,
+      sort_order: input.sort_order ?? null,
+    }));
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("摄影");
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("当代经典摄影20讲")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑专辑 当代经典摄影20讲" }));
+    const categorySelect = screen.getByLabelText("分类") as HTMLSelectElement;
+    const createCategoryOption = screen.getByRole("option", { name: "新建分类" }) as HTMLOptionElement;
+    fireEvent.change(categorySelect, { target: { value: createCategoryOption.value } });
+    expect(categorySelect.value).toBe("摄影");
+    fireEvent.submit((screen.getByLabelText("专辑名称") as HTMLInputElement).closest("form") as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(updateCourseItem).toHaveBeenCalledWith(
+        "photo-lesson-1",
+        expect.objectContaining({
+          collection_group_title: "摄影",
+          collection_title: "当代经典摄影20讲",
+        }),
+      );
+    });
+    const category = screen.getByRole("button", { name: "收起分类 摄影" }).closest(".library-collection-group");
+    expect(category).toBeTruthy();
+    expect(within(category as HTMLElement).getByText("当代经典摄影20讲")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "收起分类 摄影" }));
+    expect(screen.queryByRole("button", { name: "收起专辑 当代经典摄影20讲" })).toBeNull();
+    expect(screen.queryByText(/上层专辑/)).toBeNull();
+
+    promptSpy.mockRestore();
+  });
+
+  it("keeps categories together and lets category rows move", async () => {
+    const product = {
+      id: "product-lesson",
+      source_url: "https://example.com/product",
+      title: "Product Lesson",
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+      collection_group_title: "产品",
+      collection_title: "三节课 产品经理",
+      course_index: 1,
+      sort_order: 1,
+    };
+    const productSibling = {
+      ...product,
+      id: "product-lesson-2",
+      source_url: "https://example.com/product-2",
+      title: "Product Lesson Two",
+      course_index: 2,
+      sort_order: 2,
+    };
+    const photo = {
+      ...product,
+      id: "photo-lesson",
+      source_url: "https://example.com/photo",
+      title: "Photo Lesson",
+      collection_group_title: "摄影",
+      collection_title: "当代经典摄影20讲",
+    };
+    const ungrouped = {
+      ...product,
+      id: "ai-lesson",
+      source_url: "https://example.com/ai",
+      title: "AI Lesson",
+      collection_group_title: "",
+      collection_title: "AI Prompting",
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([product, productSibling, photo, ungrouped]);
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "收起分类 产品" })).toBeTruthy());
+    const productCategory = screen.getByRole("button", { name: "收起分类 产品" }).closest(".library-collection-group") as HTMLElement;
+    expect(productCategory.querySelector(".library-collection-group-actions")).toBeTruthy();
+    const productCount = productCategory.querySelector(".library-collection-group-count");
+    expect(productCount).toBeTruthy();
+    expect(productCount?.textContent).toBe("1");
+    expect(getTopLevelLibraryEntryNames().slice(0, 3)).toEqual(["产品", "摄影", "AI Prompting"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "下移分类 产品" }));
+
+    expect(getTopLevelLibraryEntryNames().slice(0, 3)).toEqual(["摄影", "产品", "AI Prompting"]);
+  });
+
+  it("creates a collection from the course editor and assigns the course to it", async () => {
+    const item = {
+      id: "single-lesson",
+      source_url: "https://example.com/single-lesson",
+      title: "Single Lesson",
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+      collection_title: "",
+      course_index: null,
+      sort_order: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(updateCourseItem).mockImplementation(async (_itemId, input) => ({
+      ...item,
+      title: input.title ?? item.title,
+      translated_title: input.translated_title ?? null,
+      collection_title: input.collection_title ?? "",
+      course_index: input.course_index ?? null,
+      sort_order: input.sort_order ?? null,
+    }));
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("新专辑");
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "编辑标题 Single Lesson" }));
+    const collectionSelect = screen.getByLabelText("所属专辑") as HTMLSelectElement;
+    const createCollectionOption = screen.getByRole("option", { name: "新建专辑" }) as HTMLOptionElement;
+    fireEvent.change(collectionSelect, { target: { value: createCollectionOption.value } });
+    expect(collectionSelect.value).toBe("新专辑");
+    fireEvent.submit((screen.getByLabelText("课程标题") as HTMLInputElement).closest("form") as HTMLFormElement);
+
+    await waitFor(() => {
+      expect(updateCourseItem).toHaveBeenCalledWith(
+        "single-lesson",
+        expect.objectContaining({
+          collection_title: "新专辑",
+        }),
+      );
+    });
+
+    promptSpy.mockRestore();
+  });
+
   it("deletes a collection without deleting its courses", async () => {
     const first = {
       id: "lesson-1",
@@ -1610,6 +2704,55 @@ describe("App language defaults", () => {
     expect(getLibraryCourseButtons("Lesson One").length).toBeGreaterThan(0);
     expect(getLibraryCourseButtons("Lesson Two").length).toBeGreaterThan(0);
     confirmSpy.mockRestore();
+  });
+
+  it("opens the course package export dialog with collections collapsed by default", async () => {
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "lesson-1",
+        source_url: "https://example.com/lesson-1",
+        title: "Lesson One",
+        duration: 60,
+        created_at: new Date().toISOString(),
+        transcript: [{ start: 0, end: 2, text: "Opening." }],
+        metadata: null,
+        study: null,
+        local_video_path: null,
+        collection_title: "AI Prompting",
+        course_index: 1,
+        sort_order: 1,
+      },
+      {
+        id: "lesson-2",
+        source_url: "https://example.com/lesson-2",
+        title: "Lesson Two",
+        duration: 60,
+        created_at: new Date().toISOString(),
+        transcript: [{ start: 0, end: 2, text: "Opening." }],
+        metadata: null,
+        study: null,
+        local_video_path: null,
+        collection_title: "AI Prompting",
+        course_index: 2,
+        sort_order: 2,
+      },
+    ]);
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "导出课程" }));
+    const dialog = await screen.findByRole("dialog", { name: "导出课程包" });
+    const modal = within(dialog);
+
+    expect(modal.getByText("AI Prompting")).toBeTruthy();
+    expect(modal.queryByText("1. Lesson One")).toBeNull();
+
+    fireEvent.click(modal.getByRole("button", { name: "展开导出专辑 AI Prompting" }));
+    expect(modal.getByText("1. Lesson One")).toBeTruthy();
+    expect(modal.getByText("2. Lesson Two")).toBeTruthy();
+
+    fireEvent.click(modal.getByRole("button", { name: "收起导出专辑 AI Prompting" }));
+    expect(modal.queryByText("1. Lesson One")).toBeNull();
   });
 
   it("remembers manual time-map collapse preference", async () => {
@@ -1692,10 +2835,12 @@ describe("App language defaults", () => {
 });
 
 function installTestLocalStorage() {
+  const existingLocalStorage = window.localStorage;
   if (
-    typeof window.localStorage.getItem === "function" &&
-    typeof window.localStorage.setItem === "function" &&
-    typeof window.localStorage.removeItem === "function"
+    existingLocalStorage &&
+    typeof existingLocalStorage.getItem === "function" &&
+    typeof existingLocalStorage.setItem === "function" &&
+    typeof existingLocalStorage.removeItem === "function"
   ) {
     return;
   }
@@ -1725,4 +2870,55 @@ function getLibraryCourseButtons(title: string): HTMLElement[] {
     .queryAllByText(title)
     .map((node) => node.closest("button.library-item"))
     .filter((button): button is HTMLElement => button instanceof HTMLElement);
+}
+
+function getTopLevelLibraryEntryNames(): string[] {
+  const list = document.querySelector(".library-list");
+  return Array.from(list?.children ?? []).flatMap((child) => {
+    if (!(child instanceof HTMLElement)) return [];
+    if (child.classList.contains("library-collection-group")) {
+      const label = child.querySelector(".library-collection-group-toggle span:last-child")?.textContent?.trim();
+      return label ? [label] : [];
+    }
+    if (child.classList.contains("library-collection")) {
+      const label = child.querySelector(".library-collection-toggle span:last-child")?.textContent?.trim();
+      return label ? [label] : [];
+    }
+    return [];
+  });
+}
+
+function studyQueueCourse(id: string, title: string): CourseItem {
+  return {
+    id,
+    source_url: `https://example.com/${id}`,
+    title,
+    duration: 60,
+    created_at: new Date().toISOString(),
+    transcript: [{ start: 0, end: 5, text: `${title} opening.` }],
+    metadata: null,
+    study: {
+      one_line: `${title} guide.`,
+      translated_title: null,
+      context_summary: `${title} context.`,
+      time_map: [{ start: 0, end: 5, title: `${title} block`, summary: `${title} summary.`, priority: "focus" }],
+      outline: [
+        {
+          id: `${id}-outline`,
+          start: 0,
+          end: 5,
+          title: `${title} outline`,
+          summary: `${title} outline summary.`,
+          children: [],
+        },
+      ],
+      detailed_notes: `${title} interpretation.`,
+      high_fidelity_text: `${title} detailed.`,
+      translated_transcript: [],
+      prerequisites: [],
+      thought_prompts: [],
+      review_suggestions: [],
+    },
+    local_video_path: null,
+  };
 }

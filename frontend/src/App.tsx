@@ -16,6 +16,7 @@ import {
   FolderPlus,
   GitCompare,
   Languages,
+  Link2,
   Loader2,
   Maximize2,
   Minimize2,
@@ -32,6 +33,7 @@ import {
 import type {
   ChangeEvent as ReactChangeEvent,
   CSSProperties,
+  FormEvent as ReactFormEvent,
   MouseEvent as ReactMouseEvent,
   MutableRefObject,
   PointerEvent as ReactPointerEvent,
@@ -40,6 +42,8 @@ import type {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  bindVideoSource,
+  bindVideoSourceFromPicker,
   cleanupAsrCache,
   deleteCourse,
   deleteLocalVideo,
@@ -52,6 +56,8 @@ import {
   getStudyJob,
   importCoursePackage,
   importLocalVideo,
+  importLocalVideosFromPicker,
+  importWorkspaceVideoFromPicker,
   itemVideoPath,
   listItems,
   listAvailableModels,
@@ -92,6 +98,7 @@ import type {
   CourseSharePackage,
   CourseItem,
   ExtractMode,
+  LocalVideoImportMode,
   ModelProfile,
   ModelProfileInput,
   ModelProviderType,
@@ -111,11 +118,13 @@ import type {
   TranscriptSource,
   TranscriptSegment,
   UiLanguage,
+  VideoSourceBindingInput,
 } from "./types";
 import { buildWebVttTrack, formatTime, getBilibiliVideoId, getYouTubeVideoId } from "./utils";
 
 type AiTab = "guide" | "outline" | "detailed" | "high";
 type SourceMode = "embed" | "local";
+type VideoSourceStatus = "missing" | "remote" | "external" | "workspace";
 type TextDisplayMode = "source" | "target" | "bilingual";
 type CaptionDisplayMode = TextDisplayMode | "hidden";
 type CaptionPlacement = "overlay" | "panel";
@@ -123,6 +132,19 @@ type LayoutDragKind = "left" | "right" | "player";
 type AsrSuggestionDirection = -1 | 1;
 type SubtitleSourceChoice = TranscriptSource | "local_upload";
 type StudyMapDetailMode = Extract<StudyDetailLevel, "standard" | "faithful">;
+type StudyQueueTaskStatus = "queued" | "running" | "failed";
+type StudyQueueTask = {
+  id: string;
+  itemId: string;
+  itemTitle: string;
+  section: StudySection;
+  outputLanguage: OutputLanguage;
+  detailLevel: StudyMapDetailMode;
+  status: StudyQueueTaskStatus;
+  message: string | null;
+  error: string | null;
+  jobId: string | null;
+};
 
 function requestTranscriptSource(source: SubtitleSourceChoice): TranscriptSource {
   return source === "local_upload" ? "subtitles" : source;
@@ -143,6 +165,7 @@ type TaskParameterDraft = {
 type CourseEditDraft = {
   title: string;
   translated_title: string;
+  collection_group_title: string;
   collection_title: string;
   course_index: string;
 };
@@ -150,8 +173,12 @@ type LibraryCollectionGroup = {
   key: string;
   title: string;
   value: string;
+  groupTitle: string;
   items: CourseItem[];
 };
+type LibraryCollectionEntry =
+  | { type: "collection"; group: LibraryCollectionGroup }
+  | { type: "group"; key: string; title: string; value: string; collections: LibraryCollectionGroup[]; collectionCount: number };
 type SettingsDraft = {
   profiles: ModelProfileDraft[];
   active_profile_id: string;
@@ -241,7 +268,15 @@ const COPY = {
     importLocalVideo: "导入本地视频",
     importLocalVideoFile: "选择本地视频文件",
     importingLocalVideo: "正在导入本地视频",
+    linkingLocalVideo: "正在链接原位置视频",
+    importVideoTitle: "导入视频",
+    importVideoHelp: "选择复制到 Workspace，或只保留原文件位置的链接。",
+    importVideoCopyToWorkspace: "复制到 Workspace",
+    importVideoCopyHelp: "适合需要离线副本的视频，会占用 Workspace 空间。",
+    importVideoLinkOriginal: "链接原位置",
+    importVideoLinkHelp: "适合 NAS、外置盘或本机大文件，不会复制视频。",
     localVideoAlreadyCached: "本地视频已经在 Workspace 中",
+    linkedVideoAlreadyMounted: "视频已链接原位置",
     localSubtitleNoTarget: "请先打开或选择一个课程，再上传本地字幕。",
     localSubtitleEmpty: "没有解析到可用字幕。",
     subtitlesReady: "已有字幕",
@@ -259,6 +294,7 @@ const COPY = {
     modelProfileLibrary: "模型档案",
     asrModelProfileLibrary: "ASR 模型档案",
     addModelProfile: "新增档案",
+    addLibraryEntry: "新建",
     addCollection: "新建专辑",
     activeModelProfile: "正在编辑",
     unnamedModelProfile: "未命名档案",
@@ -334,6 +370,7 @@ const COPY = {
     library: "课程库",
     importCourses: "导入课程",
     exportCourses: "导出课程",
+    addCollectionGroup: "新建分类",
     importCoursePackage: "导入课程包",
     exportCoursePackage: "导出课程包",
     exportCoursePackageTitle: "选择要导出的课程",
@@ -342,6 +379,8 @@ const COPY = {
     selectCoursesToExport: "选择课程",
     shareMessage: "留言",
     shareMessagePlaceholder: "可以写一句想留给导入者的话，也可以留空。",
+    expandExportCollection: "展开导出专辑",
+    collapseExportCollection: "收起导出专辑",
     noExportSelection: "请先选择至少一个课程。",
     importPackageFailed: "课程包导入失败",
     importMessageTitle: "来自分享者的留言",
@@ -357,6 +396,35 @@ const COPY = {
     stream: "在线播放",
     local: "本地",
     cache: "缓存",
+    importToWorkspace: "导入",
+    importToWorkspaceTitle: "导入到 Workspace",
+    importingWorkspaceVideo: "正在导入到 Workspace",
+    bulkVideoSourceBinding: "管理视频源绑定",
+    bulkVideoSourceHelp: "",
+    expandVideoSourceGroup: "展开",
+    collapseVideoSourceGroup: "收起",
+    unboundVideoSource: "暂未绑定",
+    onlineVideoSource: "在线视频",
+    fileVideoSource: "文件链接",
+    workspaceVideoSource: "本地视频",
+    videoSourceField: "视频源",
+    videoSourceRequired: "请填写视频源地址或路径。",
+    saveVideoSource: "保存视频源",
+    cancelVideoSourceEdit: "取消编辑视频源",
+    bindFileVideoSource: "绑定",
+    changeVideoSourceBinding: "更换",
+    deleteWorkspaceVideo: "删除",
+    deleteWorkspaceVideoTitle: "删除本地视频",
+    deleteWorkspaceVideoConfirm: "确定要删除这个课程的本地视频吗？字幕和学习地图会保留。",
+    bindVideoSource: "绑定视频源",
+    changeVideoSource: "更换视频源",
+    videoSourceDialogHelp: "为当前课程绑定线上视频链接，或从 Finder 选择本机、外置盘、NAS 上的视频文件。",
+    onlineVideoLink: "线上视频链接",
+    onlineVideoLinkPlaceholder: "https://...",
+    useOnlineVideoLink: "使用线上链接",
+    chooseLocalOrNasVideo: "选择本地或 NAS 文件",
+    bindingVideoSource: "正在绑定视频源",
+    workspaceVideoChangeDisabled: "Workspace 视频源不可直接更换",
     transcript: "字幕列表",
     asrCorrection: "ASR 校正",
     openAsrCorrection: "打开 ASR 校正工作台",
@@ -447,6 +515,16 @@ const COPY = {
     regenerateDetailed: "重新生成解读",
     regenerateHigh: "重新生成详解",
     regenerateFullStudy: "全部重新生成",
+    studyQueueStatus: "学习地图生成队列",
+    studyQueueRunning: "正在重建",
+    studyQueueCurrent: "当前",
+    studyQueueQueued: "排队中",
+    studyQueueFailed: "学习地图任务失败",
+    expandStudyQueue: "展开学习地图生成队列",
+    collapseStudyQueue: "收起学习地图生成队列",
+    cancelQueuedStudyTask: "取消排队任务",
+    retryStudyTask: "重试失败任务",
+    dismissStudyTask: "清除失败任务",
     studyMapDetailLevel: "详细程度",
     studyMapDetailStandard: "标准",
     studyMapDetailFaithful: "高保真",
@@ -463,15 +541,25 @@ const COPY = {
     courseCollection: "所属专辑",
     courseCollectionFallback: "未归档",
     emptyCollection: "暂无课程",
+    emptyCollectionGroup: "还没有专辑",
     newCollectionPrompt: "输入新专辑名称",
+    newCollectionGroupPrompt: "输入分类名称",
     collapseCollection: "收起专辑",
     expandCollection: "展开专辑",
+    collapseCollectionGroup: "收起分类",
+    expandCollectionGroup: "展开分类",
+    deleteCollectionGroup: "删除分类",
+    deleteCollectionGroupConfirm: "删除这个分类？分类里的专辑不会被删除，会移动到未分类。",
     editCollection: "编辑专辑",
     deleteCollection: "删除专辑",
     deleteCollectionConfirm: "删除这个专辑？课程不会被删除，会移动到未归档。",
     saveCollection: "保存专辑",
     cancelCollectionEdit: "取消编辑专辑",
     collectionTitle: "专辑名称",
+    collectionGroupTitle: "分类",
+    noCollectionGroup: "无分类",
+    createCollectionOption: "新建专辑",
+    createCollectionGroupOption: "新建分类",
     collectionTitleRequired: "专辑名称不能为空。",
     courseIndex: "课程序号",
     courseTitleRequired: "课程标题不能为空。",
@@ -479,6 +567,8 @@ const COPY = {
     moveCourseDown: "下移课程",
     moveCollectionUp: "上移专辑",
     moveCollectionDown: "下移专辑",
+    moveCollectionGroupUp: "上移分类",
+    moveCollectionGroupDown: "下移分类",
     removeLocalCache: "移除缓存",
     removeLocalCacheConfirm: "确定要删除这个课程的本地视频缓存吗？字幕和学习地图会保留。",
     prerequisites: "预备知识",
@@ -535,7 +625,15 @@ const COPY = {
     importLocalVideo: "Import local video",
     importLocalVideoFile: "Choose local video file",
     importingLocalVideo: "Importing local video",
+    linkingLocalVideo: "Linking video",
+    importVideoTitle: "Import video",
+    importVideoHelp: "Choose whether to copy videos into the Workspace or keep links to their original files.",
+    importVideoCopyToWorkspace: "Copy to Workspace",
+    importVideoCopyHelp: "Best for offline copies. Uses Workspace storage.",
+    importVideoLinkOriginal: "Link original file",
+    importVideoLinkHelp: "Best for NAS, external drives, or large local files. Does not copy video data.",
     localVideoAlreadyCached: "This local video is already in the Workspace",
+    linkedVideoAlreadyMounted: "This video is linked to its original file",
     localSubtitleNoTarget: "Open or select a course before uploading local subtitles.",
     localSubtitleEmpty: "No usable subtitles were found in this file.",
     subtitlesReady: "Transcript ready",
@@ -553,6 +651,7 @@ const COPY = {
     modelProfileLibrary: "Model profiles",
     asrModelProfileLibrary: "ASR model profiles",
     addModelProfile: "Add profile",
+    addLibraryEntry: "New",
     addCollection: "New collection",
     activeModelProfile: "Editing",
     unnamedModelProfile: "Unnamed profile",
@@ -628,6 +727,7 @@ const COPY = {
     library: "Library",
     importCourses: "Import courses",
     exportCourses: "Export courses",
+    addCollectionGroup: "New category",
     importCoursePackage: "Import course package",
     exportCoursePackage: "Export course package",
     exportCoursePackageTitle: "Choose courses to export",
@@ -636,6 +736,8 @@ const COPY = {
     selectCoursesToExport: "Select courses",
     shareMessage: "Message",
     shareMessagePlaceholder: "Add an optional note for the person importing this package.",
+    expandExportCollection: "Expand export collection",
+    collapseExportCollection: "Collapse export collection",
     noExportSelection: "Select at least one course first.",
     importPackageFailed: "Failed to import course package",
     importMessageTitle: "Message from the sharer",
@@ -651,6 +753,35 @@ const COPY = {
     stream: "Stream",
     local: "Local",
     cache: "Cache",
+    importToWorkspace: "Import",
+    importToWorkspaceTitle: "Import to Workspace",
+    importingWorkspaceVideo: "Importing to Workspace",
+    bulkVideoSourceBinding: "Manage video source bindings",
+    bulkVideoSourceHelp: "",
+    expandVideoSourceGroup: "Expand",
+    collapseVideoSourceGroup: "Collapse",
+    unboundVideoSource: "Unbound",
+    onlineVideoSource: "Online video",
+    fileVideoSource: "File link",
+    workspaceVideoSource: "Local video",
+    videoSourceField: "Video source",
+    videoSourceRequired: "Enter a video source URL or path.",
+    saveVideoSource: "Save video source",
+    cancelVideoSourceEdit: "Cancel video source edit",
+    bindFileVideoSource: "Bind",
+    changeVideoSourceBinding: "Change",
+    deleteWorkspaceVideo: "Delete",
+    deleteWorkspaceVideoTitle: "Delete local video",
+    deleteWorkspaceVideoConfirm: "Delete this course's local video? Subtitles and study map will be kept.",
+    bindVideoSource: "Bind video source",
+    changeVideoSource: "Change video source",
+    videoSourceDialogHelp: "Bind an online video link, or choose a local, external drive, or NAS video file in Finder.",
+    onlineVideoLink: "Online video link",
+    onlineVideoLinkPlaceholder: "https://...",
+    useOnlineVideoLink: "Use online link",
+    chooseLocalOrNasVideo: "Choose local or NAS file",
+    bindingVideoSource: "Binding video source",
+    workspaceVideoChangeDisabled: "Workspace video sources cannot be changed directly",
     transcript: "Subtitle list",
     asrCorrection: "ASR correction",
     openAsrCorrection: "Open ASR correction workbench",
@@ -741,6 +872,16 @@ const COPY = {
     regenerateDetailed: "Regenerate interpretation",
     regenerateHigh: "Regenerate detailed",
     regenerateFullStudy: "Regenerate all",
+    studyQueueStatus: "Study map generation queue",
+    studyQueueRunning: "Rebuilding",
+    studyQueueCurrent: "Current",
+    studyQueueQueued: "Queued",
+    studyQueueFailed: "Study map task failed",
+    expandStudyQueue: "Expand study map generation queue",
+    collapseStudyQueue: "Collapse study map generation queue",
+    cancelQueuedStudyTask: "Cancel queued task",
+    retryStudyTask: "Retry failed task",
+    dismissStudyTask: "Dismiss failed task",
     studyMapDetailLevel: "Detail level",
     studyMapDetailStandard: "Standard",
     studyMapDetailFaithful: "High fidelity",
@@ -757,15 +898,25 @@ const COPY = {
     courseCollection: "Collection",
     courseCollectionFallback: "Unfiled",
     emptyCollection: "No courses yet",
+    emptyCollectionGroup: "No collections yet",
     newCollectionPrompt: "Enter a new collection name",
+    newCollectionGroupPrompt: "Enter a category name",
     collapseCollection: "Collapse collection",
     expandCollection: "Expand collection",
+    collapseCollectionGroup: "Collapse category",
+    expandCollectionGroup: "Expand category",
+    deleteCollectionGroup: "Delete category",
+    deleteCollectionGroupConfirm: "Delete this category? Collections stay in the library and move out of the category.",
     editCollection: "Edit collection",
     deleteCollection: "Delete collection",
     deleteCollectionConfirm: "Delete this collection? Courses stay in the library and move to Unfiled.",
     saveCollection: "Save collection",
     cancelCollectionEdit: "Cancel collection edit",
     collectionTitle: "Collection name",
+    collectionGroupTitle: "Category",
+    noCollectionGroup: "No category",
+    createCollectionOption: "New collection",
+    createCollectionGroupOption: "New category",
     collectionTitleRequired: "Collection name is required.",
     courseIndex: "Course no.",
     courseTitleRequired: "Course title is required.",
@@ -773,6 +924,8 @@ const COPY = {
     moveCourseDown: "Move course down",
     moveCollectionUp: "Move collection up",
     moveCollectionDown: "Move collection down",
+    moveCollectionGroupUp: "Move category up",
+    moveCollectionGroupDown: "Move category down",
     removeLocalCache: "Remove cache",
     removeLocalCacheConfirm: "Remove this course's local video cache? Transcript and study map will stay.",
     prerequisites: "Prerequisites",
@@ -825,8 +978,14 @@ const MIN_ASR_EDITOR_WIDTH = 520;
 const MIN_PLAYER_HEIGHT_OVERLAY = 390;
 const MIN_PLAYER_HEIGHT_PANEL = 500;
 const MANUAL_COLLECTIONS_STORAGE_KEY = "course-navigator-manual-collections";
+const MANUAL_COLLECTION_GROUPS_STORAGE_KEY = "course-navigator-manual-collection-groups";
 const COLLAPSED_COLLECTIONS_STORAGE_KEY = "course-navigator-collapsed-collections";
+const COLLAPSED_COLLECTION_GROUPS_STORAGE_KEY = "course-navigator-collapsed-collection-groups";
 const COLLECTION_ORDER_STORAGE_KEY = "course-navigator-collection-order";
+const COLLECTION_GROUP_ORDER_STORAGE_KEY = "course-navigator-collection-group-order";
+const COLLECTION_GROUP_ASSIGNMENTS_STORAGE_KEY = "course-navigator-collection-group-assignments";
+const CREATE_COLLECTION_OPTION_VALUE = "__course_navigator_create_collection__";
+const CREATE_COLLECTION_GROUP_OPTION_VALUE = "__course_navigator_create_collection_group__";
 const TIME_MAP_AUTO_OPEN_STORAGE_KEY = "course-navigator-time-map-auto-open";
 const SELECTED_COURSE_STORAGE_KEY = "course-navigator-last-selected-course";
 const ASR_SAVE_ACCEPTED_CHANGES_STORAGE_KEY = "course-navigator-asr-save-accepted-changes";
@@ -908,30 +1067,57 @@ export function App() {
   const [editingCourseDraft, setEditingCourseDraft] = useState<CourseEditDraft>({
     title: "",
     translated_title: "",
+    collection_group_title: "",
     collection_title: "",
     course_index: "",
   });
   const [manualCollections, setManualCollections] = useState<string[]>(() => loadManualCollections());
+  const [manualCollectionGroups, setManualCollectionGroups] = useState<string[]>(() =>
+    loadStoredStrings(MANUAL_COLLECTION_GROUPS_STORAGE_KEY),
+  );
   const [collapsedCollections, setCollapsedCollections] = useState<string[]>(() =>
     loadStoredStrings(COLLAPSED_COLLECTIONS_STORAGE_KEY),
   );
+  const [collapsedCollectionGroups, setCollapsedCollectionGroups] = useState<string[]>(() =>
+    loadStoredStrings(COLLAPSED_COLLECTION_GROUPS_STORAGE_KEY),
+  );
   const [collectionOrder, setCollectionOrder] = useState<string[]>(() => loadStoredStrings(COLLECTION_ORDER_STORAGE_KEY));
+  const [collectionGroupOrder, setCollectionGroupOrder] = useState<string[]>(() =>
+    loadStoredStrings(COLLECTION_GROUP_ORDER_STORAGE_KEY),
+  );
+  const [collectionGroupAssignments, setCollectionGroupAssignments] = useState<Record<string, string>>(() =>
+    loadStoredStringRecord(COLLECTION_GROUP_ASSIGNMENTS_STORAGE_KEY),
+  );
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [videoImportModalOpen, setVideoImportModalOpen] = useState(false);
+  const [bulkVideoSourceModalOpen, setBulkVideoSourceModalOpen] = useState(false);
   const [exportSelectedIds, setExportSelectedIds] = useState<string[]>([]);
   const [exportMessage, setExportMessage] = useState("");
   const [importBusy, setImportBusy] = useState(false);
   const [localVideoBusy, setLocalVideoBusy] = useState(false);
+  const [videoSourceModalOpen, setVideoSourceModalOpen] = useState(false);
+  const [videoSourceUrlDraft, setVideoSourceUrlDraft] = useState("");
+  const [videoSourceBusy, setVideoSourceBusy] = useState(false);
   const [importMessage, setImportMessage] = useState<string | null>(null);
   const [timeMapAutoOpen, setTimeMapAutoOpen] = useState(() =>
     loadBooleanPreference(TIME_MAP_AUTO_OPEN_STORAGE_KEY, true),
   );
   const [studyMapDetailMode, setStudyMapDetailMode] = useState<StudyMapDetailMode>(() => loadStudyDetailModePreference());
   const [studySettingsOpen, setStudySettingsOpen] = useState(false);
+  const [studyQueueTasks, setStudyQueueTasks] = useState<StudyQueueTask[]>([]);
+  const [studyQueueDrawerOpen, setStudyQueueDrawerOpen] = useState(false);
   const [editingCollectionKey, setEditingCollectionKey] = useState<string | null>(null);
   const [editingCollectionDraft, setEditingCollectionDraft] = useState("");
+  const [editingCollectionGroupDraft, setEditingCollectionGroupDraft] = useState("");
   const [savingCollectionKey, setSavingCollectionKey] = useState<string | null>(null);
+  const [savingCollectionGroupKey, setSavingCollectionGroupKey] = useState<string | null>(null);
+  const [libraryCreateMenuOpen, setLibraryCreateMenuOpen] = useState(false);
   const [savingTitleId, setSavingTitleId] = useState<string | null>(null);
   const [activeJobKind, setActiveJobKind] = useState<"study" | "translation" | "download" | "extract" | null>(null);
+  const appMountedRef = useRef(true);
+  const studyQueueTasksRef = useRef<StudyQueueTask[]>([]);
+  const studyQueueProcessingRef = useRef(false);
+  const studyQueueTaskIdRef = useRef(0);
   const workspaceRef = useRef<HTMLElement | null>(null);
   const mainColumnRef = useRef<HTMLElement | null>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
@@ -939,6 +1125,18 @@ export function App() {
   const localVideoInputRef = useRef<HTMLInputElement | null>(null);
   const subtitleUploadInputRef = useRef<HTMLInputElement | null>(null);
   const copy = COPY[uiLanguage];
+
+  useEffect(
+    () => {
+      appMountedRef.current = true;
+      return () => {
+        appMountedRef.current = false;
+        studyQueueTasksRef.current = [];
+        studyQueueProcessingRef.current = false;
+      };
+    },
+    [],
+  );
 
   useEffect(() => {
     listItems()
@@ -990,14 +1188,35 @@ export function App() {
     saveStudyDetailModePreference(studyMapDetailMode);
   }, [studyMapDetailMode]);
 
+  const hasVisibleStudyQueueTasks = studyQueueTasks.some((task) => task.status === "queued" || task.status === "failed");
+
+  useEffect(() => {
+    if (!hasVisibleStudyQueueTasks) {
+      setStudyQueueDrawerOpen(false);
+    }
+  }, [hasVisibleStudyQueueTasks]);
+
   const selectedStudy = selected?.study ?? null;
   const translatedTranscript = selectedStudy?.translated_transcript ?? [];
   const selectedHasStudy = hasStudyMaterial(selectedStudy);
   const selectedIsBilibili = selected ? isBilibiliItem(selected) : false;
-  const selectedIsLocalVideo = selected ? isLocalVideoItem(selected) : false;
+  const selectedIsLocalVideo = selected ? isWorkspaceLocalVideoItem(selected) : false;
+  const selectedIsExternalVideo = selected ? isAvailableExternalVideoItem(selected) : false;
+  const selectedIsFileVideo = selectedIsLocalVideo || selectedIsExternalVideo;
+  const selectedHasPlayableVideoSource = selected ? hasPlayableVideoSource(selected) : false;
+  const selectedHasMissingVideoSource = selected ? isMissingVideoSourceItem(selected) : false;
+  const selectedHasWorkspaceVideoSource = selected ? hasWorkspaceManagedVideoSource(selected) : false;
+  const selectedCanShowVideoSourceAction = Boolean(selected && !isPreviewItem(selected));
+  const videoSourceActionLabel = selectedHasPlayableVideoSource ? copy.changeVideoSource : copy.bindVideoSource;
   const forcedBilibiliEmbed = selected ? forcedBilibiliEmbedIds.includes(selected.id) : false;
   const showVideoCaptionDock = Boolean(selected);
   const videoCaptionControlsAvailable = !(selectedIsBilibili && sourceMode === "embed");
+  const studyQueueWaitingTasks = studyQueueTasks.filter((task) => task.status === "queued");
+  const studyQueueFailedTasks = studyQueueTasks.filter((task) => task.status === "failed");
+  const visibleStudyQueueTasks = studyQueueTasks.filter((task) => task.status === "queued" || task.status === "failed");
+  const studyQueueTaskCount = studyQueueWaitingTasks.length;
+  const studyQueueAriaLabel = studyQueueTaskCount ? `${copy.studyQueueStatus} ${studyQueueTaskCount}` : copy.studyQueueStatus;
+  const studyActionBusy = Boolean(busy && activeJobKind !== "study");
   const rightRailClassName = [
     "right-rail",
     selectedHasStudy ? "" : "no-study-actions",
@@ -1015,11 +1234,24 @@ export function App() {
     () => collectionNames(items, manualCollections, copy.courseCollectionFallback),
     [items, manualCollections, copy.courseCollectionFallback],
   );
+  const collectionGroupOptions = useMemo(
+    () => collectionGroupNames(items, manualCollectionGroups),
+    [items, manualCollectionGroups],
+  );
   const groupedItems = useMemo(
-    () => groupCourseItems(items, copy.courseCollectionFallback, manualCollections, collectionOrder),
-    [items, copy.courseCollectionFallback, manualCollections, collectionOrder],
+    () => groupCourseItems(items, copy.courseCollectionFallback, manualCollections, collectionOrder, collectionGroupAssignments),
+    [items, copy.courseCollectionFallback, manualCollections, collectionOrder, collectionGroupAssignments],
+  );
+  const libraryEntries = useMemo(
+    () => groupLibraryCollections(groupedItems, manualCollectionGroups, collectionGroupOrder),
+    [groupedItems, manualCollectionGroups, collectionGroupOrder],
+  );
+  const libraryCategoryEntries = useMemo(
+    () => libraryEntries.filter((entry): entry is Extract<LibraryCollectionEntry, { type: "group" }> => entry.type === "group"),
+    [libraryEntries],
   );
   const collapsedCollectionKeys = useMemo(() => new Set(collapsedCollections), [collapsedCollections]);
+  const collapsedCollectionGroupKeys = useMemo(() => new Set(collapsedCollectionGroups), [collapsedCollectionGroups]);
 
   useEffect(() => {
     setTimeMapOpen(selectedHasStudy && timeMapAutoOpen);
@@ -1043,9 +1275,139 @@ export function App() {
     }
   }
 
+  async function refreshItemsPreservingSelection() {
+    const loaded = await listItems();
+    setItems(loaded);
+    setSelected((current) => (current ? loaded.find((item) => item.id === current.id) ?? current : current));
+  }
+
+  function updateStudyQueueTasks(updater: (current: StudyQueueTask[]) => StudyQueueTask[]) {
+    const next = updater(studyQueueTasksRef.current);
+    studyQueueTasksRef.current = next;
+    if (appMountedRef.current) {
+      setStudyQueueTasks(next);
+    }
+  }
+
+  function enqueueStudyTask(section: StudySection) {
+    if (studyActionBusy) return;
+    if (!selected?.transcript.length) {
+      setError(copy.noTranscriptForStudy);
+      return;
+    }
+    const task: StudyQueueTask = {
+      id: `study-${Date.now()}-${++studyQueueTaskIdRef.current}`,
+      itemId: selected.id,
+      itemTitle: selected.title,
+      section,
+      outputLanguage,
+      detailLevel: studyMapDetailMode,
+      status: "queued",
+      message: copy.studyQueueQueued,
+      error: null,
+      jobId: null,
+    };
+    setError(null);
+    updateStudyQueueTasks((current) => [...current, task]);
+    void processStudyQueue();
+  }
+
+  function retryStudyTask(taskId: string) {
+    updateStudyQueueTasks((current) =>
+      current.map((task) =>
+        task.id === taskId
+          ? { ...task, status: "queued", message: copy.studyQueueQueued, error: null, jobId: null }
+          : task,
+      ),
+    );
+    void processStudyQueue();
+  }
+
+  function dismissStudyTask(taskId: string) {
+    updateStudyQueueTasks((current) => current.filter((task) => task.id !== taskId));
+  }
+
+  function cancelQueuedStudyTask(taskId: string) {
+    updateStudyQueueTasks((current) => current.filter((task) => task.id !== taskId || task.status !== "queued"));
+  }
+
+  async function processStudyQueue() {
+    if (studyQueueProcessingRef.current) return;
+    studyQueueProcessingRef.current = true;
+    try {
+      while (true) {
+        if (!appMountedRef.current) break;
+        const task = studyQueueTasksRef.current.find((entry) => entry.status === "queued");
+        if (!task) break;
+        updateStudyQueueTasks((current) =>
+          current.map((entry) =>
+            entry.id === task.id ? { ...entry, status: "running", message: copy.studyQueueRunning, error: null } : entry,
+          ),
+        );
+        try {
+          await runStudyJob(task);
+          updateStudyQueueTasks((current) => current.filter((entry) => entry.id !== task.id));
+        } catch (err) {
+          updateStudyQueueTasks((current) =>
+            current.map((entry) =>
+              entry.id === task.id
+                ? { ...entry, status: "failed", message: copy.studyQueueFailed, error: errorMessage(err, copy.unknownError) }
+                : entry,
+            ),
+          );
+        }
+      }
+    } finally {
+      studyQueueProcessingRef.current = false;
+      if (!appMountedRef.current) return;
+      const hasActiveStudyTask = studyQueueTasksRef.current.some((task) => task.status === "queued" || task.status === "running");
+      if (!hasActiveStudyTask) {
+        setBusy(null);
+        setJobStatus(null);
+        setActiveJobKind(null);
+      }
+      if (studyQueueTasksRef.current.some((task) => task.status === "queued")) {
+        void processStudyQueue();
+      }
+    }
+  }
+
   function upsertCourseItem(item: CourseItem) {
     setItems((current) => current.map((entry) => (entry.id === item.id ? item : entry)));
     setSelected((current) => (current?.id === item.id ? item : current));
+  }
+
+  function applyVideoSourceUpdate(item: CourseItem) {
+    upsertCourseItem(item);
+    if (selected?.id === item.id) {
+      setUrl(item.source_url);
+      setSourceMode(preferredSourceModeForItem(item));
+    }
+  }
+
+  async function importWorkspaceVideoForItem(item: CourseItem): Promise<CourseItem> {
+    const next = await importWorkspaceVideoFromPicker(item.id);
+    applyVideoSourceUpdate(next);
+    return next;
+  }
+
+  async function bindFileVideoSourceForItem(item: CourseItem): Promise<CourseItem> {
+    const next = await bindVideoSourceFromPicker(item.id);
+    applyVideoSourceUpdate(next);
+    return next;
+  }
+
+  async function saveVideoSourceForItem(item: CourseItem, value: string): Promise<CourseItem> {
+    const input = videoSourceBindingInputFromValue(value);
+    const next = await bindVideoSource(item.id, input);
+    applyVideoSourceUpdate(next);
+    return next;
+  }
+
+  async function deleteWorkspaceVideoForItem(item: CourseItem): Promise<CourseItem> {
+    const next = await deleteLocalVideo(item.id);
+    applyVideoSourceUpdate(next);
+    return next;
   }
 
   async function handleOpenUrl() {
@@ -1205,6 +1567,92 @@ export function App() {
     }
   }
 
+  async function handleVideoImportMode(importMode: LocalVideoImportMode) {
+    setError(null);
+    setJobStatus(null);
+    setLocalVideoBusy(true);
+    setVideoImportModalOpen(false);
+    setBusy(importMode === "external" ? copy.linkingLocalVideo : copy.importingLocalVideo);
+    try {
+      const imported = await importLocalVideosFromPicker(importMode);
+      if (!imported.length) return;
+      const importedIds = new Set(imported.map((item) => item.id));
+      setItems((current) => sortCourseItems([...imported, ...current.filter((entry) => !importedIds.has(entry.id))]));
+      selectCourse(imported[0]);
+      setSourceMode("local");
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setLocalVideoBusy(false);
+      setBusy(null);
+      setActiveJobKind(null);
+    }
+  }
+
+  async function handleImportWorkspaceVideoSource() {
+    if (!selected || isPreviewItem(selected) || !isMissingVideoSourceItem(selected)) return;
+    setError(null);
+    setJobStatus(null);
+    setVideoSourceBusy(true);
+    setBusy(copy.importingWorkspaceVideo);
+    try {
+      await importWorkspaceVideoForItem(selected);
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setVideoSourceBusy(false);
+      setBusy(null);
+      setActiveJobKind(null);
+    }
+  }
+
+  function openVideoSourceModal() {
+    if (!selected || isPreviewItem(selected) || selectedHasWorkspaceVideoSource) return;
+    setVideoSourceUrlDraft(isRemoteVideoSource(selected.source_url) ? selected.source_url : "");
+    setVideoSourceModalOpen(true);
+  }
+
+  async function handleBindRemoteVideoSource(event: ReactFormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selected || isPreviewItem(selected) || selectedHasWorkspaceVideoSource) return;
+    const nextUrl = videoSourceUrlDraft.trim();
+    if (!nextUrl) return;
+    setError(null);
+    setJobStatus(null);
+    setVideoSourceBusy(true);
+    setBusy(copy.bindingVideoSource);
+    try {
+      await saveVideoSourceForItem(selected, nextUrl);
+      setVideoSourceModalOpen(false);
+      setVideoSourceUrlDraft("");
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setVideoSourceBusy(false);
+      setBusy(null);
+      setActiveJobKind(null);
+    }
+  }
+
+  async function handleBindFileVideoSource() {
+    if (!selected || isPreviewItem(selected) || selectedHasWorkspaceVideoSource) return;
+    setError(null);
+    setJobStatus(null);
+    setVideoSourceBusy(true);
+    setBusy(copy.bindingVideoSource);
+    try {
+      await bindFileVideoSourceForItem(selected);
+      setVideoSourceModalOpen(false);
+      setVideoSourceUrlDraft("");
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setVideoSourceBusy(false);
+      setBusy(null);
+      setActiveJobKind(null);
+    }
+  }
+
   function openExportModal() {
     setExportSelectedIds(selected && !isPreviewItem(selected) ? [selected.id] : []);
     setExportMessage("");
@@ -1255,6 +1703,7 @@ export function App() {
         source_url: item.source_url,
         title: item.title,
         custom_title: item.custom_title ?? false,
+        collection_group_title: keepCollection ? item.collection_group_title ?? null : null,
         collection_title: keepCollection ? item.collection_title ?? "" : null,
         course_index: keepCollection ? item.course_index ?? null : null,
         sort_order: keepCollection ? item.sort_order ?? null : null,
@@ -1317,59 +1766,43 @@ export function App() {
     }
   }
 
-  async function handleGenerateStudy() {
-    if (!selected?.transcript.length) {
-      setError(copy.noTranscriptForStudy);
-      return;
-    }
-    setError(null);
-    try {
-      await runStudyJob(selected.id, hasStudyMaterial(selected.study) ? activeTab : "all");
-    } catch (err) {
-      setError(errorMessage(err, copy.unknownError));
-    } finally {
-      setBusy(null);
-      setJobStatus(null);
-      setActiveJobKind(null);
-    }
+  function handleGenerateStudy() {
+    enqueueStudyTask(hasStudyMaterial(selected?.study ?? null) ? activeTab : "all");
   }
 
-  async function handleRegenerateFullStudy() {
-    if (!selected?.transcript.length) {
-      setError(copy.noTranscriptForStudy);
-      return;
-    }
-    setError(null);
-    try {
-      await runStudyJob(selected.id, "all");
-    } catch (err) {
-      setError(errorMessage(err, copy.unknownError));
-    } finally {
-      setBusy(null);
-      setJobStatus(null);
-      setActiveJobKind(null);
-    }
+  function handleRegenerateFullStudy() {
+    enqueueStudyTask("all");
   }
 
-  async function runStudyJob(itemId: string, section: StudySection = "all") {
+  async function runStudyJob(task: StudyQueueTask) {
+    const label = studyTaskActionLabel(task.section, copy);
     setActiveJobKind("study");
-    setBusy(section === "all" ? copy.generating : regenerateLabelForTab(section, copy));
-    const firstStatus = await startStudyJob(itemId, outputLanguage, section, studyMapDetailMode);
+    setBusy(`${task.itemTitle} · ${label}`);
+    const firstStatus = await startStudyJob(task.itemId, task.outputLanguage, task.section, task.detailLevel);
+    if (!appMountedRef.current) return;
+    updateStudyQueueTasks((current) =>
+      current.map((entry) => (entry.id === task.id ? { ...entry, jobId: firstStatus.job_id, message: firstStatus.message } : entry)),
+    );
     setJobStatus(firstStatus);
     let current = firstStatus;
     while (current.status === "queued" || current.status === "running") {
       await delay(1000);
+      if (!appMountedRef.current) return;
       current = await getStudyJob(firstStatus.job_id);
+      if (!appMountedRef.current) return;
+      updateStudyQueueTasks((currentTasks) =>
+        currentTasks.map((entry) => (entry.id === task.id ? { ...entry, message: current.message, jobId: current.job_id } : entry)),
+      );
       setJobStatus(current);
-      setBusy(`${current.message} ${current.progress}%`);
+      setBusy(`${task.itemTitle} · ${label}: ${current.message} ${current.progress}%`);
       if (current.status === "running") {
-        await refreshItems(itemId);
+        await refreshItemsPreservingSelection();
       }
     }
     if (current.status === "failed") {
       throw new Error(current.error ?? current.message);
     }
-    await refreshItems(itemId);
+    await refreshItemsPreservingSelection();
   }
 
   async function runTranslationJob(itemId: string) {
@@ -1384,19 +1817,19 @@ export function App() {
       setJobStatus(current);
       setBusy(`${current.message} ${current.progress}%`);
       if (current.status === "running" && current.phase === "translation") {
-        await refreshItems(itemId);
+        await refreshItemsPreservingSelection();
       }
     }
     if (current.status === "failed") {
       throw new Error(current.error ?? current.message);
     }
-    await refreshItems(itemId);
+    await refreshItemsPreservingSelection();
   }
 
   async function runDownloadJob(itemId: string) {
     const item = items.find((entry) => entry.id === itemId);
     if (!item) return;
-    if (isLocalVideoItem(item)) return;
+    if (!canCacheVideoSource(item)) return;
     setActiveJobKind("download");
     setBusy(`${copy.caching} 0%`);
     const firstStatus = await startDownloadJob(itemId, {
@@ -1448,7 +1881,7 @@ export function App() {
   }
 
   async function handleDownload() {
-    if (!selected || isPreviewItem(selected) || isLocalVideoItem(selected)) return;
+    if (!selected || isPreviewItem(selected) || !canCacheVideoSource(selected)) return;
     setError(null);
     try {
       await runDownloadJob(selected.id);
@@ -1462,7 +1895,7 @@ export function App() {
   }
 
   async function handleRemoveLocalCache() {
-    if (!selected?.local_video_path || isLocalVideoItem(selected)) return;
+    if (!selected?.local_video_path || isLocalVideoItem(selected) || isExternalVideoItem(selected)) return;
     if (!window.confirm(copy.removeLocalCacheConfirm)) return;
     setError(null);
     try {
@@ -1502,6 +1935,7 @@ export function App() {
     setEditingCourseDraft({
       title: item.title,
       translated_title: item.study?.translated_title ?? "",
+      collection_group_title: item.collection_group_title ?? "",
       collection_title: item.collection_title ?? "",
       course_index: formatCourseIndexInput(item.course_index),
     });
@@ -1509,22 +1943,77 @@ export function App() {
 
   function cancelEditingTitle() {
     setEditingTitleId(null);
-    setEditingCourseDraft({ title: "", translated_title: "", collection_title: "", course_index: "" });
+    setEditingCourseDraft({ title: "", translated_title: "", collection_group_title: "", collection_title: "", course_index: "" });
   }
 
-  function handleAddCollection() {
-    const name = window.prompt(copy.newCollectionPrompt)?.trim();
-    if (!name) return;
+  function addManualCollectionName(name: string): string {
+    const nextName = name.trim();
+    if (!nextName) return "";
     setManualCollections((current) => {
-      const next = mergeCollectionNames([...current, name]);
+      const next = mergeCollectionNames([...current, nextName]);
       saveStoredStrings(MANUAL_COLLECTIONS_STORAGE_KEY, next);
       return next;
     });
     setCollectionOrder((current) => {
-      const next = mergeStringKeys([...current, collectionStorageKey(name)]);
+      const next = mergeStringKeys([...current, collectionStorageKey(nextName)]);
       saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, next);
       return next;
     });
+    return nextName;
+  }
+
+  function addManualCollectionGroupName(name: string): string {
+    const nextName = name.trim();
+    if (!nextName) return "";
+    setManualCollectionGroups((current) => {
+      const next = mergeCollectionNames([...current, nextName]);
+      saveStoredStrings(MANUAL_COLLECTION_GROUPS_STORAGE_KEY, next);
+      return next;
+    });
+    setCollapsedCollectionGroups((current) => {
+      const key = collectionGroupStorageKey(nextName);
+      const next = current.filter((entry) => entry !== key);
+      saveStoredStrings(COLLAPSED_COLLECTION_GROUPS_STORAGE_KEY, next);
+      return next;
+    });
+    setCollectionGroupOrder((current) => {
+      const next = mergeStringKeys([...current, collectionGroupStorageKey(nextName)]);
+      saveStoredStrings(COLLECTION_GROUP_ORDER_STORAGE_KEY, next);
+      return next;
+    });
+    return nextName;
+  }
+
+  function handleAddCollection() {
+    setLibraryCreateMenuOpen(false);
+    addManualCollectionName(window.prompt(copy.newCollectionPrompt) ?? "");
+  }
+
+  function handleAddCollectionGroup() {
+    setLibraryCreateMenuOpen(false);
+    addManualCollectionGroupName(window.prompt(copy.newCollectionGroupPrompt) ?? "");
+  }
+
+  function handleCollectionDraftChange(value: string) {
+    if (value === CREATE_COLLECTION_OPTION_VALUE) {
+      const name = addManualCollectionName(window.prompt(copy.newCollectionPrompt) ?? "");
+      if (name) {
+        setEditingCourseDraft((current) => ({ ...current, collection_title: name }));
+      }
+      return;
+    }
+    setEditingCourseDraft((current) => ({ ...current, collection_title: value }));
+  }
+
+  function handleCollectionGroupDraftChange(value: string) {
+    if (value === CREATE_COLLECTION_GROUP_OPTION_VALUE) {
+      const name = addManualCollectionGroupName(window.prompt(copy.newCollectionGroupPrompt) ?? "");
+      if (name) {
+        setEditingCollectionGroupDraft(name);
+      }
+      return;
+    }
+    setEditingCollectionGroupDraft(value);
   }
 
   function setTimeMapPreference(nextOpen: boolean) {
@@ -1547,6 +2036,16 @@ export function App() {
     });
   }
 
+  function toggleCollectionGroupCollapse(collectionGroupKey: string) {
+    setCollapsedCollectionGroups((current) => {
+      const next = current.includes(collectionGroupKey)
+        ? current.filter((key) => key !== collectionGroupKey)
+        : [...current, collectionGroupKey];
+      saveStoredStrings(COLLAPSED_COLLECTION_GROUPS_STORAGE_KEY, next);
+      return next;
+    });
+  }
+
   function handleMoveCollection(group: LibraryCollectionGroup, direction: -1 | 1) {
     const visibleKeys = groupedItems.map((entry) => entry.key);
     const index = visibleKeys.indexOf(group.key);
@@ -1563,14 +2062,32 @@ export function App() {
     });
   }
 
+  function handleMoveCollectionGroup(entry: Extract<LibraryCollectionEntry, { type: "group" }>, direction: -1 | 1) {
+    const visibleKeys = libraryCategoryEntries.map((category) => category.key);
+    const index = visibleKeys.indexOf(entry.key);
+    const targetIndex = index + direction;
+    if (index < 0 || targetIndex < 0 || targetIndex >= visibleKeys.length) return;
+    const nextVisibleKeys = [...visibleKeys];
+    [nextVisibleKeys[index], nextVisibleKeys[targetIndex]] = [nextVisibleKeys[targetIndex], nextVisibleKeys[index]];
+    setCollectionGroupOrder((current) => {
+      const visibleSet = new Set(visibleKeys);
+      const hiddenKeys = current.filter((key) => !visibleSet.has(key));
+      const next = mergeStringKeys([...nextVisibleKeys, ...hiddenKeys]);
+      saveStoredStrings(COLLECTION_GROUP_ORDER_STORAGE_KEY, next);
+      return next;
+    });
+  }
+
   function startEditingCollection(group: LibraryCollectionGroup) {
     setEditingCollectionKey(group.key);
     setEditingCollectionDraft(group.value);
+    setEditingCollectionGroupDraft(group.groupTitle);
   }
 
   function cancelEditingCollection() {
     setEditingCollectionKey(null);
     setEditingCollectionDraft("");
+    setEditingCollectionGroupDraft("");
   }
 
   async function handleRenameCollection(group: LibraryCollectionGroup) {
@@ -1580,6 +2097,7 @@ export function App() {
       return;
     }
     const nextKey = collectionStorageKey(nextTitle);
+    const nextGroupTitle = editingCollectionGroupDraft.trim();
     setError(null);
     setSavingCollectionKey(group.key);
     try {
@@ -1587,6 +2105,7 @@ export function App() {
       const updatedItems = await Promise.all(
         affectedItems.map((item) =>
           updateCourseItem(item.id, {
+            collection_group_title: nextGroupTitle || null,
             collection_title: nextTitle,
             course_index: item.course_index ?? null,
             sort_order: item.sort_order ?? null,
@@ -1612,6 +2131,22 @@ export function App() {
         saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, next);
         return next;
       });
+      setCollectionGroupAssignments((current) => {
+        const next = { ...current };
+        delete next[group.key];
+        if (nextGroupTitle) {
+          next[nextKey] = nextGroupTitle;
+        }
+        saveStoredStringRecord(COLLECTION_GROUP_ASSIGNMENTS_STORAGE_KEY, next);
+        return next;
+      });
+      if (nextGroupTitle) {
+        setManualCollectionGroups((current) => {
+          const next = mergeCollectionNames([...current, nextGroupTitle]);
+          saveStoredStrings(MANUAL_COLLECTION_GROUPS_STORAGE_KEY, next);
+          return next;
+        });
+      }
       cancelEditingCollection();
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
@@ -1630,6 +2165,7 @@ export function App() {
       const updatedItems = await Promise.all(
         affectedItems.map((item) =>
           updateCourseItem(item.id, {
+            collection_group_title: null,
             collection_title: null,
             course_index: null,
             sort_order: null,
@@ -1654,6 +2190,12 @@ export function App() {
         saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, next);
         return next;
       });
+      setCollectionGroupAssignments((current) => {
+        const next = { ...current };
+        delete next[group.key];
+        saveStoredStringRecord(COLLECTION_GROUP_ASSIGNMENTS_STORAGE_KEY, next);
+        return next;
+      });
       if (editingCollectionKey === group.key) {
         cancelEditingCollection();
       }
@@ -1664,6 +2206,64 @@ export function App() {
     }
   }
 
+  async function handleDeleteCollectionGroup(entry: Extract<LibraryCollectionEntry, { type: "group" }>) {
+    if (!window.confirm(copy.deleteCollectionGroupConfirm)) return;
+    setError(null);
+    setSavingCollectionGroupKey(entry.key);
+    try {
+      const collectionKeys = new Set(entry.collections.map((collection) => collection.key));
+      const affectedItems = items.filter((item) => collectionKeys.has(collectionStorageKey(item.collection_title)));
+      const updatedItems = await Promise.all(
+        affectedItems.map((item) =>
+          updateCourseItem(item.id, {
+            collection_group_title: null,
+            collection_title: item.collection_title ?? null,
+            course_index: item.course_index ?? null,
+            sort_order: item.sort_order ?? null,
+          }),
+        ),
+      );
+      const updatedById = new Map(updatedItems.map((item) => [item.id, item]));
+      setItems((current) => sortCourseItems(current.map((item) => updatedById.get(item.id) ?? item)));
+      setSelected((current) => (current ? updatedById.get(current.id) ?? current : current));
+      setManualCollectionGroups((current) => {
+        const next = current.filter((name) => collectionGroupStorageKey(name) !== entry.key);
+        saveStoredStrings(MANUAL_COLLECTION_GROUPS_STORAGE_KEY, next);
+        return next;
+      });
+      setCollapsedCollectionGroups((current) => {
+        const next = current.filter((key) => key !== entry.key);
+        saveStoredStrings(COLLAPSED_COLLECTION_GROUPS_STORAGE_KEY, next);
+        return next;
+      });
+      setCollectionGroupOrder((current) => {
+        const next = current.filter((key) => key !== entry.key);
+        saveStoredStrings(COLLECTION_GROUP_ORDER_STORAGE_KEY, next);
+        return next;
+      });
+      setCollectionGroupAssignments((current) => {
+        const next = { ...current };
+        for (const collection of entry.collections) {
+          delete next[collection.key];
+        }
+        for (const [collectionKey, groupTitle] of Object.entries(next)) {
+          if (collectionGroupStorageKey(groupTitle) === entry.key) {
+            delete next[collectionKey];
+          }
+        }
+        saveStoredStringRecord(COLLECTION_GROUP_ASSIGNMENTS_STORAGE_KEY, next);
+        return next;
+      });
+      if (editingCollectionGroupDraft && collectionGroupStorageKey(editingCollectionGroupDraft) === entry.key) {
+        setEditingCollectionGroupDraft("");
+      }
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setSavingCollectionGroupKey(null);
+    }
+  }
+
   async function handleRenameCourse(item: CourseItem) {
     const title = editingCourseDraft.title.trim();
     if (!title) {
@@ -1671,12 +2271,15 @@ export function App() {
       return;
     }
     const courseIndex = parseCourseIndex(editingCourseDraft.course_index);
+    const nextCollectionKey = collectionStorageKey(editingCourseDraft.collection_title);
+    const nextCollectionGroupTitle = collectionGroupTitleForCollectionKey(groupedItems, nextCollectionKey, collectionGroupAssignments);
     setError(null);
     setSavingTitleId(item.id);
     try {
       const renamed = await updateCourseItem(item.id, {
         title,
         translated_title: editingCourseDraft.translated_title.trim() || null,
+        collection_group_title: nextCollectionGroupTitle || null,
         collection_title: editingCourseDraft.collection_title.trim() || null,
         course_index: courseIndex,
         sort_order: courseIndex ?? item.sort_order ?? null,
@@ -2039,6 +2642,290 @@ export function App() {
     });
   }
 
+  function renderLibraryCollection(group: LibraryCollectionGroup, groupIndex: number) {
+    const collectionCollapsed = collapsedCollectionKeys.has(group.key);
+    const collectionEditing = editingCollectionKey === group.key;
+    const canDeleteCollection = group.key !== collectionStorageKey("");
+    return (
+      <section
+        className={[
+          "library-collection",
+          collectionCollapsed ? "collapsed" : "",
+          !group.items.length ? "empty-collection" : "",
+        ].filter(Boolean).join(" ")}
+        key={group.key}
+      >
+        {collectionEditing ? (
+          <form
+            className="library-collection-edit-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void handleRenameCollection(group);
+            }}
+          >
+            <label>
+              <span>{copy.collectionTitle}</span>
+              <input
+                aria-label={copy.collectionTitle}
+                autoFocus
+                value={editingCollectionDraft}
+                onChange={(event) => setEditingCollectionDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelEditingCollection();
+                  }
+                }}
+              />
+            </label>
+            <label>
+              <span>{copy.collectionGroupTitle}</span>
+              <select
+                aria-label={copy.collectionGroupTitle}
+                value={editingCollectionGroupDraft}
+                onChange={(event) => handleCollectionGroupDraftChange(event.target.value)}
+              >
+                <option value="">{copy.noCollectionGroup}</option>
+                {collectionGroupOptions.map((collectionGroup) => (
+                  <option key={collectionGroup} value={collectionGroup}>
+                    {collectionGroup}
+                  </option>
+                ))}
+                <option value={CREATE_COLLECTION_GROUP_OPTION_VALUE}>{copy.createCollectionGroupOption}</option>
+              </select>
+            </label>
+            <div className="library-collection-edit-actions">
+              <button
+                aria-label={`${copy.saveCollection} ${editingCollectionDraft || group.title}`}
+                className="library-collection-save"
+                disabled={savingCollectionKey === group.key}
+                type="submit"
+              >
+                {savingCollectionKey === group.key ? <Loader2 className="spin" size={13} /> : <Check size={13} />}
+              </button>
+              <button
+                aria-label={copy.cancelCollectionEdit}
+                className="library-collection-cancel"
+                onClick={cancelEditingCollection}
+                type="button"
+              >
+                <X size={13} />
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="library-collection-head">
+            <button
+              aria-label={`${collectionCollapsed ? copy.expandCollection : copy.collapseCollection} ${group.title}`}
+              className="library-collection-toggle"
+              onClick={() => toggleCollectionCollapse(group.key)}
+            >
+              <span
+                aria-hidden="true"
+                className={collectionCollapsed ? "collection-disclosure collapsed" : "collection-disclosure"}
+              />
+              <span>{group.title}</span>
+            </button>
+            <div className="library-collection-actions">
+              {groupIndex > 0 ? (
+                <button
+                  aria-label={`${copy.moveCollectionUp} ${group.title}`}
+                  className="library-collection-move"
+                  title={copy.moveCollectionUp}
+                  onClick={() => handleMoveCollection(group, -1)}
+                >
+                  <ArrowUp size={12} />
+                </button>
+              ) : <span className="library-collection-spacer" aria-hidden="true" />}
+              {groupIndex < groupedItems.length - 1 ? (
+                <button
+                  aria-label={`${copy.moveCollectionDown} ${group.title}`}
+                  className="library-collection-move"
+                  title={copy.moveCollectionDown}
+                  onClick={() => handleMoveCollection(group, 1)}
+                >
+                  <ArrowDown size={12} />
+                </button>
+              ) : <span className="library-collection-spacer" aria-hidden="true" />}
+              <button
+                aria-label={`${copy.editCollection} ${group.title}`}
+                className="library-collection-edit"
+                title={copy.editCollection}
+                onClick={() => startEditingCollection(group)}
+              >
+                <Pencil size={13} />
+              </button>
+              {canDeleteCollection ? (
+                <button
+                  aria-label={`${copy.deleteCollection} ${group.title}`}
+                  className="library-collection-delete"
+                  disabled={savingCollectionKey === group.key}
+                  title={copy.deleteCollection}
+                  onClick={() => void handleDeleteCollection(group)}
+                >
+                  {savingCollectionKey === group.key ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
+                </button>
+              ) : <span className="library-collection-spacer" aria-hidden="true" />}
+            </div>
+            <small>{group.items.length}</small>
+          </div>
+        )}
+        {!collectionCollapsed && group.items.length ? group.items.map((item) => (
+          <div className={item.id === selected?.id ? "library-entry active" : "library-entry"} key={item.id}>
+            {editingTitleId === item.id ? (
+              <form
+                className="library-title-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleRenameCourse(item);
+                }}
+              >
+                <label className="title-field">
+                  <span>{copy.courseTitle}</span>
+                  <input
+                    aria-label={copy.courseTitle}
+                    autoFocus
+                    value={editingCourseDraft.title}
+                    onChange={(event) =>
+                      setEditingCourseDraft((current) => ({ ...current, title: event.target.value }))
+                    }
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        cancelEditingTitle();
+                      }
+                    }}
+                  />
+                </label>
+                <label className="translated-title-field">
+                  <span>{copy.courseTranslatedTitle}</span>
+                  <input
+                    aria-label={copy.courseTranslatedTitle}
+                    value={editingCourseDraft.translated_title}
+                    onChange={(event) =>
+                      setEditingCourseDraft((current) => ({ ...current, translated_title: event.target.value }))
+                    }
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        cancelEditingTitle();
+                      }
+                    }}
+                  />
+                </label>
+                <label className="collection-field">
+                  <span>{copy.courseCollection}</span>
+                  <select
+                    aria-label={copy.courseCollection}
+                    value={editingCourseDraft.collection_title}
+                    onChange={(event) => handleCollectionDraftChange(event.target.value)}
+                  >
+                    {collectionOptions.map((collection) => (
+                      <option key={collection.value} value={collection.value}>
+                        {collection.label}
+                      </option>
+                    ))}
+                    <option value={CREATE_COLLECTION_OPTION_VALUE}>{copy.createCollectionOption}</option>
+                  </select>
+                </label>
+                <label className="index-field">
+                  <span>{copy.courseIndex}</span>
+                  <input
+                    aria-label={copy.courseIndex}
+                    inputMode="decimal"
+                    value={editingCourseDraft.course_index}
+                    onChange={(event) =>
+                      setEditingCourseDraft((current) => ({ ...current, course_index: event.target.value }))
+                    }
+                  />
+                </label>
+                <div className="library-title-actions">
+                  <button
+                    aria-label={`${copy.saveTitle} ${editingCourseDraft.title || item.title}`}
+                    className="library-save"
+                    disabled={savingTitleId === item.id}
+                    type="submit"
+                  >
+                    {savingTitleId === item.id ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
+                  </button>
+                  <button
+                    aria-label={copy.cancelTitleEdit}
+                    className="library-cancel"
+                    onClick={cancelEditingTitle}
+                    type="button"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <>
+                <button
+                  className="library-item"
+                  onClick={() => selectCourse(item)}
+                  onDoubleClick={() => startEditingTitle(item)}
+                >
+                  <span className="library-title-line">
+                    {displayCourseNumber(item) ? <small className="library-index-badge">{displayCourseNumber(item)}</small> : null}
+                    <span>{item.title}</span>
+                  </span>
+                  {item.study?.translated_title ? (
+                    <span className="library-translated-title">{item.study.translated_title}</span>
+                  ) : null}
+                  <small>{formatCourseDuration(item) ?? copy.noDuration}</small>
+                </button>
+                <div className="library-actions">
+                  <button
+                    className="library-move"
+                    aria-label={`${copy.moveCourseUp} ${item.title}`}
+                    title={copy.moveCourseUp}
+                    disabled={!canMoveCourse(items, item, -1)}
+                    onClick={() => void handleMoveCourse(item, -1)}
+                  >
+                    <ArrowUp size={13} />
+                  </button>
+                  <button
+                    className="library-move"
+                    aria-label={`${copy.moveCourseDown} ${item.title}`}
+                    title={copy.moveCourseDown}
+                    disabled={!canMoveCourse(items, item, 1)}
+                    onClick={() => void handleMoveCourse(item, 1)}
+                  >
+                    <ArrowDown size={13} />
+                  </button>
+                  <button
+                    className="library-edit"
+                    aria-label={`${copy.editTitle} ${item.title}`}
+                    title={copy.editTitle}
+                    onClick={() => startEditingTitle(item)}
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  <button
+                    className="library-copy"
+                    aria-label={`${copy.copyUrl} ${item.title}`}
+                    data-tooltip={copy.copyUrl}
+                    onClick={() => void handleCopyCourseUrl(item)}
+                  >
+                    <Copy size={14} />
+                  </button>
+                  <button
+                    className="library-delete"
+                    aria-label={`${copy.deleteCourse} ${item.title}`}
+                    title={copy.deleteCourse}
+                    onClick={() => handleDeleteCourse(item)}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )) : !collectionCollapsed ? <p className="empty library-empty library-node-empty">{copy.emptyCollection}</p> : null}
+      </section>
+    );
+  }
+
   if (view === "asr") {
     return (
       <main className="app-shell">
@@ -2141,7 +3028,7 @@ export function App() {
             title={copy.importLocalVideo}
             type="button"
             disabled={Boolean(busy) || localVideoBusy}
-            onClick={() => localVideoInputRef.current?.click()}
+            onClick={() => setVideoImportModalOpen(true)}
           >
             {localVideoBusy ? <Loader2 className="spin" size={17} /> : <FileInput size={18} />}
           </button>
@@ -2306,6 +3193,40 @@ export function App() {
         />
       ) : null}
 
+      {videoImportModalOpen ? (
+        <VideoImportModal
+          copy={copy}
+          busy={localVideoBusy}
+          onChoose={(nextMode) => void handleVideoImportMode(nextMode)}
+          onClose={() => setVideoImportModalOpen(false)}
+        />
+      ) : null}
+
+      {videoSourceModalOpen && selected ? (
+        <VideoSourceModal
+          copy={copy}
+          busy={videoSourceBusy}
+          modeLabel={videoSourceActionLabel}
+          urlDraft={videoSourceUrlDraft}
+          onUrlDraftChange={setVideoSourceUrlDraft}
+          onChooseFile={() => void handleBindFileVideoSource()}
+          onSubmitRemote={(event) => void handleBindRemoteVideoSource(event)}
+          onClose={() => setVideoSourceModalOpen(false)}
+        />
+      ) : null}
+
+      {bulkVideoSourceModalOpen ? (
+        <BulkVideoSourceModal
+          copy={copy}
+          groups={groupedItems}
+          onBindFile={(item) => bindFileVideoSourceForItem(item)}
+          onClose={() => setBulkVideoSourceModalOpen(false)}
+          onDeleteWorkspace={(item) => deleteWorkspaceVideoForItem(item)}
+          onImportWorkspace={(item) => importWorkspaceVideoForItem(item)}
+          onSaveSource={(item, value) => saveVideoSourceForItem(item, value)}
+        />
+      ) : null}
+
       {exportModalOpen ? (
         <CourseShareExportModal
           copy={copy}
@@ -2330,6 +3251,69 @@ export function App() {
           <span>{busy}</span>
           {jobStatus ? <progress max={100} value={jobStatus.progress} /> : null}
         </div>
+      ) : null}
+      {visibleStudyQueueTasks.length ? (
+        <section className={studyQueueDrawerOpen ? "study-queue-drawer open" : "study-queue-drawer"} aria-label={copy.studyQueueStatus}>
+          <button
+            className="study-queue-drawer-toggle"
+            type="button"
+            aria-label={studyQueueAriaLabel}
+            aria-expanded={studyQueueDrawerOpen}
+            title={studyQueueDrawerOpen ? copy.collapseStudyQueue : copy.expandStudyQueue}
+            onClick={() => setStudyQueueDrawerOpen((value) => !value)}
+          >
+            <span>
+              {copy.studyQueueStatus}
+              {studyQueueTaskCount ? <b>{studyQueueTaskCount}</b> : null}
+            </span>
+            {studyQueueFailedTasks.length ? <small>{copy.studyQueueFailed} {studyQueueFailedTasks.length}</small> : null}
+            {studyQueueDrawerOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          </button>
+          {studyQueueDrawerOpen ? (
+            <div className="study-queue-drawer-list">
+              {visibleStudyQueueTasks.map((task) => {
+                const taskLabel = studyTaskActionLabel(task.section, copy);
+                return (
+                  <div className={`study-queue-drawer-item ${task.status}`} key={task.id}>
+                    <span className="study-queue-task-status">{studyTaskStatusLabel(task.status, copy)}</span>
+                    <strong>{task.itemTitle}</strong>
+                    <span>{taskLabel}</span>
+                    {task.status === "queued" ? (
+                      <button
+                        className="study-queue-cancel"
+                        type="button"
+                        title={copy.cancelQueuedStudyTask}
+                        aria-label={`${copy.cancelQueuedStudyTask} ${task.itemTitle} ${taskLabel}`}
+                        onClick={() => cancelQueuedStudyTask(task.id)}
+                      >
+                        <X size={14} />
+                      </button>
+                    ) : null}
+                    {task.error ? <small>{task.error}</small> : null}
+                    {task.status === "failed" ? (
+                      <div className="study-queue-actions">
+                        <button
+                          type="button"
+                          onClick={() => retryStudyTask(task.id)}
+                          aria-label={`${copy.retryStudyTask} ${task.itemTitle} ${taskLabel}`}
+                        >
+                          {copy.retryStudyTask}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => dismissStudyTask(task.id)}
+                          aria-label={`${copy.dismissStudyTask} ${task.itemTitle} ${taskLabel}`}
+                        >
+                          {copy.dismissStudyTask}
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+        </section>
       ) : null}
 
       <section
@@ -2366,13 +3350,35 @@ export function App() {
                   <Upload size={14} />
                 </button>
                 <button
-                  aria-label={copy.addCollection}
+                  aria-label={copy.bulkVideoSourceBinding}
                   className="panel-icon-button"
-                  title={copy.addCollection}
-                  onClick={handleAddCollection}
+                  disabled={!items.length}
+                  title={copy.bulkVideoSourceBinding}
+                  onClick={() => setBulkVideoSourceModalOpen(true)}
                 >
-                  <FolderPlus size={14} />
+                  <Link2 size={14} />
                 </button>
+                <div className="library-create-control">
+                  <button
+                    aria-expanded={libraryCreateMenuOpen}
+                    aria-label={copy.addLibraryEntry}
+                    className="panel-icon-button"
+                    title={copy.addLibraryEntry}
+                    onClick={() => setLibraryCreateMenuOpen((open) => !open)}
+                  >
+                    <FolderPlus size={14} />
+                  </button>
+                  {libraryCreateMenuOpen ? (
+                    <div aria-label={copy.addLibraryEntry} className="library-create-menu" role="menu">
+                      <button onClick={handleAddCollection} type="button">
+                        {copy.addCollection}
+                      </button>
+                      <button onClick={handleAddCollectionGroup} type="button">
+                        {copy.addCollectionGroup}
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
                 <input
                   ref={importFileInputRef}
                   className="visually-hidden"
@@ -2383,271 +3389,91 @@ export function App() {
               </div>
             </div>
             <div className="library-list">
-              {groupedItems.map((group, groupIndex) => {
-                const collectionCollapsed = collapsedCollectionKeys.has(group.key);
-                const collectionEditing = editingCollectionKey === group.key;
-                const canDeleteCollection = group.key !== collectionStorageKey("");
+              {libraryEntries.map((entry) => {
+                if (entry.type === "collection") {
+                  const groupIndex = groupedItems.findIndex((group) => group.key === entry.group.key);
+                  return renderLibraryCollection(entry.group, groupIndex);
+                }
+                const collectionGroupCollapsed = collapsedCollectionGroupKeys.has(entry.key);
+                const collectionGroupEmpty = entry.collections.length === 0;
+                const collectionGroupIndex = libraryCategoryEntries.findIndex((category) => category.key === entry.key);
+                const collectionGroupClassName = [
+                  "library-collection-group",
+                  collectionGroupCollapsed ? "collapsed" : "",
+                  collectionGroupEmpty ? "empty-category" : "",
+                ].filter(Boolean).join(" ");
                 return (
-                <section
-                  className={collectionCollapsed ? "library-collection collapsed" : "library-collection"}
-                  key={group.key}
-                >
-                  {collectionEditing ? (
-                    <form
-                      className="library-collection-edit-form"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        void handleRenameCollection(group);
-                      }}
-                    >
-                      <label>
-                        <span>{copy.collectionTitle}</span>
-                        <input
-                          aria-label={copy.collectionTitle}
-                          autoFocus
-                          value={editingCollectionDraft}
-                          onChange={(event) => setEditingCollectionDraft(event.target.value)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Escape") {
-                              event.preventDefault();
-                              cancelEditingCollection();
-                            }
-                          }}
-                        />
-                      </label>
-                      <div className="library-collection-edit-actions">
-                        <button
-                          aria-label={`${copy.saveCollection} ${editingCollectionDraft || group.title}`}
-                          className="library-collection-save"
-                          disabled={savingCollectionKey === group.key}
-                          type="submit"
-                        >
-                          {savingCollectionKey === group.key ? <Loader2 className="spin" size={13} /> : <Check size={13} />}
-                        </button>
-                        <button
-                          aria-label={copy.cancelCollectionEdit}
-                          className="library-collection-cancel"
-                          onClick={cancelEditingCollection}
-                          type="button"
-                        >
-                          <X size={13} />
-                        </button>
-                      </div>
-                    </form>
-                  ) : (
-                    <div className="library-collection-head">
+                  <section
+                    className={collectionGroupClassName}
+                    key={entry.key}
+                  >
+                    <div className="library-collection-group-head">
                       <button
-                        aria-label={`${collectionCollapsed ? copy.expandCollection : copy.collapseCollection} ${group.title}`}
-                        className="library-collection-toggle"
-                        onClick={() => toggleCollectionCollapse(group.key)}
+                        aria-label={`${collectionGroupCollapsed ? copy.expandCollectionGroup : copy.collapseCollectionGroup} ${entry.title}`}
+                        className="library-collection-group-toggle"
+                        onClick={() => toggleCollectionGroupCollapse(entry.key)}
                       >
                         <span
                           aria-hidden="true"
-                          className={collectionCollapsed ? "collection-disclosure collapsed" : "collection-disclosure"}
+                          className={collectionGroupCollapsed ? "collection-disclosure collapsed" : "collection-disclosure"}
                         />
-                        <span>{group.title}</span>
+                        <span>{entry.title}</span>
                       </button>
-                      <div className="library-collection-actions">
-                        {groupIndex > 0 ? (
+                      <div className="library-collection-group-actions">
+                        {collectionGroupIndex > 0 ? (
                           <button
-                            aria-label={`${copy.moveCollectionUp} ${group.title}`}
-                            className="library-collection-move"
-                            title={copy.moveCollectionUp}
-                            onClick={() => handleMoveCollection(group, -1)}
+                            aria-label={`${copy.moveCollectionGroupUp} ${entry.title}`}
+                            className="library-collection-group-move"
+                            title={copy.moveCollectionGroupUp}
+                            onClick={() => handleMoveCollectionGroup(entry, -1)}
                           >
                             <ArrowUp size={12} />
                           </button>
-                        ) : <span className="library-collection-spacer" aria-hidden="true" />}
-                        {groupIndex < groupedItems.length - 1 ? (
+                        ) : <span className="library-collection-group-spacer" aria-hidden="true" />}
+                        {collectionGroupIndex < libraryCategoryEntries.length - 1 ? (
                           <button
-                            aria-label={`${copy.moveCollectionDown} ${group.title}`}
-                            className="library-collection-move"
-                            title={copy.moveCollectionDown}
-                            onClick={() => handleMoveCollection(group, 1)}
+                            aria-label={`${copy.moveCollectionGroupDown} ${entry.title}`}
+                            className="library-collection-group-move"
+                            title={copy.moveCollectionGroupDown}
+                            onClick={() => handleMoveCollectionGroup(entry, 1)}
                           >
                             <ArrowDown size={12} />
                           </button>
-                        ) : <span className="library-collection-spacer" aria-hidden="true" />}
+                        ) : <span className="library-collection-group-spacer" aria-hidden="true" />}
                         <button
-                          aria-label={`${copy.editCollection} ${group.title}`}
-                          className="library-collection-edit"
-                          title={copy.editCollection}
-                          onClick={() => startEditingCollection(group)}
+                          aria-label={`${copy.deleteCollectionGroup} ${entry.title}`}
+                          className="library-collection-group-delete"
+                          disabled={savingCollectionGroupKey === entry.key}
+                          title={copy.deleteCollectionGroup}
+                          onClick={() => void handleDeleteCollectionGroup(entry)}
                         >
-                          <Pencil size={13} />
+                          {savingCollectionGroupKey === entry.key ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
                         </button>
-                        {canDeleteCollection ? (
-                          <button
-                            aria-label={`${copy.deleteCollection} ${group.title}`}
-                            className="library-collection-delete"
-                            disabled={savingCollectionKey === group.key}
-                            title={copy.deleteCollection}
-                            onClick={() => void handleDeleteCollection(group)}
-                          >
-                            {savingCollectionKey === group.key ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
-                          </button>
-                        ) : <span className="library-collection-spacer" aria-hidden="true" />}
                       </div>
-                      <small>{group.items.length}</small>
+                      <small className="library-collection-group-count">{entry.collectionCount}</small>
                     </div>
-                  )}
-                  {!collectionCollapsed && group.items.length ? group.items.map((item) => (
-                    <div className={item.id === selected?.id ? "library-entry active" : "library-entry"} key={item.id}>
-                      {editingTitleId === item.id ? (
-                        <form
-                          className="library-title-form"
-                          onSubmit={(event) => {
-                            event.preventDefault();
-                            void handleRenameCourse(item);
-                          }}
-                        >
-                          <label className="title-field">
-                            <span>{copy.courseTitle}</span>
-                            <input
-                              aria-label={copy.courseTitle}
-                              autoFocus
-                              value={editingCourseDraft.title}
-                              onChange={(event) =>
-                                setEditingCourseDraft((current) => ({ ...current, title: event.target.value }))
-                              }
-                              onKeyDown={(event) => {
-                                if (event.key === "Escape") {
-                                  event.preventDefault();
-                                  cancelEditingTitle();
-                                }
-                              }}
-                            />
-                          </label>
-                          <label className="translated-title-field">
-                            <span>{copy.courseTranslatedTitle}</span>
-                            <input
-                              aria-label={copy.courseTranslatedTitle}
-                              value={editingCourseDraft.translated_title}
-                              onChange={(event) =>
-                                setEditingCourseDraft((current) => ({ ...current, translated_title: event.target.value }))
-                              }
-                              onKeyDown={(event) => {
-                                if (event.key === "Escape") {
-                                  event.preventDefault();
-                                  cancelEditingTitle();
-                                }
-                              }}
-                            />
-                          </label>
-                          <label className="collection-field">
-                            <span>{copy.courseCollection}</span>
-                            <select
-                              aria-label={copy.courseCollection}
-                              value={editingCourseDraft.collection_title}
-                              onChange={(event) =>
-                                setEditingCourseDraft((current) => ({ ...current, collection_title: event.target.value }))
-                              }
-                            >
-                              {collectionOptions.map((collection) => (
-                                <option key={collection.value} value={collection.value}>
-                                  {collection.label}
-                                </option>
-                              ))}
-                            </select>
-                          </label>
-                          <label className="index-field">
-                            <span>{copy.courseIndex}</span>
-                            <input
-                              aria-label={copy.courseIndex}
-                              inputMode="decimal"
-                              value={editingCourseDraft.course_index}
-                              onChange={(event) =>
-                                setEditingCourseDraft((current) => ({ ...current, course_index: event.target.value }))
-                              }
-                            />
-                          </label>
-                          <div className="library-title-actions">
-                            <button
-                              aria-label={`${copy.saveTitle} ${editingCourseDraft.title || item.title}`}
-                              className="library-save"
-                              disabled={savingTitleId === item.id}
-                              type="submit"
-                            >
-                              {savingTitleId === item.id ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
-                            </button>
-                            <button
-                              aria-label={copy.cancelTitleEdit}
-                              className="library-cancel"
-                              onClick={cancelEditingTitle}
-                              type="button"
-                            >
-                              <X size={14} />
-                            </button>
-                          </div>
-                        </form>
-                      ) : (
-                        <>
-                          <button
-                            className="library-item"
-                            onClick={() => selectCourse(item)}
-                            onDoubleClick={() => startEditingTitle(item)}
-                          >
-                            <span className="library-title-line">
-                              {displayCourseNumber(item) ? <small className="library-index-badge">{displayCourseNumber(item)}</small> : null}
-                              <span>{item.title}</span>
-                            </span>
-                            {item.study?.translated_title ? (
-                              <span className="library-translated-title">{item.study.translated_title}</span>
-                            ) : null}
-                            <small>{formatCourseDuration(item) ?? copy.noDuration}</small>
-                          </button>
-                          <div className="library-actions">
-                            <button
-                              className="library-move"
-                              aria-label={`${copy.moveCourseUp} ${item.title}`}
-                              title={copy.moveCourseUp}
-                              disabled={!canMoveCourse(items, item, -1)}
-                              onClick={() => void handleMoveCourse(item, -1)}
-                            >
-                              <ArrowUp size={13} />
-                            </button>
-                            <button
-                              className="library-move"
-                              aria-label={`${copy.moveCourseDown} ${item.title}`}
-                              title={copy.moveCourseDown}
-                              disabled={!canMoveCourse(items, item, 1)}
-                              onClick={() => void handleMoveCourse(item, 1)}
-                            >
-                              <ArrowDown size={13} />
-                            </button>
-                            <button
-                              className="library-edit"
-                              aria-label={`${copy.editTitle} ${item.title}`}
-                              title={copy.editTitle}
-                              onClick={() => startEditingTitle(item)}
-                            >
-                              <Pencil size={14} />
-                            </button>
-                            <button
-                              className="library-copy"
-                              aria-label={`${copy.copyUrl} ${item.title}`}
-                              data-tooltip={copy.copyUrl}
-                              onClick={() => void handleCopyCourseUrl(item)}
-                            >
-                              <Copy size={14} />
-                            </button>
-                            <button
-                              className="library-delete"
-                              aria-label={`${copy.deleteCourse} ${item.title}`}
-                              title={copy.deleteCourse}
-                              onClick={() => handleDeleteCourse(item)}
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  )) : !collectionCollapsed ? <p className="empty library-empty">{copy.emptyCollection}</p> : null}
-                </section>
-              );
+                    {!collectionGroupCollapsed ? (
+                      <div
+                        className={
+                          collectionGroupEmpty
+                            ? "library-collection-group-body empty-category-body"
+                            : "library-collection-group-body"
+                        }
+                      >
+                        {entry.collections.length ? (
+                          entry.collections.map((group) => {
+                            const groupIndex = groupedItems.findIndex((candidate) => candidate.key === group.key);
+                            return renderLibraryCollection(group, groupIndex);
+                          })
+                        ) : (
+                          <p className="empty library-empty library-node-empty library-category-empty">{copy.emptyCollectionGroup}</p>
+                        )}
+                      </div>
+                    ) : null}
+                  </section>
+                );
               })}
-              {!items.length && !manualCollections.length ? <p className="empty">{copy.emptyLibrary}</p> : null}
+              {!items.length && !manualCollections.length && !manualCollectionGroups.length ? <p className="empty">{copy.emptyLibrary}</p> : null}
             </div>
           </section>
 
@@ -2728,13 +3554,29 @@ export function App() {
                 <button
                   className="icon-button"
                   onClick={handleDownload}
-                  disabled={!selected || isPreviewItem(selected) || selectedIsLocalVideo || Boolean(busy)}
-                  title={selectedIsLocalVideo ? copy.localVideoAlreadyCached : copy.cache}
+                  disabled={!selected || isPreviewItem(selected) || !canCacheVideoSource(selected) || Boolean(busy)}
+                  title={
+                    selectedIsExternalVideo
+                      ? copy.linkedVideoAlreadyMounted
+                      : selectedIsLocalVideo
+                        ? copy.localVideoAlreadyCached
+                        : copy.cache
+                  }
                 >
                   {activeJobKind === "download" ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
                   {copy.cache}
                 </button>
-                {selected?.local_video_path && !selectedIsLocalVideo ? (
+                <button
+                  className="icon-button"
+                  type="button"
+                  onClick={() => void handleImportWorkspaceVideoSource()}
+                  disabled={!selected || isPreviewItem(selected) || !selectedHasMissingVideoSource || Boolean(busy) || videoSourceBusy}
+                  title={copy.importToWorkspaceTitle}
+                >
+                  {videoSourceBusy && selectedHasMissingVideoSource ? <Loader2 className="spin" size={15} /> : <FileInput size={15} />}
+                  {copy.importToWorkspace}
+                </button>
+                {selected?.local_video_path && !selectedIsFileVideo ? (
                   <button
                     className="icon-button subtle-danger"
                     onClick={handleRemoveLocalCache}
@@ -2743,6 +3585,18 @@ export function App() {
                   >
                     <Trash2 size={15} />
                     {copy.removeLocalCache}
+                  </button>
+                ) : null}
+                {selectedCanShowVideoSourceAction ? (
+                  <button
+                    className="icon-button"
+                    type="button"
+                    onClick={openVideoSourceModal}
+                    disabled={Boolean(busy) || videoSourceBusy || selectedHasWorkspaceVideoSource}
+                    title={selectedHasWorkspaceVideoSource ? copy.workspaceVideoChangeDisabled : videoSourceActionLabel}
+                  >
+                    {videoSourceBusy ? <Loader2 className="spin" size={15} /> : <Link2 size={15} />}
+                    {videoSourceActionLabel}
                   </button>
                 ) : null}
               </div>
@@ -2860,7 +3714,7 @@ export function App() {
                 className="player-subtle-action study-full-regenerate-action"
                 type="button"
                 onClick={handleRegenerateFullStudy}
-                disabled={Boolean(busy) || !selectedHasStudy || !selected?.transcript.length}
+                disabled={studyActionBusy || !selectedHasStudy || !selected?.transcript.length}
                 title={copy.regenerateFullStudy}
               >
                 <RefreshCcw size={13} />
@@ -2894,7 +3748,7 @@ export function App() {
               <button
                 className="study-primary-action"
                 onClick={handleGenerateStudy}
-                disabled={Boolean(busy) || !selected?.transcript.length}
+                disabled={studyActionBusy || !selected?.transcript.length}
               >
                 {regenerateLabelForTab(activeTab, copy)}
               </button>
@@ -2909,12 +3763,373 @@ export function App() {
             currentTime={playheadTime}
             onSeek={seek}
             copy={copy}
-            busy={Boolean(busy)}
+            busy={studyActionBusy}
             onGenerateStudy={handleGenerateStudy}
           />
         </aside>
       </section>
     </main>
+  );
+}
+
+function VideoImportModal({
+  copy,
+  busy,
+  onChoose,
+  onClose,
+}: {
+  copy: (typeof COPY)[UiLanguage];
+  busy: boolean;
+  onChoose: (mode: LocalVideoImportMode) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="settings-modal video-import-modal" role="dialog" aria-modal="true" aria-labelledby="video-import-title">
+        <div className="modal-head">
+          <div>
+            <h2 id="video-import-title">{copy.importVideoTitle}</h2>
+            <p>{copy.importVideoHelp}</p>
+          </div>
+          <button className="icon-only" aria-label={copy.closeDialog} onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="video-import-options">
+          <button type="button" className="video-import-option" disabled={busy} onClick={() => onChoose("workspace")}>
+            <Download size={18} />
+            <span>{copy.importVideoCopyToWorkspace}</span>
+            <small>{copy.importVideoCopyHelp}</small>
+          </button>
+          <button type="button" className="video-import-option" disabled={busy} onClick={() => onChoose("external")}>
+            <Link2 size={18} />
+            <span>{copy.importVideoLinkOriginal}</span>
+            <small>{copy.importVideoLinkHelp}</small>
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function VideoSourceModal({
+  copy,
+  busy,
+  modeLabel,
+  urlDraft,
+  onUrlDraftChange,
+  onChooseFile,
+  onSubmitRemote,
+  onClose,
+}: {
+  copy: (typeof COPY)[UiLanguage];
+  busy: boolean;
+  modeLabel: string;
+  urlDraft: string;
+  onUrlDraftChange: (value: string) => void;
+  onChooseFile: () => void;
+  onSubmitRemote: (event: ReactFormEvent<HTMLFormElement>) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="settings-modal video-import-modal" role="dialog" aria-modal="true" aria-labelledby="video-source-title">
+        <div className="modal-head">
+          <div>
+            <h2 id="video-source-title">{modeLabel}</h2>
+            <p>{copy.videoSourceDialogHelp}</p>
+          </div>
+          <button className="icon-only" aria-label={copy.closeDialog} onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <form className="video-source-form" onSubmit={onSubmitRemote}>
+          <label>
+            <span>{copy.onlineVideoLink}</span>
+            <input
+              value={urlDraft}
+              onChange={(event) => onUrlDraftChange(event.target.value)}
+              placeholder={copy.onlineVideoLinkPlaceholder}
+            />
+          </label>
+          <button type="submit" className="primary-action" disabled={busy || !urlDraft.trim()}>
+            {busy ? <Loader2 className="spin" size={16} /> : <Link2 size={16} />}
+            {copy.useOnlineVideoLink}
+          </button>
+        </form>
+        <div className="video-source-divider" aria-hidden="true" />
+        <button
+          type="button"
+          className="video-import-option video-source-file-option"
+          aria-label={copy.chooseLocalOrNasVideo}
+          disabled={busy}
+          onClick={onChooseFile}
+        >
+          {busy ? <Loader2 className="spin" size={18} /> : <FileInput size={18} />}
+          <span>{copy.chooseLocalOrNasVideo}</span>
+          <small>{copy.importVideoLinkHelp}</small>
+        </button>
+      </section>
+    </div>
+  );
+}
+
+function BulkVideoSourceModal({
+  copy,
+  groups,
+  onImportWorkspace,
+  onBindFile,
+  onDeleteWorkspace,
+  onSaveSource,
+  onClose,
+}: {
+  copy: (typeof COPY)[UiLanguage];
+  groups: LibraryCollectionGroup[];
+  onImportWorkspace: (item: CourseItem) => Promise<CourseItem>;
+  onBindFile: (item: CourseItem) => Promise<CourseItem>;
+  onDeleteWorkspace: (item: CourseItem) => Promise<CourseItem>;
+  onSaveSource: (item: CourseItem, value: string) => Promise<CourseItem>;
+  onClose: () => void;
+}) {
+  const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
+  const [editingIds, setEditingIds] = useState<string[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [busyIds, setBusyIds] = useState<string[]>([]);
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const expandedSet = useMemo(() => new Set(expandedKeys), [expandedKeys]);
+  const editingSet = useMemo(() => new Set(editingIds), [editingIds]);
+  const busySet = useMemo(() => new Set(busyIds), [busyIds]);
+
+  function toggleGroup(groupKey: string) {
+    setExpandedKeys((current) =>
+      current.includes(groupKey) ? current.filter((key) => key !== groupKey) : [...current, groupKey],
+    );
+  }
+
+  function startEditing(item: CourseItem) {
+    if (videoSourceStatus(item) === "workspace") return;
+    if (!editingSet.has(item.id)) {
+      setDrafts((current) => ({ ...current, [item.id]: videoSourceValue(item) }));
+    }
+    setEditingIds((current) => (current.includes(item.id) ? current : [...current, item.id]));
+    setRowErrors((current) => ({ ...current, [item.id]: "" }));
+  }
+
+  function startAndFocusEditing(item: CourseItem) {
+    startEditing(item);
+    window.setTimeout(() => inputRefs.current[item.id]?.focus(), 0);
+  }
+
+  function cancelEditing(itemId: string) {
+    setEditingIds((current) => current.filter((id) => id !== itemId));
+    setRowErrors((current) => ({ ...current, [itemId]: "" }));
+  }
+
+  function setRowBusy(itemId: string, value: boolean) {
+    setBusyIds((current) => {
+      if (value) {
+        return current.includes(itemId) ? current : [...current, itemId];
+      }
+      return current.filter((id) => id !== itemId);
+    });
+  }
+
+  async function runRowAction(item: CourseItem, action: () => Promise<CourseItem>) {
+    setRowBusy(item.id, true);
+    setRowErrors((current) => ({ ...current, [item.id]: "" }));
+    try {
+      await action();
+      setEditingIds((current) => current.filter((id) => id !== item.id));
+      setDrafts((current) => ({ ...current, [item.id]: "" }));
+    } catch (err) {
+      setRowErrors((current) => ({ ...current, [item.id]: errorMessage(err, copy.unknownError) }));
+    } finally {
+      setRowBusy(item.id, false);
+    }
+  }
+
+  function handleImportWorkspace(item: CourseItem) {
+    if (videoSourceStatus(item) !== "missing") return;
+    void runRowAction(item, () => onImportWorkspace(item));
+  }
+
+  function handleBindingAction(item: CourseItem) {
+    const status = videoSourceStatus(item);
+    if (status === "workspace") return;
+    if (status === "remote") {
+      startAndFocusEditing(item);
+      return;
+    }
+    void runRowAction(item, () => onBindFile(item));
+  }
+
+  function handleDeleteWorkspace(item: CourseItem) {
+    if (videoSourceStatus(item) !== "workspace") return;
+    if (!window.confirm(copy.deleteWorkspaceVideoConfirm)) return;
+    void runRowAction(item, () => onDeleteWorkspace(item));
+  }
+
+  function handleSaveSource(item: CourseItem) {
+    if (videoSourceStatus(item) === "workspace") return;
+    const nextValue = (drafts[item.id] ?? "").trim();
+    if (!nextValue) {
+      setRowErrors((current) => ({ ...current, [item.id]: copy.videoSourceRequired }));
+      return;
+    }
+    void runRowAction(item, () => onSaveSource(item, nextValue));
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        aria-labelledby="bulk-video-source-title"
+        aria-modal="true"
+        className="settings-modal bulk-video-source-modal"
+        role="dialog"
+      >
+        <div className="modal-head">
+          <div>
+            <h2 id="bulk-video-source-title">{copy.bulkVideoSourceBinding}</h2>
+          </div>
+          <button className="icon-only" aria-label={copy.closeDialog} onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="bulk-video-source-body">
+          {groups.map((group) => {
+            const expanded = expandedSet.has(group.key);
+            return (
+              <section className="bulk-video-source-group" key={group.key}>
+                <button
+                  aria-expanded={expanded}
+                  aria-label={`${expanded ? copy.collapseVideoSourceGroup : copy.expandVideoSourceGroup} ${group.title}`}
+                  className="bulk-video-source-group-toggle"
+                  type="button"
+                  onClick={() => toggleGroup(group.key)}
+                >
+                  {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                  <span>{group.title}</span>
+                  <small>{group.items.length}</small>
+                </button>
+                {expanded ? (
+                  <div className="bulk-video-source-rows">
+                    {group.items.map((item) => {
+                      const status = videoSourceStatus(item);
+                      const sourceValue = videoSourceValue(item);
+                      const editing = editingSet.has(item.id);
+                      const busy = busySet.has(item.id);
+                      const draft = editing ? drafts[item.id] ?? "" : sourceValue;
+                      const statusLabel = videoSourceStatusLabel(status, copy);
+                      const bindingLabel = status === "missing" ? copy.bindFileVideoSource : copy.changeVideoSourceBinding;
+                      const courseNumber = displayCourseNumber(item);
+                      return (
+                        <div className="bulk-video-source-row" key={item.id}>
+                          <div className="bulk-video-source-course">
+                            {courseNumber ? <span className="bulk-video-source-index">{courseNumber}</span> : null}
+                            <span title={item.title}>{item.title}</span>
+                          </div>
+                          <span className={`video-source-status status-${status}`}>{statusLabel}</span>
+                          <div className={status === "missing" ? "bulk-video-source-actions split" : "bulk-video-source-actions single"}>
+                            {status === "missing" ? (
+                              <>
+                                <button
+                                  aria-label={`${copy.importToWorkspace} ${item.title}`}
+                                  className="bulk-video-source-action"
+                                  disabled={busy}
+                                  title={copy.importToWorkspaceTitle}
+                                  type="button"
+                                  onClick={() => handleImportWorkspace(item)}
+                                >
+                                  {busy ? <Loader2 className="spin" size={14} /> : <FileInput size={14} />}
+                                  <span>{copy.importToWorkspace}</span>
+                                </button>
+                                <button
+                                  aria-label={`${bindingLabel} ${item.title}`}
+                                  className="bulk-video-source-action"
+                                  disabled={busy}
+                                  title={copy.chooseLocalOrNasVideo}
+                                  type="button"
+                                  onClick={() => handleBindingAction(item)}
+                                >
+                                  {busy ? <Loader2 className="spin" size={14} /> : <Link2 size={14} />}
+                                  <span>{bindingLabel}</span>
+                                </button>
+                              </>
+                            ) : status === "workspace" ? (
+                              <button
+                                aria-label={`${copy.deleteWorkspaceVideo} ${item.title}`}
+                                className="bulk-video-source-action danger"
+                                disabled={busy}
+                                title={copy.deleteWorkspaceVideoTitle}
+                                type="button"
+                                onClick={() => handleDeleteWorkspace(item)}
+                              >
+                                {busy ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                                <span>{copy.deleteWorkspaceVideo}</span>
+                              </button>
+                            ) : (
+                              <button
+                                aria-label={`${bindingLabel} ${item.title}`}
+                                className="bulk-video-source-action"
+                                disabled={busy}
+                                title={status === "remote" ? copy.videoSourceField : copy.chooseLocalOrNasVideo}
+                                type="button"
+                                onClick={() => handleBindingAction(item)}
+                              >
+                                {busy ? <Loader2 className="spin" size={14} /> : <Link2 size={14} />}
+                                <span>{bindingLabel}</span>
+                              </button>
+                            )}
+                          </div>
+                          <div className={editing ? "bulk-video-source-editor editing" : "bulk-video-source-editor"}>
+                            <input
+                              aria-label={`${copy.videoSourceField} ${item.title}`}
+                              className="bulk-video-source-input"
+                              onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: event.target.value }))}
+                              onClick={() => startEditing(item)}
+                              onFocus={() => startEditing(item)}
+                              readOnly={status === "workspace"}
+                              ref={(element) => {
+                                inputRefs.current[item.id] = element;
+                              }}
+                              value={draft}
+                            />
+                            {editing ? (
+                              <div className="bulk-video-source-edit-actions">
+                                <button
+                                  aria-label={`${copy.saveVideoSource} ${item.title}`}
+                                  className="bulk-video-source-save"
+                                  disabled={busy}
+                                  type="button"
+                                  onClick={() => handleSaveSource(item)}
+                                >
+                                  {busy ? <Loader2 className="spin" size={13} /> : <Check size={13} />}
+                                </button>
+                                <button
+                                  aria-label={`${copy.cancelVideoSourceEdit} ${item.title}`}
+                                  className="bulk-video-source-cancel"
+                                  disabled={busy}
+                                  type="button"
+                                  onClick={() => cancelEditing(item.id)}
+                                >
+                                  <X size={13} />
+                                </button>
+                              </div>
+                            ) : null}
+                          </div>
+                          {rowErrors[item.id] ? <p className="bulk-video-source-error">{rowErrors[item.id]}</p> : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </section>
+            );
+          })}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -2941,6 +4156,15 @@ function CourseShareExportModal({
 }) {
   const selectedSet = new Set(selectedIds);
   const selectedCount = selectedIds.length;
+  const [collapsedExportGroupKeys, setCollapsedExportGroupKeys] = useState<string[]>(() => groups.map((group) => group.key));
+  useEffect(() => {
+    setCollapsedExportGroupKeys(groups.map((group) => group.key));
+  }, [groups]);
+  function toggleExportGroupCollapse(groupKey: string) {
+    setCollapsedExportGroupKeys((current) =>
+      current.includes(groupKey) ? current.filter((key) => key !== groupKey) : [...current, groupKey],
+    );
+  }
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="settings-modal course-share-modal" role="dialog" aria-modal="true" aria-labelledby="course-share-title">
@@ -2959,22 +4183,39 @@ function CourseShareExportModal({
               const groupIds = group.items.map((item) => item.id);
               const allChecked = groupIds.length > 0 && groupIds.every((id) => selectedSet.has(id));
               const someChecked = groupIds.some((id) => selectedSet.has(id));
+              const collapsed = collapsedExportGroupKeys.includes(group.key);
               return (
                 <div className="course-share-group" key={group.key}>
-                  <label className="course-share-group-head">
+                  <div
+                    className="course-share-group-head"
+                    onClick={() => toggleExportGroupCollapse(group.key)}
+                  >
                     <input
                       type="checkbox"
+                      aria-label={`${copy.selectCoursesToExport} ${group.title}`}
                       checked={allChecked}
                       ref={(element) => {
                         if (element) element.indeterminate = someChecked && !allChecked;
                       }}
+                      onClick={(event) => event.stopPropagation()}
                       onChange={() => onToggleGroup(group)}
                       disabled={!group.items.length}
                     />
                     <span>{group.title}</span>
-                    <small>{group.items.length}</small>
-                  </label>
-                  {group.items.length ? (
+                    <button
+                      className="course-share-group-toggle"
+                      type="button"
+                      aria-label={`${collapsed ? copy.expandExportCollection : copy.collapseExportCollection} ${group.title}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleExportGroupCollapse(group.key);
+                      }}
+                    >
+                      <small>{group.items.length}</small>
+                      {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                    </button>
+                  </div>
+                  {!collapsed && group.items.length ? (
                     <div className="course-share-courses">
                       {group.items.map((item) => (
                         <label className="course-share-course" key={item.id}>
@@ -5939,12 +7180,83 @@ function isLocalVideoItem(item: CourseItem): boolean {
   return item.source_url.startsWith("local-video://");
 }
 
+function isExternalVideoItem(item: CourseItem): boolean {
+  return item.video_source_type === "external" || item.source_url.startsWith("external-video://");
+}
+
+function isWorkspaceLocalVideoItem(item: CourseItem): boolean {
+  return Boolean(item.local_video_path && isLocalVideoItem(item) && !isExternalVideoItem(item));
+}
+
+function isAvailableExternalVideoItem(item: CourseItem): boolean {
+  return Boolean(item.local_video_path && isExternalVideoItem(item));
+}
+
+function isRemoteVideoSource(sourceUrl: string): boolean {
+  const normalized = sourceUrl.trim();
+  return Boolean(normalized && !normalized.startsWith("local-video://") && !normalized.startsWith("external-video://"));
+}
+
+function canCacheVideoSource(item: CourseItem): boolean {
+  return Boolean(isRemoteVideoSource(item.source_url) && !item.local_video_path && !isExternalVideoItem(item));
+}
+
+function hasPlayableVideoSource(item: CourseItem): boolean {
+  return Boolean(item.local_video_path || isRemoteVideoSource(item.source_url));
+}
+
+function isMissingVideoSourceItem(item: CourseItem): boolean {
+  return !hasPlayableVideoSource(item);
+}
+
+function videoSourceStatus(item: CourseItem): VideoSourceStatus {
+  if (hasWorkspaceManagedVideoSource(item)) return "workspace";
+  if (isAvailableExternalVideoItem(item)) return "external";
+  if (isRemoteVideoSource(item.source_url)) return "remote";
+  return "missing";
+}
+
+function videoSourceStatusLabel(status: VideoSourceStatus, copy: (typeof COPY)[UiLanguage]): string {
+  return {
+    missing: copy.unboundVideoSource,
+    remote: copy.onlineVideoSource,
+    external: copy.fileVideoSource,
+    workspace: copy.workspaceVideoSource,
+  }[status];
+}
+
+function videoSourceValue(item: CourseItem): string {
+  const status = videoSourceStatus(item);
+  if (status === "workspace" || status === "external") {
+    return item.local_video_path ?? "";
+  }
+  if (status === "remote") {
+    return item.source_url;
+  }
+  return "";
+}
+
+function videoSourceBindingInputFromValue(value: string): VideoSourceBindingInput {
+  const trimmed = value.trim();
+  if (/^https?:\/\//i.test(trimmed)) {
+    return { source_type: "remote", url: trimmed };
+  }
+  return { source_type: "external", path: trimmed };
+}
+
+function hasWorkspaceManagedVideoSource(item: CourseItem): boolean {
+  return Boolean(item.local_video_path && !isExternalVideoItem(item) && (item.video_source_type === "workspace" || isLocalVideoItem(item)));
+}
+
 function preferredSourceModeForItem(item: CourseItem | null | undefined): SourceMode {
-  return item?.local_video_path || (item && isLocalVideoItem(item)) ? "local" : "embed";
+  return item?.local_video_path ? "local" : "embed";
 }
 
 function preferredSourceModeForSource(sourceUrl: string, item?: CourseItem | null): SourceMode {
-  return sourceUrl.trim().startsWith("local-video://") ? "local" : preferredSourceModeForItem(item);
+  const normalized = sourceUrl.trim();
+  return normalized.startsWith("local-video://") || normalized.startsWith("external-video://")
+    ? "local"
+    : preferredSourceModeForItem(item);
 }
 
 function formatCourseDuration(item: CourseItem): string | null {
@@ -5994,19 +7306,25 @@ function groupCourseItems(
   fallbackTitle: string,
   extraCollections: string[] = [],
   collectionOrder: string[] = [],
+  collectionGroupAssignments: Record<string, string> = {},
 ): LibraryCollectionGroup[] {
   const groups = new Map<string, LibraryCollectionGroup>();
   for (const item of sortCourseItems(items)) {
     const value = item.collection_title?.trim() ?? "";
     const key = collectionStorageKey(value);
+    const groupTitle = item.collection_group_title?.trim() || collectionGroupAssignments[key] || "";
     const existing = groups.get(key);
     if (existing) {
       existing.items.push(item);
+      if (!existing.groupTitle && groupTitle) {
+        existing.groupTitle = groupTitle;
+      }
     } else {
       groups.set(key, {
         key,
         title: value || fallbackTitle,
         value,
+        groupTitle,
         items: [item],
       });
     }
@@ -6015,7 +7333,7 @@ function groupCourseItems(
     const value = collection.trim();
     const key = collectionStorageKey(value);
     if (value && !groups.has(key)) {
-      groups.set(key, { key, title: value, value, items: [] });
+      groups.set(key, { key, title: value, value, groupTitle: collectionGroupAssignments[key] || "", items: [] });
     }
   }
   const orderIndex = new Map(collectionOrder.map((key, index) => [key, index]));
@@ -6029,6 +7347,64 @@ function groupCourseItems(
     }
     return left.title.localeCompare(right.title, undefined, { sensitivity: "base", numeric: true });
   });
+}
+
+function groupLibraryCollections(
+  collections: LibraryCollectionGroup[],
+  manualCollectionGroups: string[] = [],
+  collectionGroupOrder: string[] = [],
+): LibraryCollectionEntry[] {
+  const uncategorizedEntries: LibraryCollectionEntry[] = [];
+  const folderMap = new Map<string, Extract<LibraryCollectionEntry, { type: "group" }>>();
+  for (const collection of collections) {
+    const value = collection.groupTitle.trim();
+    if (!value) {
+      uncategorizedEntries.push({ type: "collection", group: collection });
+      continue;
+    }
+    const key = collectionGroupStorageKey(value);
+    const existing = folderMap.get(key);
+    if (existing) {
+      existing.collections.push(collection);
+      existing.collectionCount += 1;
+    } else {
+      const folder: Extract<LibraryCollectionEntry, { type: "group" }> = {
+        type: "group",
+        key,
+        title: value,
+        value,
+        collections: [collection],
+        collectionCount: 1,
+      };
+      folderMap.set(key, folder);
+    }
+  }
+  for (const rawName of manualCollectionGroups) {
+    const value = rawName.trim();
+    const key = collectionGroupStorageKey(value);
+    if (!value || folderMap.has(key)) continue;
+    const folder: Extract<LibraryCollectionEntry, { type: "group" }> = {
+      type: "group",
+      key,
+      title: value,
+      value,
+      collections: [],
+      collectionCount: 0,
+    };
+    folderMap.set(key, folder);
+  }
+  const orderIndex = new Map(collectionGroupOrder.map((key, index) => [key, index]));
+  const categoryEntries = [...folderMap.values()].sort((left, right) => {
+    const leftIndex = orderIndex.get(left.key);
+    const rightIndex = orderIndex.get(right.key);
+    if (leftIndex !== undefined || rightIndex !== undefined) {
+      if (leftIndex === undefined) return 1;
+      if (rightIndex === undefined) return -1;
+      return leftIndex - rightIndex;
+    }
+    return left.title.localeCompare(right.title, undefined, { sensitivity: "base", numeric: true });
+  });
+  return [...categoryEntries, ...uncategorizedEntries];
 }
 
 function collectionNames(
@@ -6045,6 +7421,13 @@ function collectionNames(
     value: name,
     label: name || fallbackTitle,
   }));
+}
+
+function collectionGroupNames(items: CourseItem[], extraCollectionGroups: string[]): string[] {
+  return mergeCollectionNames([
+    ...items.map((item) => item.collection_group_title ?? ""),
+    ...extraCollectionGroups,
+  ]).filter(Boolean);
 }
 
 function mergeCollectionNames(names: string[]): string[] {
@@ -6075,6 +7458,30 @@ function loadStoredStrings(key: string): string[] {
 }
 
 function saveStoredStrings(key: string, values: string[]) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(values));
+  } catch {
+    // Storage is a convenience layer. Losing it should not block the current edit.
+  }
+}
+
+function loadStoredStringRecord(key: string): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed)
+        .filter((entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string")
+        .map(([entryKey, value]) => [entryKey, value.trim()])
+        .filter(([, value]) => Boolean(value)),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function saveStoredStringRecord(key: string, values: Record<string, string>) {
   try {
     window.localStorage.setItem(key, JSON.stringify(values));
   } catch {
@@ -6171,11 +7578,29 @@ function collectionStorageKey(value: string | null | undefined): string {
   return normalized ? `collection:${normalized}` : "collection:";
 }
 
+function collectionGroupStorageKey(value: string | null | undefined): string {
+  const normalized = (value ?? "").trim().toLocaleLowerCase();
+  return normalized ? `collection-group:${normalized}` : "collection-group:";
+}
+
+function collectionGroupTitleForCollectionKey(
+  groups: LibraryCollectionGroup[],
+  collectionKey: string,
+  assignments: Record<string, string>,
+): string {
+  return groups.find((group) => group.key === collectionKey)?.groupTitle || assignments[collectionKey] || "";
+}
+
 function sortCourseItems(items: CourseItem[]): CourseItem[] {
   return [...items].sort(compareCourseItems);
 }
 
 function compareCourseItems(left: CourseItem, right: CourseItem): number {
+  const collectionGroupCompare = (left.collection_group_title ?? "").localeCompare(right.collection_group_title ?? "", undefined, {
+    sensitivity: "base",
+    numeric: true,
+  });
+  if (collectionGroupCompare !== 0) return collectionGroupCompare;
   const collectionCompare = (left.collection_title ?? "").localeCompare(right.collection_title ?? "", undefined, {
     sensitivity: "base",
     numeric: true,
@@ -6253,6 +7678,16 @@ function regenerateLabelForTab(tab: StudySection, copy: (typeof COPY)[UiLanguage
   if (tab === "detailed") return copy.regenerateDetailed;
   if (tab === "high") return copy.regenerateHigh;
   return copy.regenerateGuide;
+}
+
+function studyTaskActionLabel(section: StudySection, copy: (typeof COPY)[UiLanguage]): string {
+  return section === "all" ? copy.regenerateFullStudy : regenerateLabelForTab(section, copy);
+}
+
+function studyTaskStatusLabel(status: StudyQueueTaskStatus, copy: (typeof COPY)[UiLanguage]): string {
+  if (status === "running") return copy.studyQueueCurrent;
+  if (status === "failed") return copy.studyQueueFailed;
+  return copy.studyQueueQueued;
 }
 
 function formatCountMessage(template: string, count: number): string {

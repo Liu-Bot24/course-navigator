@@ -46,6 +46,26 @@ def test_generate_study_material_fallback_can_use_chinese_output():
     assert study.translated_transcript == []
 
 
+def test_generate_study_material_provider_failure_does_not_return_fallback(monkeypatch):
+    transcript = [
+        TranscriptSegment(start=0, end=8, text="This lesson explains prompt iteration."),
+        TranscriptSegment(start=8, end=16, text="Examples help users compare outputs."),
+    ]
+
+    def fail_provider_generation(*args, **kwargs):
+        raise RuntimeError("learning provider failed")
+
+    monkeypatch.setattr(ai, "_generate_with_provider", fail_provider_generation)
+
+    with pytest.raises(RuntimeError, match="learning provider failed"):
+        generate_study_material(
+            title="Prompting Lesson",
+            transcript=transcript,
+            provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+            output_language="zh-CN",
+        )
+
+
 def test_chinese_one_line_does_not_reuse_english_context_summary():
     summary = "This is a weekly AI large model news report for May 2026."
 
@@ -1133,6 +1153,82 @@ def test_regenerate_high_reuses_existing_structure_and_interpretation(monkeypatc
     assert calls["detailed_notes"] == "已有解读内容。"
     assert study.detailed_notes == existing.detailed_notes
     assert "新详解内容" in study.high_fidelity_text
+
+
+@pytest.mark.parametrize(
+    ("section", "failing_function", "error_text"),
+    [
+        ("detailed", "_generate_learning_block_interpretation_with_provider", "interpretation failed"),
+        ("high", "_generate_learning_block_high_fidelity_with_provider", "high fidelity failed"),
+    ],
+)
+def test_regenerate_learning_section_fails_instead_of_falling_back_to_subtitle_dump(monkeypatch, section, failing_function, error_text):
+    transcript = [
+        TranscriptSegment(start=0, end=5, text="Opening idea."),
+        TranscriptSegment(start=5, end=10, text="Important detail."),
+    ]
+    existing = StudyMaterial(
+        one_line="旧导览",
+        context_summary="已有上下文摘要",
+        time_map=[TimeRange(start=0, end=10, title="旧结构标题", summary="旧结构摘要", priority="focus")],
+        outline=[OutlineNode(id="block-1", start=0, end=10, title="旧大纲", summary="旧摘要", children=[])],
+        detailed_notes="00:00-00:10 旧结构标题\n已有解读内容。",
+        high_fidelity_text="旧详解",
+    )
+
+    def fail_generation(*args, **kwargs):
+        raise RuntimeError(error_text)
+
+    monkeypatch.setattr(ai, failing_function, fail_generation)
+
+    with pytest.raises(RuntimeError, match=error_text):
+        ai.regenerate_study_section(
+            title="Lesson",
+            transcript=transcript,
+            existing_study=existing,
+            provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+            output_language="zh-CN",
+            section=section,
+        )
+
+
+def test_learning_block_generation_fails_when_high_fidelity_layer_fails(monkeypatch):
+    source_chunk = [
+        TranscriptSegment(start=0, end=5, text="Opening idea corrected."),
+        TranscriptSegment(start=5, end=10, text="The example shows two prompt versions."),
+    ]
+    translated_chunk = [
+        TranscriptSegment(start=0, end=5, text="校正后的开场观点。"),
+        TranscriptSegment(start=5, end=10, text="例子展示两个提示词版本。"),
+    ]
+
+    def fake_chat_json(provider, messages, temperature, max_tokens, timeout, task_key=None):
+        if task_key == "high_fidelity":
+            raise RuntimeError("high fidelity failed")
+        if "Return strict JSON only: {\"detailed_notes\": string}" in messages[0]["content"]:
+            return {"detailed_notes": "解读层说明这个例子为什么重要。"}
+        return {
+            "title": "提示词版本对比",
+            "summary": "这一块用例子说明提示词迭代。",
+            "priority": "focus",
+            "key_points": [{"type": "example", "text": "比较两个提示词版本。", "evidence": "example line"}],
+            "terms": ["提示词迭代"],
+            "open_questions": [],
+        }
+
+    monkeypatch.setattr(ai, "_chat_json", fake_chat_json)
+
+    with pytest.raises(RuntimeError, match="high fidelity failed"):
+        ai._generate_learning_block_with_provider(
+            title="Lesson",
+            index=0,
+            source_chunk=source_chunk,
+            translated_chunk=translated_chunk,
+            context_summary="课程讲提示词迭代。",
+            provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="learning"),
+            output_language="zh-CN",
+            detail_level="faithful",
+        )
 
 
 def test_outline_time_calibration_uses_block_ids():

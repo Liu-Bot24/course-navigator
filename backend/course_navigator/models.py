@@ -10,6 +10,9 @@ StudySection = Literal["all", "guide", "outline", "detailed", "high"]
 ModelProviderType = Literal["openai", "anthropic"]
 StudyDetailLevel = Literal["fast", "standard", "detailed", "faithful"]
 TranscriptSource = Literal["subtitles", "asr", "online_asr", "imported"]
+VideoSourceType = Literal["remote", "workspace", "external"]
+LocalVideoPathImportMode = Literal["workspace", "external"]
+VideoSourceBindingType = Literal["remote", "external"]
 OnlineAsrProvider = Literal["none", "openai", "groq", "xai", "custom"]
 TaskParameterKey = Literal[
     "title_translation",
@@ -47,6 +50,21 @@ class DownloadRequest(BaseModel):
     cookies_path: str | None = None
 
 
+class LocalVideoPathImportRequest(BaseModel):
+    paths: list[str] = Field(min_length=1)
+    mode: LocalVideoPathImportMode = "external"
+
+
+class LocalVideoFilePickerRequest(BaseModel):
+    mode: LocalVideoPathImportMode = "external"
+
+
+class VideoSourceBindingRequest(BaseModel):
+    source_type: VideoSourceBindingType
+    url: str | None = None
+    path: str | None = None
+
+
 class StudyRequest(BaseModel):
     output_language: OutputLanguage = "zh-CN"
     section: StudySection = "all"
@@ -60,6 +78,7 @@ class TranscriptUpdateRequest(BaseModel):
 class CourseItemUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     translated_title: str | None = Field(default=None, max_length=200)
+    collection_group_title: str | None = Field(default=None, max_length=200)
     collection_title: str | None = Field(default=None, max_length=200)
     course_index: float | None = None
     sort_order: float | None = None
@@ -286,6 +305,8 @@ class CourseItem(BaseModel):
     source_url: str
     title: str
     custom_title: bool = False
+    video_source_type: VideoSourceType = "remote"
+    collection_group_title: str | None = None
     collection_title: str | None = None
     course_index: float | None = None
     sort_order: float | None = None
@@ -336,6 +357,7 @@ class CourseShareItem(BaseModel):
     source_url: str
     title: str
     custom_title: bool = False
+    collection_group_title: str | None = Field(default=None, max_length=200)
     collection_title: str | None = Field(default=None, max_length=200)
     course_index: float | None = None
     sort_order: float | None = None

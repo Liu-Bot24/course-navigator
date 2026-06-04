@@ -41,6 +41,9 @@ export type UiLanguage = "zh-CN" | "en";
 
 export type OutputLanguage = "zh-CN" | "en" | "ja";
 export type TranscriptSource = "subtitles" | "asr" | "online_asr" | "imported";
+export type VideoSourceType = "remote" | "workspace" | "external";
+export type LocalVideoImportMode = "workspace" | "external";
+export type VideoSourceBindingInput = { source_type: "remote"; url: string } | { source_type: "external"; path: string };
 export type OnlineAsrProvider = "none" | "openai" | "groq" | "xai" | "custom";
 export type StudySection = "all" | "guide" | "outline" | "detailed" | "high";
 export type ModelProviderType = "openai" | "anthropic";
@@ -249,6 +252,7 @@ export type CourseItem = {
   source_url: string;
   title: string;
   custom_title?: boolean;
+  collection_group_title?: string | null;
   collection_title?: string | null;
   course_index?: number | null;
   sort_order?: number | null;
@@ -258,6 +262,7 @@ export type CourseItem = {
   transcript_source?: TranscriptSource | null;
   metadata?: VideoMetadata | null;
   study: StudyMaterial | null;
+  video_source_type?: VideoSourceType;
   local_video_path?: string | null;
 };
 
@@ -266,6 +271,7 @@ export type CourseShareItem = {
   source_url: string;
   title: string;
   custom_title?: boolean;
+  collection_group_title?: string | null;
   collection_title?: string | null;
   course_index?: number | null;
   sort_order?: number | null;

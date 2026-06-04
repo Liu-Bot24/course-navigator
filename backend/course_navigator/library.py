@@ -59,13 +59,14 @@ class CourseLibrary:
         return self.items_dir / f"{item_id}.json"
 
 
-def _course_sort_key(item: CourseItem) -> tuple[str, int, float, float]:
+def _course_sort_key(item: CourseItem) -> tuple[str, str, int, float, float]:
+    collection_group = (item.collection_group_title or "").casefold()
     collection = (item.collection_title or "未归档").casefold()
     has_index = 0 if item.course_index is not None else 1
     numeric_order = item.course_index if item.course_index is not None else item.sort_order
     if numeric_order is None:
         numeric_order = float("inf")
-    return (collection, has_index, numeric_order, -_created_at_timestamp(item.created_at))
+    return (collection_group, collection, has_index, numeric_order, -_created_at_timestamp(item.created_at))
 
 
 def _created_at_timestamp(value: str) -> float:

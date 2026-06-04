@@ -52,7 +52,7 @@ class FakeLocalVideoRunner(FakeRunner):
     def extract_asr_from_file(self, video_path: Path, target_dir: Path, item_id: str, language: str = "auto", progress=None):
         if progress:
             progress(45, "正在转写本地视频")
-        assert video_path.name == "Local-Lesson.mp4"
+        assert video_path.suffix == ".mp4"
         return [TranscriptSegment(start=0, end=2, text="Local transcript")]
 
 
@@ -171,6 +171,7 @@ def test_import_course_package_saves_finished_course_without_local_artifacts(tmp
                     "id": "abc123",
                     "source_url": "https://example.com/shared-course",
                     "title": "Shared lesson",
+                    "collection_group_title": "Shared group",
                     "collection_title": "Shared collection",
                     "course_index": 3,
                     "sort_order": 3,
@@ -191,6 +192,7 @@ def test_import_course_package_saves_finished_course_without_local_artifacts(tmp
     assert imported["id"] == "abc123-imported"
     assert imported["title"] == "Shared lesson"
     assert imported["custom_title"] is True
+    assert imported["collection_group_title"] == "Shared group"
     assert imported["collection_title"] == "Shared collection"
     assert imported["course_index"] == 3
     assert imported["transcript_source"] == "imported"
@@ -279,6 +281,315 @@ def test_imported_course_can_cache_video_after_reusing_deleted_id(tmp_path):
 
     assert payload["status"] == "succeeded"
     assert client.get("/api/items/abc123").json()["local_video_path"].endswith("abc123.mp4")
+
+
+def test_imported_course_can_bind_external_video_source_without_losing_artifacts(tmp_path):
+    process_dir = tmp_path / "process-data"
+    workspace_dir = tmp_path / "course-workspace"
+    nas_video = tmp_path / "nas" / "Shared Lesson.mp4"
+    nas_video.parent.mkdir()
+    nas_video.write_text("video", encoding="utf-8")
+    client = make_client(process_dir, runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+
+    imported = client.post(
+        "/api/import",
+        json={
+            "format": "course-navigator-share",
+            "version": 1,
+            "items": [
+                {
+                    "id": "shared-course",
+                    "source_url": "local-video://original-shared-course",
+                    "title": "Shared lesson",
+                    "duration": 12,
+                    "transcript": [{"start": 0, "end": 2, "text": "Corrected opening."}],
+                    "study": {
+                        "one_line": "已有导览",
+                        "time_map": [],
+                        "outline": [],
+                        "detailed_notes": "已有解读",
+                        "high_fidelity_text": "已有详解",
+                    },
+                }
+            ],
+        },
+    )
+    assert imported.status_code == 200
+    assert imported.json()["items"][0]["local_video_path"] is None
+
+    response = client.post(
+        "/api/items/shared-course/video-source",
+        json={"source_type": "external", "path": str(nas_video)},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "shared-course"
+    assert payload["source_url"] == "external-video://shared-course"
+    assert payload["video_source_type"] == "external"
+    assert payload["local_video_path"] == str(nas_video.resolve())
+    assert payload["duration"] == 67.5
+    assert payload["transcript"][0]["text"] == "Corrected opening."
+    assert payload["study"]["high_fidelity_text"] == "已有详解"
+    assert not (workspace_dir / "downloads").exists()
+
+
+def test_external_video_course_can_change_to_another_external_video_source(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    old_video = tmp_path / "nas" / "Old.mp4"
+    new_video = tmp_path / "nas" / "New.mp4"
+    old_video.parent.mkdir()
+    old_video.write_text("old video", encoding="utf-8")
+    new_video.write_text("new video", encoding="utf-8")
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+
+    imported = client.post("/api/local-video-paths", json={"paths": [str(old_video)], "mode": "external"})
+    item_id = imported.json()[0]["id"]
+
+    response = client.post(
+        f"/api/items/{item_id}/video-source",
+        json={"source_type": "external", "path": str(new_video)},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == item_id
+    assert payload["video_source_type"] == "external"
+    assert payload["local_video_path"] == str(new_video.resolve())
+    assert old_video.exists()
+    assert new_video.exists()
+    assert not (workspace_dir / "downloads").exists()
+
+
+def test_external_video_course_can_change_to_remote_video_source(tmp_path):
+    old_video = tmp_path / "nas" / "Old.mp4"
+    old_video.parent.mkdir()
+    old_video.write_text("old video", encoding="utf-8")
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=tmp_path / "workspace")
+    imported = client.post("/api/local-video-paths", json={"paths": [str(old_video)], "mode": "external"})
+    item_id = imported.json()[0]["id"]
+
+    response = client.post(
+        f"/api/items/{item_id}/video-source",
+        json={"source_type": "remote", "url": "https://example.com/new-video"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source_url"] == "https://example.com/new-video"
+    assert payload["video_source_type"] == "remote"
+    assert payload["local_video_path"] is None
+    assert old_video.exists()
+
+
+def test_workspace_video_course_cannot_change_video_source_directly(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    replacement = tmp_path / "nas" / "Replacement.mp4"
+    replacement.parent.mkdir()
+    replacement.write_text("replacement", encoding="utf-8")
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    )
+    item_id = imported.json()["id"]
+
+    response = client.post(
+        f"/api/items/{item_id}/video-source",
+        json={"source_type": "external", "path": str(replacement)},
+    )
+
+    assert response.status_code == 400
+    assert "Workspace" in response.json()["detail"]
+    payload = client.get(f"/api/items/{item_id}").json()
+    assert payload["source_url"] == f"local-video://{item_id}"
+    assert payload["video_source_type"] == "workspace"
+    assert payload["local_video_path"].endswith(f"{item_id}.mp4")
+
+
+def test_missing_workspace_video_file_can_bind_replacement_source(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    replacement = tmp_path / "nas" / "Replacement.mp4"
+    replacement.parent.mkdir()
+    replacement.write_text("replacement", encoding="utf-8")
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    )
+    item_id = imported.json()["id"]
+    cached_path = workspace_dir / imported.json()["local_video_path"]
+    cached_path.unlink()
+    missing_video_payload = client.get(f"/api/items/{item_id}").json()
+
+    assert missing_video_payload["local_video_path"] is None
+    response = client.post(
+        f"/api/items/{item_id}/video-source",
+        json={"source_type": "external", "path": str(replacement)},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source_url"] == f"external-video://{item_id}"
+    assert payload["video_source_type"] == "external"
+    assert payload["local_video_path"] == str(replacement.resolve())
+
+
+def test_video_source_picker_binds_single_external_file_to_existing_course(tmp_path, monkeypatch):
+    replacement = tmp_path / "nas" / "Replacement.mp4"
+    replacement.parent.mkdir()
+    replacement.write_text("replacement", encoding="utf-8")
+    picker_modes: list[bool] = []
+    monkeypatch.setattr(app_module, "_pick_local_video_paths", lambda *, multiple: picker_modes.append(multiple) or [replacement])
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=tmp_path / "workspace")
+    imported = client.post(
+        "/api/import",
+        json={
+            "format": "course-navigator-share",
+            "version": 1,
+            "items": [
+                {
+                    "id": "shared-course",
+                    "source_url": "local-video://shared-course",
+                    "title": "Shared course",
+                    "created_at": "2026-05-03T00:00:00Z",
+                    "transcript": [{"start": 0, "end": 2, "text": "Hello"}],
+                    "study": {
+                        "one_line": "Existing guide",
+                        "translated_title": None,
+                        "time_map": [],
+                        "outline": [],
+                        "detailed_notes": "Existing notes",
+                        "high_fidelity_text": "Existing detail",
+                        "translated_transcript": [],
+                        "prerequisites": [],
+                        "thought_prompts": [],
+                        "review_suggestions": [],
+                    },
+                }
+            ],
+        },
+    )
+    item_id = imported.json()["items"][0]["id"]
+
+    response = client.post(f"/api/items/{item_id}/video-source-picker")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == item_id
+    assert payload["source_url"] == f"external-video://{item_id}"
+    assert payload["video_source_type"] == "external"
+    assert payload["local_video_path"] == str(replacement.resolve())
+    assert payload["transcript"][0]["text"] == "Hello"
+    assert client.get("/api/items").json()[0]["id"] == item_id
+    assert picker_modes == [False]
+
+
+def test_workspace_video_picker_imports_single_file_to_existing_course(tmp_path, monkeypatch):
+    workspace_dir = tmp_path / "workspace"
+    source = tmp_path / "nas" / "Replacement.mp4"
+    source.parent.mkdir()
+    source.write_text("replacement", encoding="utf-8")
+    picker_modes: list[bool] = []
+    monkeypatch.setattr(app_module, "_pick_local_video_paths", lambda *, multiple: picker_modes.append(multiple) or [source])
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
+    imported = client.post(
+        "/api/import",
+        json={
+            "format": "course-navigator-share",
+            "version": 1,
+            "items": [
+                {
+                    "id": "shared-course",
+                    "source_url": "local-video://shared-course",
+                    "title": "Shared course",
+                    "duration": 12,
+                    "created_at": "2026-05-03T00:00:00Z",
+                    "transcript": [{"start": 0, "end": 2, "text": "Hello"}],
+                    "study": {
+                        "one_line": "Existing guide",
+                        "translated_title": None,
+                        "time_map": [],
+                        "outline": [],
+                        "detailed_notes": "Existing notes",
+                        "high_fidelity_text": "Existing detail",
+                        "translated_transcript": [],
+                        "prerequisites": [],
+                        "thought_prompts": [],
+                        "review_suggestions": [],
+                    },
+                }
+            ],
+        },
+    )
+    item_id = imported.json()["items"][0]["id"]
+
+    response = client.post(f"/api/items/{item_id}/workspace-video-picker")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == item_id
+    assert payload["source_url"] == f"local-video://{item_id}"
+    assert payload["video_source_type"] == "workspace"
+    assert payload["local_video_path"] == f"downloads/{item_id}.mp4"
+    assert payload["duration"] == 67.5
+    assert payload["transcript"][0]["text"] == "Hello"
+    assert payload["study"]["high_fidelity_text"] == "Existing detail"
+    assert (workspace_dir / payload["local_video_path"]).read_text(encoding="utf-8") == "replacement"
+    assert source.exists()
+    assert picker_modes == [False]
+
+
+def test_workspace_video_picker_rejects_existing_workspace_video(tmp_path, monkeypatch):
+    source = tmp_path / "nas" / "Replacement.mp4"
+    source.parent.mkdir()
+    source.write_text("replacement", encoding="utf-8")
+    picker_modes: list[bool] = []
+    monkeypatch.setattr(app_module, "_pick_local_video_paths", lambda *, multiple: picker_modes.append(multiple) or [source])
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=tmp_path / "workspace")
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    )
+    item_id = imported.json()["id"]
+
+    response = client.post(f"/api/items/{item_id}/workspace-video-picker")
+
+    assert response.status_code == 400
+    assert "Workspace" in response.json()["detail"]
+    assert picker_modes == []
+
+
+def test_workspace_video_picker_cancel_returns_current_item(tmp_path, monkeypatch):
+    picker_modes: list[bool] = []
+    monkeypatch.setattr(app_module, "_pick_local_video_paths", lambda *, multiple: picker_modes.append(multiple) or [])
+    client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=tmp_path / "workspace")
+    imported = client.post(
+        "/api/import",
+        json={
+            "format": "course-navigator-share",
+            "version": 1,
+            "items": [
+                {
+                    "id": "shared-course",
+                    "source_url": "local-video://shared-course",
+                    "title": "Shared course",
+                    "created_at": "2026-05-03T00:00:00Z",
+                    "transcript": [{"start": 0, "end": 2, "text": "Hello"}],
+                }
+            ],
+        },
+    )
+    item_id = imported.json()["items"][0]["id"]
+
+    response = client.post(f"/api/items/{item_id}/workspace-video-picker")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == item_id
+    assert payload["local_video_path"] is None
+    assert payload["source_url"] == "local-video://shared-course"
+    assert picker_modes == [False]
 
 
 def test_workspace_keeps_course_records_and_downloads_separate_from_process_files(tmp_path):
@@ -449,6 +760,7 @@ def test_course_collection_and_index_can_be_edited_and_cleared(tmp_path):
     updated = client.patch(
         "/api/items/abc123",
         json={
+            "collection_group_title": "学习",
             "collection_title": "提示工程入门",
             "course_index": 2,
             "sort_order": 2,
@@ -456,12 +768,14 @@ def test_course_collection_and_index_can_be_edited_and_cleared(tmp_path):
     )
 
     assert updated.status_code == 200
+    assert updated.json()["collection_group_title"] == "学习"
     assert updated.json()["collection_title"] == "提示工程入门"
     assert updated.json()["course_index"] == 2
 
     cleared = client.patch(
         "/api/items/abc123",
         json={
+            "collection_group_title": None,
             "collection_title": None,
             "course_index": None,
             "sort_order": None,
@@ -469,6 +783,7 @@ def test_course_collection_and_index_can_be_edited_and_cleared(tmp_path):
     )
 
     assert cleared.status_code == 200
+    assert cleared.json()["collection_group_title"] == ""
     assert cleared.json()["collection_title"] == ""
     assert cleared.json()["course_index"] is None
 
@@ -1039,6 +1354,141 @@ def test_study_job_saves_partial_study_sections_before_completion(tmp_path, monk
 
     assert payload["status"] == "succeeded"
     assert client.get("/api/items/abc123").json()["study"]["high_fidelity_text"] == "最终详解"
+
+
+def test_study_job_section_failure_marks_failed_and_keeps_existing_study(tmp_path, monkeypatch):
+    def fail_regenerate(**kwargs):
+        raise RuntimeError("high fidelity failed")
+
+    monkeypatch.setattr("course_navigator.app.regenerate_study_section", fail_regenerate)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    library = CourseLibrary(tmp_path)
+    item = library.get("abc123")
+    assert item is not None
+    item.study = StudyMaterial(
+        one_line="已有导览",
+        time_map=[],
+        outline=[],
+        detailed_notes="已有解读",
+        high_fidelity_text="已有详解",
+    )
+    library.save(item)
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "high"})
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "failed"
+    assert payload["error"] == "high fidelity failed"
+    assert client.get("/api/items/abc123").json()["study"]["high_fidelity_text"] == "已有详解"
+
+
+def test_study_job_full_provider_failure_marks_failed_and_keeps_existing_study(tmp_path, monkeypatch):
+    def fail_provider_generation(*args, **kwargs):
+        raise RuntimeError("learning provider failed")
+
+    monkeypatch.setattr("course_navigator.ai._generate_with_provider", fail_provider_generation)
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            llm_base_url="https://example.test/v1",
+            llm_api_key="sk-test",
+            llm_model="test-model",
+        ),
+    )
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    library = CourseLibrary(tmp_path)
+    item = library.get("abc123")
+    assert item is not None
+    item.study = StudyMaterial(
+        one_line="已有导览",
+        time_map=[],
+        outline=[],
+        detailed_notes="已有解读",
+        high_fidelity_text="已有详解",
+    )
+    library.save(item)
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "all"})
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "failed"
+    assert payload["error"] == "learning provider failed"
+    assert client.get("/api/items/abc123").json()["study"]["high_fidelity_text"] == "已有详解"
+
+
+def test_study_job_full_failure_restores_existing_study_after_partial_save(tmp_path, monkeypatch):
+    def fail_after_partial(**kwargs):
+        kwargs["partial_study"](
+            StudyMaterial(
+                one_line="临时导览",
+                time_map=[],
+                outline=[],
+                detailed_notes="临时解读",
+                high_fidelity_text="临时详解",
+            )
+        )
+        raise RuntimeError("learning provider failed late")
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fail_after_partial)
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            llm_base_url="https://example.test/v1",
+            llm_api_key="sk-test",
+            llm_model="test-model",
+        ),
+    )
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    library = CourseLibrary(tmp_path)
+    item = library.get("abc123")
+    assert item is not None
+    item.study = StudyMaterial(
+        one_line="已有导览",
+        time_map=[],
+        outline=[],
+        detailed_notes="已有解读",
+        high_fidelity_text="已有详解",
+    )
+    library.save(item)
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "all"})
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "failed"
+    assert payload["error"] == "learning provider failed late"
+    study = client.get("/api/items/abc123").json()["study"]
+    assert study["one_line"] == "已有导览"
+    assert study["high_fidelity_text"] == "已有详解"
 
 
 def test_translation_job_writes_translated_transcript(tmp_path, monkeypatch):
@@ -1795,6 +2245,109 @@ def test_import_local_video_copies_file_to_workspace_downloads_and_creates_cours
     assert client.get("/api/items/Local-Lesson/video").content == b"local video"
 
 
+def test_import_external_video_paths_links_files_without_copying(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    process_dir = tmp_path / "process"
+    source_dir = tmp_path / "nas"
+    source_dir.mkdir()
+    source = source_dir / "NAS Lesson.mp4"
+    source.write_bytes(b"external video")
+    client = make_client(process_dir, workspace_dir=workspace_dir, runner=FakeLocalVideoRunner())
+
+    response = client.post(
+        "/api/local-video-paths",
+        json={"paths": [str(source)], "mode": "external"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["id"] == "NAS-Lesson"
+    assert payload[0]["title"] == "NAS Lesson"
+    assert payload[0]["source_url"] == "external-video://NAS-Lesson"
+    assert payload[0]["video_source_type"] == "external"
+    assert payload[0]["local_video_path"] == str(source)
+    assert not (workspace_dir / "downloads" / "NAS-Lesson.mp4").exists()
+
+
+def test_import_workspace_video_paths_copies_multiple_files(tmp_path):
+    workspace_dir = tmp_path / "workspace"
+    process_dir = tmp_path / "process"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    first = source_dir / "First.mp4"
+    second = source_dir / "Second.webm"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    client = make_client(process_dir, workspace_dir=workspace_dir, runner=FakeLocalVideoRunner())
+
+    response = client.post(
+        "/api/local-video-paths",
+        json={"paths": [str(first), str(second)], "mode": "workspace"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["id"] for item in payload] == ["First", "Second"]
+    assert [item["video_source_type"] for item in payload] == ["workspace", "workspace"]
+    assert [item["local_video_path"] for item in payload] == ["downloads/First.mp4", "downloads/Second.webm"]
+    assert (workspace_dir / "downloads" / "First.mp4").read_bytes() == b"first"
+    assert (workspace_dir / "downloads" / "Second.webm").read_bytes() == b"second"
+
+
+def test_import_external_video_path_rejects_missing_file(tmp_path):
+    client = make_client(tmp_path / "process", workspace_dir=tmp_path / "workspace", runner=FakeLocalVideoRunner())
+
+    response = client.post(
+        "/api/local-video-paths",
+        json={"paths": [str(tmp_path / "missing.mp4")], "mode": "external"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Local video file not found"
+
+
+def test_import_external_video_path_rejects_unsupported_file_type(tmp_path):
+    source = tmp_path / "notes.txt"
+    source.write_text("not a video", encoding="utf-8")
+    client = make_client(tmp_path / "process", workspace_dir=tmp_path / "workspace", runner=FakeLocalVideoRunner())
+
+    response = client.post(
+        "/api/local-video-paths",
+        json={"paths": [str(source)], "mode": "external"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unsupported local video file type"
+
+
+def test_local_video_file_picker_imports_selected_paths(tmp_path, monkeypatch):
+    source = tmp_path / "NAS Lesson.mp4"
+    source.write_bytes(b"external video")
+    picker_modes: list[bool] = []
+    monkeypatch.setattr(app_module, "_pick_local_video_paths", lambda *, multiple: picker_modes.append(multiple) or [source])
+    client = make_client(tmp_path / "process", workspace_dir=tmp_path / "workspace", runner=FakeLocalVideoRunner())
+
+    response = client.post("/api/local-video-file-picker", json={"mode": "external"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["video_source_type"] == "external"
+    assert payload[0]["local_video_path"] == str(source)
+    assert picker_modes == [True]
+
+
+def test_local_video_file_picker_returns_empty_list_when_cancelled(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "_pick_local_video_paths", lambda *, multiple: [])
+    client = make_client(tmp_path / "process", workspace_dir=tmp_path / "workspace", runner=FakeLocalVideoRunner())
+
+    response = client.post("/api/local-video-file-picker", json={"mode": "external"})
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
 def test_existing_empty_workspace_receives_legacy_items_and_downloads(tmp_path):
     legacy_dir = tmp_path / "legacy"
     workspace_dir = tmp_path / "workspace"
@@ -1848,7 +2401,7 @@ def test_startup_backfills_missing_study_guidance_fields(tmp_path):
     assert payload["study"]["experienced_guidance"] == []
 
 
-def test_delete_local_video_rejects_local_imports_without_removing_file(tmp_path):
+def test_delete_local_video_keeps_local_import_course_and_removes_video_file(tmp_path):
     workspace_dir = tmp_path / "workspace"
     client = make_client(tmp_path / "process", runner=FakeLocalVideoRunner(), workspace_dir=workspace_dir)
     client.post(
@@ -1858,10 +2411,12 @@ def test_delete_local_video_rejects_local_imports_without_removing_file(tmp_path
 
     response = client.delete("/api/items/Local-Lesson/local-video")
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Local video imports must be deleted from the course library"
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source_url"] == "local-video://Local-Lesson"
+    assert payload["local_video_path"] is None
     assert client.get("/api/items/Local-Lesson").status_code == 200
-    assert (workspace_dir / "downloads" / "Local-Lesson.mp4").exists()
+    assert not (workspace_dir / "downloads" / "Local-Lesson.mp4").exists()
 
 
 def test_delete_local_import_course_removes_imported_video_file(tmp_path):
@@ -1974,6 +2529,72 @@ def test_local_video_extract_job_runs_asr_from_workspace_file(tmp_path):
     item = client.get("/api/items/Local-Lesson").json()
     assert item["transcript_source"] == "asr"
     assert item["transcript"][0]["text"] == "Local transcript"
+
+
+def test_external_video_route_serves_linked_file(tmp_path):
+    source = tmp_path / "NAS Lesson.mp4"
+    source.write_bytes(b"external video")
+    client = make_client(tmp_path / "process", workspace_dir=tmp_path / "workspace", runner=FakeLocalVideoRunner())
+    item = client.post(
+        "/api/local-video-paths",
+        json={"paths": [str(source)], "mode": "external"},
+    ).json()[0]
+
+    response = client.get(f"/api/items/{item['id']}/video")
+
+    assert response.status_code == 200
+    assert response.content == b"external video"
+
+
+def test_delete_external_video_course_keeps_original_file(tmp_path):
+    source = tmp_path / "NAS Lesson.mp4"
+    source.write_bytes(b"external video")
+    client = make_client(tmp_path / "process", workspace_dir=tmp_path / "workspace", runner=FakeLocalVideoRunner())
+    item = client.post(
+        "/api/local-video-paths",
+        json={"paths": [str(source)], "mode": "external"},
+    ).json()[0]
+
+    response = client.delete(f"/api/items/{item['id']}")
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+    assert source.read_bytes() == b"external video"
+    assert client.get(f"/api/items/{item['id']}").status_code == 404
+
+
+def test_external_video_extract_job_runs_asr_from_linked_file(tmp_path):
+    source = tmp_path / "NAS Lesson.mp4"
+    source.write_bytes(b"external video")
+    client = make_client(tmp_path / "process", workspace_dir=tmp_path / "workspace", runner=FakeLocalVideoRunner())
+    item = client.post(
+        "/api/local-video-paths",
+        json={"paths": [str(source)], "mode": "external"},
+    ).json()[0]
+
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": item["source_url"],
+            "mode": "normal",
+            "subtitle_source": "asr",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    assert payload["item_id"] == item["id"]
+    course = client.get(f"/api/items/{item['id']}").json()
+    assert course["transcript_source"] == "asr"
+    assert course["transcript"][0]["text"] == "Local transcript"
 
 
 def test_local_video_extract_job_supports_online_asr_from_workspace_file(tmp_path, monkeypatch):

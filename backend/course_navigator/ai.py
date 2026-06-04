@@ -145,25 +145,21 @@ def generate_study_material(
 
     provider_set = _coerce_provider_set(provider)
     if _first_provider(provider_set.learning, provider_set.global_provider, provider_set.translation):
-        try:
-            return _generate_with_provider(
-                title,
-                transcript,
-                provider_set,
-                output_language,
-                detail_level,
-                progress,
-                partial_translation,
-                partial_study,
-                existing_translation,
-                existing_context_summary,
-                existing_translated_title,
-                source_language,
-                metadata,
-            )
-        except Exception as exc:
-            _report(progress, "fallback", 90, f"模型生成失败，使用本地回退：{type(exc).__name__}")
-            return _generate_fallback(title, transcript, output_language)
+        return _generate_with_provider(
+            title,
+            transcript,
+            provider_set,
+            output_language,
+            detail_level,
+            progress,
+            partial_translation,
+            partial_study,
+            existing_translation,
+            existing_context_summary,
+            existing_translated_title,
+            source_language,
+            metadata,
+        )
 
     _report(progress, "fallback", 70, "未配置模型，使用本地字幕生成学习材料")
     return _generate_fallback(title, transcript, output_language)
@@ -1827,17 +1823,11 @@ def _generate_learning_blocks_for_ranges_with_provider(
         total = max(len(futures), 1)
         for future in as_completed(futures):
             index, time_range, source_chunk, translated_chunk = futures[future]
-            try:
-                block = future.result()
-                block["id"] = f"block-{index + 1}"
-                block["start"] = time_range.start
-                block["end"] = time_range.end
-                blocks_by_index[index] = block
-            except Exception:
-                fallback = _fallback_learning_block(index, source_chunk, translated_chunk, output_language)
-                fallback["start"] = time_range.start
-                fallback["end"] = time_range.end
-                blocks_by_index[index] = fallback
+            block = future.result()
+            block["id"] = f"block-{index + 1}"
+            block["start"] = time_range.start
+            block["end"] = time_range.end
+            blocks_by_index[index] = block
             completed += 1
             _report(
                 progress,
@@ -1956,14 +1946,11 @@ def _generate_existing_range_blocks_with_provider(
         total = max(len(futures), 1)
         for future in as_completed(futures):
             index, time_range = futures[future]
-            try:
-                block = future.result()
-                block["id"] = f"block-{index + 1}"
-                block["start"] = time_range.start
-                block["end"] = time_range.end
-                blocks_by_index[index] = block
-            except Exception:
-                blocks_by_index[index] = _block_from_time_range(index, time_range)
+            block = future.result()
+            block["id"] = f"block-{index + 1}"
+            block["start"] = time_range.start
+            block["end"] = time_range.end
+            blocks_by_index[index] = block
             completed += 1
             _report(
                 progress,
@@ -1994,38 +1981,32 @@ def _generate_existing_range_block_with_provider(
     fallback = _fallback_learning_block(index, source_chunk, translated_chunk, output_language)
     structure = _existing_structure_for_range(existing_study, index, time_range)
     if section == "detailed":
-        try:
-            detailed_notes = _generate_learning_block_interpretation_with_provider(
-                title=title,
-                index=index,
-                source_chunk=source_chunk,
-                translated_chunk=translated_chunk,
-                context_summary=context_summary,
-                structure=structure,
-                provider=provider,
-                output_language=output_language,
-                detail_level=detail_level,
-            )
-        except Exception:
-            detailed_notes = fallback["detailed_notes"]
+        detailed_notes = _generate_learning_block_interpretation_with_provider(
+            title=title,
+            index=index,
+            source_chunk=source_chunk,
+            translated_chunk=translated_chunk,
+            context_summary=context_summary,
+            structure=structure,
+            provider=provider,
+            output_language=output_language,
+            detail_level=detail_level,
+        )
         high_fidelity_text = fallback["high_fidelity_text"]
     else:
         detailed_notes = _existing_detailed_notes_for_range(existing_study, index, time_range)
-        try:
-            high_fidelity_text = _generate_learning_block_high_fidelity_with_provider(
-                title=title,
-                index=index,
-                source_chunk=source_chunk,
-                translated_chunk=translated_chunk,
-                context_summary=context_summary,
-                structure=structure,
-                detailed_notes=detailed_notes,
-                provider=provider,
-                output_language=output_language,
-                detail_level=detail_level,
-            )
-        except Exception:
-            high_fidelity_text = fallback["high_fidelity_text"]
+        high_fidelity_text = _generate_learning_block_high_fidelity_with_provider(
+            title=title,
+            index=index,
+            source_chunk=source_chunk,
+            translated_chunk=translated_chunk,
+            context_summary=context_summary,
+            structure=structure,
+            detailed_notes=detailed_notes,
+            provider=provider,
+            output_language=output_language,
+            detail_level=detail_level,
+        )
     return {
         "id": f"block-{index + 1}",
         "start": time_range.start,
@@ -2084,36 +2065,30 @@ def _generate_learning_block_with_provider(
             output_language=output_language,
         )
 
-    try:
-        detailed_notes = _generate_learning_block_interpretation_with_provider(
-            title=title,
-            index=index,
-            source_chunk=source_chunk,
-            translated_chunk=translated_chunk,
-            context_summary=context_summary,
-            structure=structure,
-            provider=provider,
-            output_language=output_language,
-            detail_level=detail_level,
-        )
-    except Exception:
-        detailed_notes = fallback["detailed_notes"]
+    detailed_notes = _generate_learning_block_interpretation_with_provider(
+        title=title,
+        index=index,
+        source_chunk=source_chunk,
+        translated_chunk=translated_chunk,
+        context_summary=context_summary,
+        structure=structure,
+        provider=provider,
+        output_language=output_language,
+        detail_level=detail_level,
+    )
 
-    try:
-        high_fidelity_text = _generate_learning_block_high_fidelity_with_provider(
-            title=title,
-            index=index,
-            source_chunk=source_chunk,
-            translated_chunk=translated_chunk,
-            context_summary=context_summary,
-            structure=structure,
-            detailed_notes=detailed_notes,
-            provider=provider,
-            output_language=output_language,
-            detail_level=detail_level,
-        )
-    except Exception:
-        high_fidelity_text = fallback["high_fidelity_text"]
+    high_fidelity_text = _generate_learning_block_high_fidelity_with_provider(
+        title=title,
+        index=index,
+        source_chunk=source_chunk,
+        translated_chunk=translated_chunk,
+        context_summary=context_summary,
+        structure=structure,
+        detailed_notes=detailed_notes,
+        provider=provider,
+        output_language=output_language,
+        detail_level=detail_level,
+    )
 
     priority = str(structure.get("priority") or fallback["priority"]).lower()
     if priority not in {"focus", "skim", "skip", "review"}:

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -50,6 +51,8 @@ from .models import (
     DownloadRequest,
     DownloadResponse,
     ExtractRequest,
+    LocalVideoFilePickerRequest,
+    LocalVideoPathImportRequest,
     ModelListRequest,
     ModelListResponse,
     ModelSettingsResponse,
@@ -66,6 +69,7 @@ from .models import (
     StudyRequest,
     TranscriptSegment,
     TranscriptUpdateRequest,
+    VideoSourceBindingRequest,
 )
 from .online_asr import extract_online_asr_transcript
 from .ytdlp import YtDlpError, YtDlpRunner, is_subtitle_unavailable_error
@@ -100,6 +104,7 @@ def create_app(
     _maybe_auto_cleanup_asr_cache(active_data_dir, active_settings)
     library = CourseLibrary(active_workspace_dir)
     _normalize_library_video_paths(library, active_workspace_dir)
+    _backfill_video_source_types(library, active_workspace_dir)
     _backfill_study_guidance_fields(library)
     ytdlp_runner = runner or YtDlpRunner()
     _backfill_local_video_items(library, active_workspace_dir, ytdlp_runner)
@@ -135,14 +140,14 @@ def create_app(
 
     @app.get("/api/items")
     def list_items() -> list[CourseItem]:
-        return [_normalize_item_for_response(item) for item in library.list_items()]
+        return [_normalize_item_for_response(item, active_workspace_dir) for item in library.list_items()]
 
     @app.get("/api/items/{item_id}")
     def get_item(item_id: str) -> CourseItem:
         item = library.get(item_id)
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
-        return _normalize_item_for_response(item)
+        return _normalize_item_for_response(item, active_workspace_dir)
 
     @app.post("/api/import")
     def import_course_package(package: CourseSharePackage) -> CourseImportResponse:
@@ -161,6 +166,7 @@ def create_app(
                 source_url=entry.source_url,
                 title=entry.title.strip() or (entry.metadata.title if entry.metadata else item_id),
                 custom_title=True,
+                collection_group_title=entry.collection_group_title.strip() if entry.collection_group_title else "",
                 collection_title=entry.collection_title.strip() if entry.collection_title else "",
                 course_index=entry.course_index,
                 sort_order=entry.sort_order,
@@ -170,12 +176,13 @@ def create_app(
                 transcript_source="imported",
                 metadata=entry.metadata,
                 study=entry.study,
+                video_source_type="remote",
                 local_video_path=None,
             )
             library.save(item)
             with deleted_items_lock:
                 deleted_items.discard(item.id)
-            imported.append(_normalize_item_for_response(item))
+            imported.append(_normalize_item_for_response(item, active_workspace_dir))
         message = package.message.strip() if package.message else None
         return CourseImportResponse(items=imported, message=message or None)
 
@@ -214,19 +221,99 @@ def create_app(
             transcript_source=None,
             metadata=None,
             study=None,
+            video_source_type="workspace",
             local_video_path=_workspace_relative_path(active_workspace_dir, video_path),
         )
         with deleted_items_lock:
             deleted_items.discard(item.id)
         library.save(item)
-        return _normalize_item_for_response(item)
+        return _normalize_item_for_response(item, active_workspace_dir)
+
+    @app.post("/api/local-video-paths")
+    def import_local_video_paths(request: LocalVideoPathImportRequest) -> list[CourseItem]:
+        try:
+            imported = _import_video_paths(library, active_workspace_dir, ytdlp_runner, request.paths, request.mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        with deleted_items_lock:
+            for item in imported:
+                deleted_items.discard(item.id)
+        return imported
+
+    @app.post("/api/local-video-file-picker")
+    def import_local_video_file_picker(request: LocalVideoFilePickerRequest) -> list[CourseItem]:
+        try:
+            paths = [str(path) for path in _pick_local_video_paths(multiple=True)]
+            if not paths:
+                return []
+            imported = _import_video_paths(library, active_workspace_dir, ytdlp_runner, paths, request.mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        with deleted_items_lock:
+            for item in imported:
+                deleted_items.discard(item.id)
+        return imported
+
+    @app.post("/api/items/{item_id}/video-source")
+    def bind_video_source(item_id: str, request: VideoSourceBindingRequest) -> CourseItem:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        try:
+            updated = _bind_video_source_for_item(item, active_workspace_dir, ytdlp_runner, request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        library.save(updated)
+        return _normalize_item_for_response(updated, active_workspace_dir)
+
+    @app.post("/api/items/{item_id}/video-source-picker")
+    def bind_video_source_from_picker(item_id: str) -> CourseItem:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        try:
+            paths = _pick_local_video_paths(multiple=False)
+            if not paths:
+                return _normalize_item_for_response(item, active_workspace_dir)
+            updated = _bind_video_source_for_item(
+                item,
+                active_workspace_dir,
+                ytdlp_runner,
+                VideoSourceBindingRequest(source_type="external", path=str(paths[0])),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        library.save(updated)
+        return _normalize_item_for_response(updated, active_workspace_dir)
+
+    @app.post("/api/items/{item_id}/workspace-video-picker")
+    def import_workspace_video_from_picker(item_id: str) -> CourseItem:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        if _has_workspace_video_file(active_workspace_dir, item):
+            raise HTTPException(status_code=400, detail="Workspace video sources cannot be changed directly")
+        try:
+            paths = _pick_local_video_paths(multiple=False)
+            if not paths:
+                return _normalize_item_for_response(item, active_workspace_dir)
+            updated = _import_workspace_video_source_for_item(
+                item,
+                active_workspace_dir,
+                ytdlp_runner,
+                paths[0],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        library.save(updated)
+        return _normalize_item_for_response(updated, active_workspace_dir)
 
     @app.post("/api/preview")
     def preview(request: ExtractRequest) -> CourseItem:
-        if _is_local_video_url(request.url):
-            item = _local_video_item_for_request(request)
+        if _is_file_video_url(request.url):
+            item = _file_video_item_for_request(request)
             if item:
-                return _normalize_item_for_response(item)
+                return _normalize_item_for_response(item, active_workspace_dir)
             raise HTTPException(status_code=404, detail="Local video course not found")
         try:
             metadata = ytdlp_runner.fetch_metadata(request)
@@ -259,6 +346,7 @@ def create_app(
             transcript_source=existing.transcript_source if existing else None,
             metadata=metadata,
             study=existing.study if existing else None,
+            video_source_type=existing.video_source_type if existing else "remote",
             local_video_path=existing.local_video_path if existing else None,
         )
         with deleted_items_lock:
@@ -268,7 +356,7 @@ def create_app(
 
     @app.post("/api/extract")
     def extract(request: ExtractRequest) -> CourseItem:
-        if _is_local_video_url(request.url):
+        if _is_file_video_url(request.url):
             try:
                 return _extract_and_save_local_video_course(request)
             except YtDlpError as exc:
@@ -321,6 +409,7 @@ def create_app(
             transcript_source=transcript_source,
             metadata=metadata,
             study=existing.study if keep_existing_study else None,
+            video_source_type=existing.video_source_type if existing else "remote",
             local_video_path=existing.local_video_path if existing else None,
         )
         if progress:
@@ -336,12 +425,12 @@ def create_app(
         request: ExtractRequest,
         progress: Callable[[str, int, str], None] | None = None,
     ) -> CourseItem:
-        item = _local_video_item_for_request(request)
+        item = _file_video_item_for_request(request)
         if not item:
             raise YtDlpError("Local video course not found")
-        video_path = _local_video_path_for_item(item)
+        video_path = _file_video_path_for_item(item)
         if not video_path:
-            raise YtDlpError("Local video not found")
+            raise YtDlpError("Linked video file is unavailable" if _is_external_video_item(item) else "Local video not found")
         transcript_dir = active_data_dir / "subtitles" / item.id
         source = request.subtitle_source if request.subtitle_source in {"asr", "online_asr"} else "asr"
         if source == "online_asr":
@@ -376,13 +465,23 @@ def create_app(
         )
         library.save(next_item)
         _maybe_auto_cleanup_asr_cache(active_data_dir, settings_state["value"])
-        return _normalize_item_for_response(next_item)
+        return _normalize_item_for_response(next_item, active_workspace_dir)
 
     def _local_video_item_for_request(request: ExtractRequest) -> CourseItem | None:
         return library.get(_local_video_item_id_from_url(request.url))
 
     def _local_video_path_for_item(item: CourseItem) -> Path | None:
         return _local_video_path_for_workspace_item(active_workspace_dir, item)
+
+    def _file_video_item_for_request(request: ExtractRequest) -> CourseItem | None:
+        if _is_local_video_url(request.url):
+            return _local_video_item_for_request(request)
+        if _is_external_video_url(request.url):
+            return library.get(_external_video_item_id_from_url(request.url))
+        return None
+
+    def _file_video_path_for_item(item: CourseItem) -> Path | None:
+        return _file_video_path_for_workspace_item(active_workspace_dir, item)
 
     @app.patch("/api/items/{item_id}")
     def update_item_title(item_id: str, request: CourseItemUpdate) -> CourseItem:
@@ -419,6 +518,9 @@ def create_app(
         if "collection_title" in fields:
             collection_title = request.collection_title.strip() if request.collection_title else ""
             updates["collection_title"] = collection_title
+        if "collection_group_title" in fields:
+            collection_group_title = request.collection_group_title.strip() if request.collection_group_title else ""
+            updates["collection_group_title"] = collection_group_title
         if "course_index" in fields:
             updates["course_index"] = request.course_index
         if "sort_order" in fields:
@@ -427,7 +529,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="No course updates provided")
         item = item.model_copy(update=updates)
         library.save(item)
-        return _normalize_item_for_response(item)
+        return _normalize_item_for_response(item, active_workspace_dir)
 
     @app.put("/api/items/{item_id}/transcript")
     def update_transcript(item_id: str, request: TranscriptUpdateRequest) -> CourseItem:
@@ -444,7 +546,7 @@ def create_app(
                 }
             )
         library.save(item)
-        return _normalize_item_for_response(item)
+        return _normalize_item_for_response(item, active_workspace_dir)
 
     @app.delete("/api/items/{item_id}")
     def delete_item(item_id: str) -> dict[str, bool]:
@@ -462,12 +564,14 @@ def create_app(
         item = library.get(item_id)
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
-        if _is_local_video_item(item):
-            raise HTTPException(status_code=400, detail="Local video imports must be deleted from the course library")
+        if _is_external_video_item(item):
+            raise HTTPException(status_code=400, detail="Linked video imports must be deleted from the course library")
+        was_local_import = _is_local_video_item(item)
         _delete_local_video(active_workspace_dir, item)
         item.local_video_path = None
+        item.video_source_type = "workspace" if was_local_import else "remote"
         library.save(item)
-        return item
+        return _normalize_item_for_response(item, active_workspace_dir)
 
     @app.post("/api/items/{item_id}/study")
     def generate_study(item_id: str, request: StudyRequest | None = None) -> StudyMaterial:
@@ -561,7 +665,7 @@ def create_app(
         item = library.get(item_id)
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
-        if _is_local_video_item(item):
+        if _is_local_video_item(item) or _is_external_video_item(item):
             raise HTTPException(status_code=400, detail="本地视频已经在 Workspace 中，无需再次缓存。")
         job_id = uuid4().hex
         now = datetime.now(timezone.utc).isoformat()
@@ -582,8 +686,8 @@ def create_app(
 
     @app.post("/api/extract-jobs")
     def create_extract_job(request: ExtractRequest) -> StudyJobStatus:
-        if _is_local_video_url(request.url):
-            item = _local_video_item_for_request(request)
+        if _is_file_video_url(request.url):
+            item = _file_video_item_for_request(request)
             if not item:
                 raise HTTPException(status_code=404, detail="Local video course not found")
             if request.subtitle_source not in {"asr", "online_asr"}:
@@ -829,6 +933,7 @@ def create_app(
         except (ValueError, YtDlpError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         item.local_video_path = _workspace_relative_path(active_workspace_dir, video_path)
+        item.video_source_type = "workspace"
         library.save(item)
         return DownloadResponse(path=str(item.local_video_path))
 
@@ -837,10 +942,10 @@ def create_app(
         item = library.get(item_id)
         if not item or not item.local_video_path:
             raise HTTPException(status_code=404, detail="Local video not found")
-        video_path = _resolve_workspace_path(active_workspace_dir, Path(item.local_video_path))
-        downloads_dir = (active_workspace_dir / "downloads").resolve()
-        if not video_path.exists() or downloads_dir not in video_path.parents:
-            raise HTTPException(status_code=404, detail="Local video not found")
+        video_path = _file_video_path_for_item(item)
+        if not video_path:
+            detail = "Linked video file is unavailable" if _is_external_video_item(item) else "Local video not found"
+            raise HTTPException(status_code=404, detail=detail)
         return FileResponse(video_path)
 
     def _set_job(job_id: str, **updates: object) -> StudyJobStatus | None:
@@ -872,7 +977,7 @@ def create_app(
             )
 
         try:
-            if _is_local_video_url(request.url):
+            if _is_file_video_url(request.url):
                 item = _extract_and_save_local_video_course(request, progress=update_progress)
             else:
                 item = _extract_and_save_course(request, progress=update_progress)
@@ -948,10 +1053,12 @@ def create_app(
             item.study = study
             library.save(item)
 
+        original_study: StudyMaterial | None = None
         try:
             item = library.get(item_id)
             if not item:
                 raise ValueError("Course item not found")
+            original_study = item.study.model_copy(deep=True) if item.study else None
             if section == "all":
                 existing_translation = item.study.translated_transcript if item.study else None
                 existing_context_summary = item.study.context_summary if item.study else None
@@ -991,6 +1098,13 @@ def create_app(
             library.save(item)
         except Exception as exc:
             logger.exception("Study job failed: job_id=%s item_id=%s", job_id, item_id)
+            with deleted_items_lock:
+                item_deleted = item_id in deleted_items
+            if not item_deleted:
+                failed_item = library.get(item_id)
+                if failed_item:
+                    failed_item.study = original_study
+                    library.save(failed_item)
             _set_job(
                 job_id,
                 status="failed",
@@ -1162,6 +1276,7 @@ def create_app(
                 _delete_download_path(active_workspace_dir, video_path)
                 raise ValueError("Course item not found")
             item.local_video_path = _workspace_relative_path(active_workspace_dir, video_path)
+            item.video_source_type = "workspace"
             library.save(item)
         except Exception as exc:
             if video_path is not None:
@@ -1299,6 +1414,23 @@ def _backfill_study_guidance_fields(library: CourseLibrary) -> None:
             library.save(item)
 
 
+def _backfill_video_source_types(library: CourseLibrary, workspace_dir: Path) -> None:
+    for item in library.list_items():
+        video_source_type = _expected_video_source_type(workspace_dir, item)
+        if item.video_source_type != video_source_type:
+            library.save(item.model_copy(update={"video_source_type": video_source_type}))
+
+
+def _expected_video_source_type(workspace_dir: Path, item: CourseItem):
+    if _is_external_video_url(item.source_url) or item.video_source_type == "external":
+        return "external"
+    if _is_local_video_url(item.source_url):
+        return "workspace"
+    if item.local_video_path and _local_video_path_for_workspace_item(workspace_dir, item):
+        return "workspace"
+    return "remote"
+
+
 def _backfill_local_video_items(library: CourseLibrary, workspace_dir: Path, runner: YtDlpRunner) -> None:
     next_unfiled_index = _next_course_index(library.list_items(), "", "")
     for item in library.list_items():
@@ -1319,6 +1451,178 @@ def _backfill_local_video_items(library: CourseLibrary, workspace_dir: Path, run
             updates["sort_order"] = item.course_index
         if updates:
             library.save(item.model_copy(update=updates))
+
+
+def _import_video_paths(
+    library: CourseLibrary,
+    workspace_dir: Path,
+    runner: YtDlpRunner,
+    paths: list[str],
+    mode: str,
+) -> list[CourseItem]:
+    imported: list[CourseItem] = []
+    for raw_path in paths:
+        source_path = Path(raw_path).expanduser()
+        _validate_local_video_source_path(source_path)
+        item = _course_item_from_video_path(library, workspace_dir, runner, source_path, mode)
+        library.save(item)
+        imported.append(_normalize_item_for_response(item, workspace_dir))
+    return imported
+
+
+def _validate_local_video_source_path(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        raise ValueError("Local video file not found")
+    if path.suffix.lower() not in LOCAL_VIDEO_EXTENSIONS:
+        raise ValueError("Unsupported local video file type")
+
+
+def _pick_local_video_paths(*, multiple: bool) -> list[Path]:
+    multiple_selection_clause = " with multiple selections allowed" if multiple else ""
+    script = """
+set chosenFiles to choose file with prompt "选择要导入的课程视频" of type {"public.movie"}MULTIPLE_SELECTION_CLAUSE
+set output to ""
+if class of chosenFiles is list then
+  repeat with chosenFile in chosenFiles
+    set output to output & POSIX path of chosenFile & linefeed
+  end repeat
+else
+  set output to POSIX path of chosenFiles & linefeed
+end if
+return output
+""".replace("MULTIPLE_SELECTION_CLAUSE", multiple_selection_clause)
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        error = result.stderr.strip()
+        if "User canceled" in error or "用户已取消" in error or "-128" in error:
+            return []
+        raise ValueError(error or "Unable to open Finder video picker")
+    return [Path(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def _bind_video_source_for_item(
+    item: CourseItem,
+    workspace_dir: Path,
+    runner: YtDlpRunner,
+    request: VideoSourceBindingRequest,
+) -> CourseItem:
+    if _has_workspace_video_file(workspace_dir, item):
+        raise ValueError("Workspace video sources cannot be changed directly")
+    if request.source_type == "external":
+        if not request.path or not request.path.strip():
+            raise ValueError("Local video file path is required")
+        source_path = Path(request.path).expanduser()
+        _validate_local_video_source_path(source_path)
+        resolved_source = source_path.resolve()
+        duration = _probe_local_video_duration(runner, resolved_source)
+        return item.model_copy(
+            update={
+                "source_url": f"external-video://{item.id}",
+                "video_source_type": "external",
+                "local_video_path": resolved_source,
+                "duration": duration if duration is not None else item.duration,
+            }
+        )
+    if request.source_type == "remote":
+        if not request.url or not request.url.strip():
+            raise ValueError("Online video URL is required")
+        source_url = request.url.strip()
+        if _is_file_video_url(source_url):
+            raise ValueError("Use the Finder picker to bind local or NAS video files")
+        return item.model_copy(
+            update={
+                "source_url": source_url,
+                "video_source_type": "remote",
+                "local_video_path": None,
+            }
+        )
+    raise ValueError("Unsupported video source type")
+
+
+def _has_workspace_video_file(workspace_dir: Path, item: CourseItem) -> bool:
+    return _local_video_path_for_workspace_item(workspace_dir, item) is not None
+
+
+def _import_workspace_video_source_for_item(
+    item: CourseItem,
+    workspace_dir: Path,
+    runner: YtDlpRunner,
+    source_path: Path,
+) -> CourseItem:
+    if _has_workspace_video_file(workspace_dir, item):
+        raise ValueError("Workspace video sources cannot be changed directly")
+    source_path = source_path.expanduser()
+    _validate_local_video_source_path(source_path)
+    extension = source_path.suffix.lower()
+    downloads_dir = workspace_dir / "downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    video_path = downloads_dir / f"{item.id}{extension}"
+    try:
+        shutil.copy2(source_path, video_path)
+    except Exception as exc:
+        _delete_download_path(workspace_dir, video_path)
+        raise ValueError(f"Unable to import local video: {exc}") from exc
+    duration = _probe_local_video_duration(runner, video_path)
+    return item.model_copy(
+        update={
+            "source_url": f"local-video://{item.id}",
+            "video_source_type": "workspace",
+            "local_video_path": _workspace_relative_path(workspace_dir, video_path),
+            "duration": duration if duration is not None else item.duration,
+        }
+    )
+
+
+def _course_item_from_video_path(
+    library: CourseLibrary,
+    workspace_dir: Path,
+    runner: YtDlpRunner,
+    source_path: Path,
+    mode: str,
+) -> CourseItem:
+    filename = source_path.name
+    extension = source_path.suffix.lower()
+    item_id = _unique_import_item_id(library, source_path.stem)
+    course_index = _next_course_index(library.list_items(), "", item_id)
+    if mode == "workspace":
+        downloads_dir = workspace_dir / "downloads"
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        video_path = downloads_dir / f"{item_id}{extension}"
+        try:
+            shutil.copy2(source_path, video_path)
+        except Exception as exc:
+            _delete_download_path(workspace_dir, video_path)
+            raise ValueError(f"Unable to import local video: {exc}") from exc
+        source_url = f"local-video://{item_id}"
+        local_video_path = _workspace_relative_path(workspace_dir, video_path)
+        video_source_type = "workspace"
+        duration_path = video_path
+    elif mode == "external":
+        resolved_source = source_path.resolve()
+        source_url = f"external-video://{item_id}"
+        local_video_path = resolved_source
+        video_source_type = "external"
+        duration_path = resolved_source
+    else:
+        raise ValueError("Unsupported local video import mode")
+    return CourseItem(
+        id=item_id,
+        source_url=source_url,
+        title=_local_video_title(filename),
+        custom_title=True,
+        collection_group_title="",
+        collection_title="",
+        course_index=course_index,
+        sort_order=course_index,
+        duration=_probe_local_video_duration(runner, duration_path),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        transcript=[],
+        transcript_source=None,
+        metadata=None,
+        study=None,
+        video_source_type=video_source_type,
+        local_video_path=local_video_path,
+    )
 
 
 def _normalized_local_video_reference(workspace_dir: Path, item: CourseItem) -> Path | None:
@@ -1350,6 +1654,23 @@ def _local_video_path_for_workspace_item(workspace_dir: Path, item: CourseItem) 
     return None
 
 
+def _file_video_path_for_workspace_item(workspace_dir: Path, item: CourseItem) -> Path | None:
+    if _is_external_video_item(item):
+        return _external_video_path_for_item(item)
+    return _local_video_path_for_workspace_item(workspace_dir, item)
+
+
+def _external_video_path_for_item(item: CourseItem) -> Path | None:
+    if not item.local_video_path:
+        return None
+    video_path = Path(item.local_video_path).expanduser()
+    if not video_path.exists() or not video_path.is_file():
+        return None
+    if video_path.suffix.lower() not in LOCAL_VIDEO_EXTENSIONS:
+        return None
+    return video_path.resolve()
+
+
 def _resolve_workspace_path(workspace_dir: Path, path: Path) -> Path:
     path = path.expanduser()
     if path.is_absolute():
@@ -1372,12 +1693,28 @@ def _is_local_video_url(value: str) -> bool:
     return value.startswith("local-video://")
 
 
+def _is_external_video_url(value: str) -> bool:
+    return value.startswith("external-video://")
+
+
+def _is_file_video_url(value: str) -> bool:
+    return _is_local_video_url(value) or _is_external_video_url(value)
+
+
 def _is_local_video_item(item: CourseItem) -> bool:
     return _is_local_video_url(item.source_url)
 
 
+def _is_external_video_item(item: CourseItem) -> bool:
+    return item.video_source_type == "external" or _is_external_video_url(item.source_url)
+
+
 def _local_video_item_id_from_url(value: str) -> str:
     return unquote(value.removeprefix("local-video://")).strip("/")
+
+
+def _external_video_item_id_from_url(value: str) -> str:
+    return unquote(value.removeprefix("external-video://")).strip("/")
 
 
 def _probe_local_video_duration(runner: YtDlpRunner, video_path: Path) -> float | None:
@@ -1478,6 +1815,7 @@ def _asr_context_for_item(item: CourseItem, user_context: str | None = None) -> 
     metadata = item.metadata
     context: dict[str, object] = {
         "title": item.title,
+        "collection_group_title": item.collection_group_title,
         "collection_title": item.collection_title,
         "source_url": item.source_url,
         "duration": item.duration,
@@ -1664,10 +2002,23 @@ def _extract_online_asr_transcript_from_file(
     )
 
 
-def _normalize_item_for_response(item: CourseItem) -> CourseItem:
-    return _with_course_defaults(
-        _with_complete_translation_for_response(_with_display_title_fallback(_with_duration_fallback(item)))
-    )
+def _normalize_item_for_response(item: CourseItem, workspace_dir: Path | None = None) -> CourseItem:
+    item = _with_available_video_source_for_response(item, workspace_dir)
+    item = _with_duration_fallback(item)
+    item = _with_display_title_fallback(item)
+    item = _with_complete_translation_for_response(item)
+    return _with_course_defaults(item)
+
+
+def _with_available_video_source_for_response(item: CourseItem, workspace_dir: Path | None) -> CourseItem:
+    if workspace_dir is None or not item.local_video_path or _is_external_video_item(item):
+        return item
+    if (item.video_source_type == "workspace" or _is_local_video_item(item)) and not _local_video_path_for_workspace_item(
+        workspace_dir,
+        item,
+    ):
+        return item.model_copy(update={"local_video_path": None})
+    return item
 
 
 def _with_duration_fallback(item: CourseItem) -> CourseItem:
@@ -1862,8 +2213,9 @@ def _study_with_translation(
 
 
 def _delete_course_artifacts(data_dir: Path, workspace_dir: Path, item: CourseItem) -> None:
-    _delete_local_video(workspace_dir, item)
-    _delete_download_files_for_item(workspace_dir, item.id)
+    if not _is_external_video_item(item):
+        _delete_local_video(workspace_dir, item)
+        _delete_download_files_for_item(workspace_dir, item.id)
     subtitle_dir = (data_dir / "subtitles" / item.id).resolve()
     subtitles_root = (data_dir / "subtitles").resolve()
     if subtitle_dir.exists() and subtitles_root in subtitle_dir.parents:
