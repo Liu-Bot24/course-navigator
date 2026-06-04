@@ -16,6 +16,8 @@ rsync -a "$ROOT_DIR/" "$RESOURCE_DIR/" \
   --exclude '.git/' \
   --exclude '.gitignore' \
   --exclude '.DS_Store' \
+  --exclude 'DEVELOPMENT_LOG.md' \
+  --exclude '.internal-docs/' \
   --exclude '.venv/' \
   --exclude 'node_modules/' \
   --exclude 'dist/' \
@@ -30,6 +32,7 @@ rsync -a "$ROOT_DIR/" "$RESOURCE_DIR/" \
   --exclude 'course-navigator-workspace/' \
   --exclude 'data/' \
   --exclude 'downloads/' \
+  --exclude 'output/' \
   --exclude 'backend/**/__pycache__/' \
   --exclude '.pytest_cache/' \
   --exclude '.ruff_cache/' \

@@ -1,5 +1,9 @@
 /// <reference types="vite/client" />
 
+import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import rawConfig from "../src-tauri/tauri.conf.json";
@@ -25,6 +29,7 @@ type TauriConfig = {
 };
 
 const config = rawConfig as TauriConfig;
+const testDir = dirname(fileURLToPath(import.meta.url));
 
 describe("Tauri app shell", () => {
   it("uses the native menu bar tray instead of a custom tray WebView window", () => {
@@ -41,6 +46,14 @@ describe("Tauri app shell", () => {
     expect(config.bundle.resources).toEqual({
       "resources/runtime-source": "runtime-source",
     });
+  });
+
+  it("keeps local collaboration notes out of packaged runtime source", async () => {
+    const prepareScript = await readFile(resolve(testDir, "../../scripts/prepare-mac-runtime-source.sh"), "utf-8");
+
+    expect(prepareScript).toContain("--exclude 'DEVELOPMENT_LOG.md'");
+    expect(prepareScript).toContain("--exclude '.internal-docs/'");
+    expect(prepareScript).toContain("--exclude 'output/'");
   });
 
   it("uses a compact default main window that can fit the full launcher", () => {
