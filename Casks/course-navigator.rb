@@ -2,8 +2,7 @@ cask "course-navigator" do
   version "0.1.4"
   sha256 "0d47d57eae7513901d748c5b478d6c730b1f79608d3c3531feab8170c449d671"
 
-  url "https://github.com/Liu-Bot24/course-navigator/releases/download/v#{version}/Course.Navigator-#{version}-macos-arm64.dmg",
-      verified: "github.com/Liu-Bot24/course-navigator/"
+  url "https://github.com/Liu-Bot24/course-navigator/releases/download/v#{version}/Course.Navigator-#{version}-macos-arm64.dmg"
   name "Course Navigator"
   desc "Video course workspace for subtitles, translation, study maps, and ASR"
   homepage "https://github.com/Liu-Bot24/course-navigator"
