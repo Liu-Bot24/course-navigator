@@ -15,6 +15,10 @@ const MANAGED_ENV_KEYS: &[&str] = &[
 ];
 const RUNTIME_RESOURCE_DIR: &str = "runtime-source";
 const RUNTIME_MANIFEST_FILE: &str = ".course-navigator-runtime.json";
+pub const DEFAULT_API_PORT: u16 = 18000;
+pub const DEFAULT_WEB_PORT: u16 = 15173;
+const LEGACY_DEFAULT_API_PORT: u16 = 8000;
+const LEGACY_DEFAULT_WEB_PORT: u16 = 5173;
 const PRESERVED_RUNTIME_ENTRIES: &[&str] = &[
     ".env",
     ".venv",
@@ -66,14 +70,14 @@ pub fn prepare_bundled_runtime(app: &AppHandle) -> Result<(), String> {
 
 fn should_use_bundled_runtime(config: &LauncherConfig, target_root: &Path) -> bool {
     let project_root = Path::new(&config.project_root);
-    !project_root.exists() || project_root == target_root
+    !project_root.exists() || project_root == target_root || project_root == default_project_root()
 }
 
 pub fn load_config() -> LauncherConfig {
     let path = launcher_config_path();
     if let Ok(raw) = fs::read_to_string(path) {
         if let Ok(config) = serde_json::from_str::<LauncherConfig>(&raw) {
-            return reconcile_project_root(config);
+            return reconcile_config(config);
         }
     }
     default_config()
@@ -100,9 +104,9 @@ pub fn default_config() -> LauncherConfig {
             .to_string(),
         project_root: project_root.display().to_string(),
         api_host: "127.0.0.1".to_string(),
-        api_port: 8000,
+        api_port: DEFAULT_API_PORT,
         web_host: "127.0.0.1".to_string(),
-        web_port: 5173,
+        web_port: DEFAULT_WEB_PORT,
         open_browser_on_start: true,
     }
 }
@@ -181,7 +185,8 @@ fn default_project_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn reconcile_project_root(mut config: LauncherConfig) -> LauncherConfig {
+fn reconcile_config(mut config: LauncherConfig) -> LauncherConfig {
+    config = migrate_legacy_default_ports(config);
     if !Path::new(&config.project_root).exists() {
         let project_root = default_project_root();
         if project_root.exists() {
@@ -191,16 +196,60 @@ fn reconcile_project_root(mut config: LauncherConfig) -> LauncherConfig {
     config
 }
 
+fn migrate_legacy_default_ports(mut config: LauncherConfig) -> LauncherConfig {
+    if config.api_host == "127.0.0.1"
+        && config.web_host == "127.0.0.1"
+        && config.api_port == LEGACY_DEFAULT_API_PORT
+        && config.web_port == LEGACY_DEFAULT_WEB_PORT
+    {
+        config.api_port = DEFAULT_API_PORT;
+        config.web_port = DEFAULT_WEB_PORT;
+    }
+    config
+}
+
 fn launcher_config_path() -> PathBuf {
     application_support_dir().join("launcher-config.json")
 }
 
-fn application_support_dir() -> PathBuf {
+pub(crate) fn application_support_dir() -> PathBuf {
+    platform_application_support_dir()
+}
+
+#[cfg(target_os = "windows")]
+fn platform_application_support_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|profile| profile.join("AppData").join("Roaming"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Course Navigator")
+}
+
+#[cfg(target_os = "macos")]
+fn platform_application_support_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Library")
         .join("Application Support")
+        .join("Course Navigator")
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn platform_application_support_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("Course Navigator")
 }
 
@@ -341,9 +390,9 @@ mod tests {
         let config = LauncherConfig {
             project_root: "/app".into(),
             api_host: "127.0.0.1".into(),
-            api_port: 8000,
+            api_port: 18000,
             web_host: "127.0.0.1".into(),
-            web_port: 5173,
+            web_port: 15173,
             workspace_dir: "/Volumes/Learning SSD/Course Workspace".into(),
             open_browser_on_start: true,
         };
@@ -356,9 +405,19 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_project_root_repairs_missing_saved_project_path() {
+    fn default_config_uses_non_common_launcher_ports() {
+        let config = default_config();
+
+        assert_eq!(config.api_port, DEFAULT_API_PORT);
+        assert_eq!(config.web_port, DEFAULT_WEB_PORT);
+        assert_ne!(config.api_port, LEGACY_DEFAULT_API_PORT);
+        assert_ne!(config.web_port, LEGACY_DEFAULT_WEB_PORT);
+    }
+
+    #[test]
+    fn reconcile_config_migrates_legacy_default_ports() {
         let config = LauncherConfig {
-            project_root: "/definitely/missing/course-navigator".into(),
+            project_root: "/app".into(),
             api_host: "127.0.0.1".into(),
             api_port: 8000,
             web_host: "127.0.0.1".into(),
@@ -367,9 +426,47 @@ mod tests {
             open_browser_on_start: true,
         };
 
-        let repaired = reconcile_project_root(config);
+        let reconciled = reconcile_config(config);
+
+        assert_eq!(reconciled.api_port, DEFAULT_API_PORT);
+        assert_eq!(reconciled.web_port, DEFAULT_WEB_PORT);
+    }
+
+    #[test]
+    fn reconcile_config_keeps_custom_ports() {
+        let config = LauncherConfig {
+            project_root: "/app".into(),
+            api_host: "127.0.0.1".into(),
+            api_port: 8100,
+            web_host: "127.0.0.1".into(),
+            web_port: 5188,
+            workspace_dir: "/tmp/workspace".into(),
+            open_browser_on_start: true,
+        };
+
+        let reconciled = reconcile_config(config);
+
+        assert_eq!(reconciled.api_port, 8100);
+        assert_eq!(reconciled.web_port, 5188);
+    }
+
+    #[test]
+    fn reconcile_config_repairs_missing_saved_project_path() {
+        let config = LauncherConfig {
+            project_root: "/definitely/missing/course-navigator".into(),
+            api_host: "127.0.0.1".into(),
+            api_port: 8100,
+            web_host: "127.0.0.1".into(),
+            web_port: 5188,
+            workspace_dir: "/tmp/workspace".into(),
+            open_browser_on_start: true,
+        };
+
+        let repaired = reconcile_config(config);
 
         assert!(Path::new(&repaired.project_root).exists());
+        assert_eq!(repaired.api_port, 8100);
+        assert_eq!(repaired.web_port, 5188);
     }
 
     #[test]
@@ -400,7 +497,18 @@ mod tests {
     }
 
     #[test]
-    fn bundled_runtime_keeps_an_existing_project_root() {
+    #[cfg(windows)]
+    fn windows_application_support_dir_uses_windows_profile_location() {
+        let support_dir = application_support_dir();
+        let support = support_dir.to_string_lossy();
+
+        assert!(support.ends_with(r"Course Navigator"));
+        assert!(!support.contains("Library"));
+        assert!(!support.contains("Application Support"));
+    }
+
+    #[test]
+    fn bundled_runtime_keeps_an_existing_custom_project_root() {
         let root = std::env::temp_dir().join(format!(
             "course-navigator-project-root-{}",
             std::time::SystemTime::now()
@@ -415,9 +523,9 @@ mod tests {
         let config = LauncherConfig {
             project_root: project_root.display().to_string(),
             api_host: "127.0.0.1".into(),
-            api_port: 8000,
+            api_port: 18000,
             web_host: "127.0.0.1".into(),
-            web_port: 5173,
+            web_port: 15173,
             workspace_dir: "/tmp/workspace".into(),
             open_browser_on_start: true,
         };
@@ -425,6 +533,23 @@ mod tests {
         assert!(!should_use_bundled_runtime(&config, &target_root));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bundled_runtime_replaces_build_time_default_project_root_even_when_it_exists() {
+        let target_root = std::env::temp_dir().join("course-navigator-runtime/project");
+        let config = LauncherConfig {
+            project_root: default_project_root().display().to_string(),
+            api_host: "127.0.0.1".into(),
+            api_port: 18000,
+            web_host: "127.0.0.1".into(),
+            web_port: 15173,
+            workspace_dir: "/tmp/workspace".into(),
+            open_browser_on_start: true,
+        };
+
+        assert!(Path::new(&config.project_root).exists());
+        assert!(should_use_bundled_runtime(&config, &target_root));
     }
 
     #[test]
@@ -441,9 +566,9 @@ mod tests {
         let base = LauncherConfig {
             project_root: root.join("missing").display().to_string(),
             api_host: "127.0.0.1".into(),
-            api_port: 8000,
+            api_port: 18000,
             web_host: "127.0.0.1".into(),
-            web_port: 5173,
+            web_port: 15173,
             workspace_dir: "/tmp/workspace".into(),
             open_browser_on_start: true,
         };

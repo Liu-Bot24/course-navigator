@@ -60,7 +60,7 @@ The start command installs dependencies, creates local settings when needed, and
 Open:
 
 ```text
-http://127.0.0.1:5173
+http://127.0.0.1:15173
 ```
 
 Press `Ctrl+C` in the terminal to stop both services.

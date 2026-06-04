@@ -35,9 +35,9 @@ const apiMocks = vi.hoisted(() => ({
   setWorkspaceDirectory: vi.fn(async (_target: string) => ({
     projectRoot: "/tmp/course-navigator",
     apiHost: "127.0.0.1",
-    apiPort: 8000,
+    apiPort: 18000,
     webHost: "127.0.0.1",
-    webPort: 5173,
+    webPort: 15173,
     workspaceDir: "/Volumes/Learning/Course Workspace",
     openBrowserOnStart: true,
   })),
@@ -51,23 +51,28 @@ vi.mock("./api", () => ({
   getConfig: async () => ({
     projectRoot: "/tmp/course-navigator",
     apiHost: "127.0.0.1",
-    apiPort: 8000,
+    apiPort: 18000,
     webHost: "127.0.0.1",
-    webPort: 5173,
+    webPort: 15173,
     workspaceDir: "/tmp/course-navigator/course-navigator-workspace",
     openBrowserOnStart: true,
   }),
   getStatus: async () => ({
     state: "stopped",
-    apiUrl: "http://127.0.0.1:8000",
-    webUrl: "http://127.0.0.1:5173",
+    apiUrl: "http://127.0.0.1:18000",
+    webUrl: "http://127.0.0.1:15173",
     message: "尚未启动",
   }),
   checkDependencies: async () => [
     {
       name: "uv",
       available: true,
-      purpose: "安装和启动 Python 后端",
+      purpose: "提供本地课程服务",
+    },
+    {
+      name: "yt-dlp",
+      available: true,
+      purpose: "提取在线视频信息和字幕",
     },
   ],
   getModelConfig: async () => ({
@@ -112,14 +117,14 @@ vi.mock("./api", () => ({
   saveModelConfig: apiMocks.saveModelConfig,
   startServices: async () => ({
     state: "starting",
-    apiUrl: "http://127.0.0.1:8000",
-    webUrl: "http://127.0.0.1:5173",
+    apiUrl: "http://127.0.0.1:18000",
+    webUrl: "http://127.0.0.1:15173",
     message: "启动命令已准备，进程管理将在下一步启用",
   }),
   stopServices: async () => ({
     state: "stopped",
-    apiUrl: "http://127.0.0.1:8000",
-    webUrl: "http://127.0.0.1:5173",
+    apiUrl: "http://127.0.0.1:18000",
+    webUrl: "http://127.0.0.1:15173",
     message: "服务已停止",
   }),
   saveConfig: apiMocks.saveConfig,
@@ -151,12 +156,15 @@ describe("App", () => {
     expect(screen.getByRole("region", { name: "路径配置" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "端口配置" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "模型配置" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "运行环境" })).toBeTruthy();
     expect(await screen.findByLabelText("字幕模型")).toBeTruthy();
     expect(screen.getByLabelText("在线 ASR 模型")).toBeTruthy();
     expect(screen.getByText("uv")).toBeTruthy();
+    expect(screen.getByText("yt-dlp")).toBeTruthy();
+    expect(screen.getByText("这些组件用于打开课程、处理视频和提取字幕。")).toBeTruthy();
     expect(screen.queryByText("Workspace 迁移")).toBeNull();
     expect(screen.queryByText("缓存视频仍属于 Workspace；迁移前会先做路径检查，旧 Workspace 默认保留。")).toBeNull();
-    expect(screen.queryByLabelText("状态消息")).toBeNull();
+    expect(screen.getByLabelText("状态消息").textContent).toBe("尚未启动");
   });
 
   it("saves model role selections from the launcher panel", async () => {
@@ -286,8 +294,9 @@ describe("App", () => {
     render(<App />);
 
     const portPanel = await screen.findByRole("region", { name: "端口配置" });
-    expect(within(portPanel).getByRole("button", { name: "修改端口" })).toBeTruthy();
-    fireEvent.click(within(portPanel).getByRole("button", { name: "修改端口" }));
+    const editButton = within(portPanel).getByRole("button", { name: "修改端口" }) as HTMLButtonElement;
+    await waitFor(() => expect(editButton.disabled).toBe(false));
+    fireEvent.click(editButton);
     fireEvent.change(screen.getByLabelText("网页端口"), { target: { value: "5188" } });
     fireEvent.change(screen.getByLabelText("API 端口"), { target: { value: "8100" } });
     fireEvent.click(screen.getByRole("button", { name: "保存端口" }));

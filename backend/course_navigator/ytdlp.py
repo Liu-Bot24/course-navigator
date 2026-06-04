@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -55,28 +57,35 @@ def build_auth_args(request: ExtractRequest | DownloadRequest) -> list[str]:
 
 
 class YtDlpRunner:
-    def __init__(self, binary: str = "yt-dlp") -> None:
+    def __init__(self, binary: str | None = None) -> None:
         self.binary = binary
 
+    def command_prefix(self) -> list[str]:
+        if self.binary:
+            return [self.binary]
+        return [sys.executable, "-m", "yt_dlp"]
+
     def fetch_metadata(self, request: ExtractRequest) -> VideoMetadata:
-        cmd = [
-            self.binary,
-            "--skip-download",
-            "--dump-json",
-            "--no-warnings",
-            *build_runtime_args(),
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            "all",
-            "--sub-format",
-            "vtt/srt/best",
-            *build_auth_args(request),
-            str(request.url),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        def metadata_command(active_request: ExtractRequest | DownloadRequest) -> list[str]:
+            return [
+                *self.command_prefix(),
+                "--skip-download",
+                "--dump-json",
+                "--no-warnings",
+                *build_runtime_args(),
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs",
+                "all",
+                "--sub-format",
+                "vtt/srt/best",
+                *build_auth_args(active_request),
+                str(active_request.url),
+            ]
+
+        result, active_request = _run_with_browser_cookie_retry(metadata_command, request)
         if result.returncode != 0:
-            raise YtDlpError(_friendly_error(result.stderr.strip(), request, "yt-dlp metadata extraction failed"))
+            raise YtDlpError(_friendly_error(result.stderr.strip(), active_request, "yt-dlp metadata extraction failed"))
 
         try:
             payload = json.loads(result.stdout)
@@ -112,26 +121,28 @@ class YtDlpRunner:
         _clear_subtitle_files(target_dir)
         output_template = str(target_dir / "%(id)s.%(ext)s")
         subtitle_language = choose_source_subtitle_language(metadata, request.language)
-        cmd = [
-            self.binary,
-            "--skip-download",
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            subtitle_language,
-            "--sub-format",
-            "vtt/srt/best",
-            "--convert-subs",
-            "vtt",
-            "--output",
-            output_template,
-            *build_runtime_args(),
-            *build_auth_args(request),
-            str(request.url),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        def subtitle_command(active_request: ExtractRequest | DownloadRequest) -> list[str]:
+            return [
+                *self.command_prefix(),
+                "--skip-download",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs",
+                subtitle_language,
+                "--sub-format",
+                "vtt/srt/best",
+                "--convert-subs",
+                "vtt",
+                "--output",
+                output_template,
+                *build_runtime_args(),
+                *build_auth_args(active_request),
+                str(active_request.url),
+            ]
+
+        result, active_request = _run_with_browser_cookie_retry(subtitle_command, request)
         if result.returncode != 0:
-            raise YtDlpError(_friendly_error(result.stderr.strip(), request, "yt-dlp subtitle extraction failed"))
+            raise YtDlpError(_friendly_error(result.stderr.strip(), active_request, "yt-dlp subtitle extraction failed"))
 
         subtitle_file = _find_newest_subtitle(target_dir)
         if not subtitle_file:
@@ -156,7 +167,7 @@ class YtDlpRunner:
         target_dir.mkdir(parents=True, exist_ok=True)
         output_template = str(target_dir / f"{item_id}.%(ext)s")
         cmd = [
-            self.binary,
+            *self.command_prefix(),
             "--newline",
             "--format",
             "bv*+ba/b",
@@ -205,20 +216,22 @@ class YtDlpRunner:
         if progress:
             progress(3, "正在准备本地 ASR 音频")
         audio_template = str(target_dir / f"{item_id}.%(ext)s")
-        audio_cmd = [
-            self.binary,
-            "--extract-audio",
-            "--audio-format",
-            "wav",
-            "--output",
-            audio_template,
-            *build_runtime_args(),
-            *build_auth_args(request),
-            str(request.url),
-        ]
-        audio_result = subprocess.run(audio_cmd, capture_output=True, text=True, check=False)
+        def audio_command(active_request: ExtractRequest | DownloadRequest) -> list[str]:
+            return [
+                *self.command_prefix(),
+                "--extract-audio",
+                "--audio-format",
+                "wav",
+                "--output",
+                audio_template,
+                *build_runtime_args(),
+                *build_auth_args(active_request),
+                str(active_request.url),
+            ]
+
+        audio_result, active_request = _run_with_browser_cookie_retry(audio_command, request)
         if audio_result.returncode != 0:
-            raise YtDlpError(_friendly_error(audio_result.stderr.strip(), request, "yt-dlp audio extraction failed"))
+            raise YtDlpError(_friendly_error(audio_result.stderr.strip(), active_request, "yt-dlp audio extraction failed"))
         if progress:
             progress(32, "音频已抽取，正在启动本地 ASR")
 
@@ -246,6 +259,105 @@ class YtDlpRunner:
     def probe_local_video_duration(self, path: Path) -> float | None:
         duration = _media_duration(path)
         return duration if duration > 0 else None
+
+
+def _run_with_browser_cookie_retry(
+    command_builder: Callable[[ExtractRequest | DownloadRequest], list[str]],
+    request: ExtractRequest | DownloadRequest,
+) -> tuple[subprocess.CompletedProcess[str], ExtractRequest | DownloadRequest]:
+    result = subprocess.run(command_builder(request), capture_output=True, text=True, check=False)
+    if request.mode != "browser" or result.returncode == 0:
+        return result, request
+
+    if _looks_like_login_required(result.stderr):
+        for profile_request in _browser_cookie_profile_retry_requests(request):
+            profile_result = subprocess.run(
+                command_builder(profile_request),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if profile_result.returncode == 0:
+                return profile_result, profile_request
+
+    if not _looks_like_cookie_database_copy_error(result.stderr):
+        return result, request
+
+    retry_request = request.model_copy(update={"mode": "normal"})
+    retry_result = subprocess.run(command_builder(retry_request), capture_output=True, text=True, check=False)
+    if retry_result.returncode == 0:
+        return retry_result, retry_request
+    return result, request
+
+
+def _looks_like_cookie_database_copy_error(message: str) -> bool:
+    normalized = message.lower()
+    return "could not copy" in normalized and "cookie database" in normalized
+
+
+def _looks_like_login_required(message: str) -> bool:
+    return "sign in to confirm" in message.lower()
+
+
+def _browser_cookie_profile_retry_requests(
+    request: ExtractRequest | DownloadRequest,
+) -> list[ExtractRequest | DownloadRequest]:
+    browser = (request.browser or "chrome").strip() or "chrome"
+    if ":" in browser:
+        return []
+    return [
+        request.model_copy(update={"browser": profile_source})
+        for profile_source in _browser_cookie_profile_sources(browser)
+        if profile_source != browser
+    ]
+
+
+def _browser_cookie_profile_sources(browser: str) -> list[str]:
+    browser_name = browser.strip().lower()
+    profile_root = _browser_cookie_profile_root(browser_name)
+    discovered: list[str] = []
+    if profile_root and profile_root.exists():
+        discovered = [
+            child.name
+            for child in profile_root.iterdir()
+            if child.is_dir() and (child.name == "Default" or child.name.startswith("Profile "))
+        ]
+    if not discovered and browser_name in {"chrome", "edge"}:
+        discovered = ["Default", "Profile 1", "Profile 2", "Profile 3"]
+    return [f"{browser}:{profile}" for profile in sorted(discovered, key=_profile_sort_key)]
+
+
+def _browser_cookie_profile_root(browser_name: str) -> Path | None:
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            return None
+        roots = {
+            "chrome": Path(local_app_data) / "Google" / "Chrome" / "User Data",
+            "edge": Path(local_app_data) / "Microsoft" / "Edge" / "User Data",
+        }
+        return roots.get(browser_name)
+    if sys.platform == "darwin":
+        roots = {
+            "chrome": Path.home() / "Library" / "Application Support" / "Google" / "Chrome",
+            "edge": Path.home() / "Library" / "Application Support" / "Microsoft Edge",
+        }
+        return roots.get(browser_name)
+    roots = {
+        "chrome": Path.home() / ".config" / "google-chrome",
+        "edge": Path.home() / ".config" / "microsoft-edge",
+        "chromium": Path.home() / ".config" / "chromium",
+    }
+    return roots.get(browser_name)
+
+
+def _profile_sort_key(profile: str) -> tuple[int, int, str]:
+    if profile == "Default":
+        return (0, 0, profile)
+    match = re.fullmatch(r"Profile\s+(\d+)", profile)
+    if match:
+        return (1, int(match.group(1)), profile)
+    return (2, 0, profile)
 
 
 def choose_source_subtitle_language(metadata: VideoMetadata | None, requested: str = "auto") -> str:
@@ -615,7 +727,10 @@ def _media_duration(path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return 0.0
     if result.returncode != 0:
         return 0.0
     try:
@@ -652,13 +767,20 @@ def _friendly_error(
     fallback: str,
 ) -> str:
     message = stderr or fallback
+    if _looks_like_cookie_database_copy_error(message):
+        browser = (request.browser or "chrome").strip() or "chrome"
+        return (
+            f"无法读取浏览器 Cookie 来源 {browser}：Chrome/Edge 的 Cookie 数据库当前无法复制。"
+            "请先关闭对应浏览器后重试，或改用 Cookies 文件模式。"
+            f"原始错误：{message}"
+        )
     if _looks_like_missing_ffmpeg(message):
         return (
             "缺少 ffmpeg，当前操作需要合并或转换媒体文件。"
             "请安装 ffmpeg 后重试；字幕提取、字幕浏览和 AI 校正仍可继续使用。"
             f"原始错误：{message}"
         )
-    if "Sign in to confirm" not in message:
+    if not _looks_like_login_required(message):
         return message
     if request.mode == "browser":
         browser = (request.browser or "chrome").strip() or "chrome"

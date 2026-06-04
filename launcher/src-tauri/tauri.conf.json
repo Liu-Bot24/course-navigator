@@ -30,9 +30,17 @@
     "active": true,
     "targets": "app",
     "category": "Education",
-    "icon": ["icons/icon.icns", "icons/icon.png"],
+    "icon": ["icons/icon.icns", "icons/icon.png", "icons/icon.ico"],
     "resources": {
-      "resources/runtime-source": "runtime-source"
+      "resources/runtime-source": "runtime-source",
+      "resources/runtime-tools": "runtime-tools"
+    },
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "installerHooks": "windows/installer-hooks.nsh"
+      }
     }
   }
 }

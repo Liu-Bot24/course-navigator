@@ -27,4 +27,7 @@ launcher/src-tauri/resources/runtime-source/**
 !launcher/src-tauri/resources/runtime-source/
 launcher/src-tauri/resources/runtime-source/.env.example
 !launcher/src-tauri/resources/runtime-source/.gitkeep
+launcher/src-tauri/resources/runtime-tools/**
+!launcher/src-tauri/resources/runtime-tools/
+!launcher/src-tauri/resources/runtime-tools/.gitkeep
 launcher/src-tauri/target/

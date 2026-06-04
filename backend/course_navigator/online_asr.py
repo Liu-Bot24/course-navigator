@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,7 @@ def extract_online_asr_transcript(
     source_audio = (
         _extract_audio_from_file(source_video_path, target_dir, item_id)
         if source_video_path
-        else _extract_audio(request, target_dir, item_id, yt_dlp_binary or "yt-dlp")
+        else _extract_audio(request, target_dir, item_id, yt_dlp_binary)
     )
     _report(progress, 28, "音频已抽取，正在压缩为在线 ASR 音频")
     compressed_audio = _compress_audio(source_audio, target_dir / f"{item_id}.online-asr.mp3")
@@ -59,10 +60,16 @@ def extract_online_asr_transcript(
     return _merge_segments(segments)
 
 
-def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_dlp_binary: str) -> Path:
+def _yt_dlp_command_prefix(yt_dlp_binary: str | None) -> list[str]:
+    if yt_dlp_binary:
+        return [yt_dlp_binary]
+    return [sys.executable, "-m", "yt_dlp"]
+
+
+def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_dlp_binary: str | None) -> Path:
     output_template = str(target_dir / f"{item_id}.online-source.%(ext)s")
     cmd = [
-        yt_dlp_binary,
+        *_yt_dlp_command_prefix(yt_dlp_binary),
         "--extract-audio",
         "--audio-format",
         "wav",

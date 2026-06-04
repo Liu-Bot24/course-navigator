@@ -8,9 +8,10 @@
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "tauri": "tauri",
-    "prepare:runtime": "bash ../scripts/prepare-mac-runtime-source.sh",
+    "prepare:runtime": "node ../scripts/prepare-runtime-source.mjs",
     "tauri:dev": "tauri dev",
     "tauri:build": "npm run prepare:runtime && tauri build",
+    "tauri:build:windows": "npm run prepare:runtime && tauri build --bundles nsis",
     "dmg": "bash ../scripts/build-mac-dmg.sh"
   },
   "dependencies": {

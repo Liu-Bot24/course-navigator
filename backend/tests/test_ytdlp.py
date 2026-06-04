@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -53,7 +54,7 @@ def test_build_auth_args_for_cookie_file_mode():
         cookies_path="/tmp/cookies.txt",
     )
 
-    assert build_auth_args(request) == ["--cookies", "/tmp/cookies.txt"]
+    assert build_auth_args(request) == ["--cookies", str(Path("/tmp/cookies.txt").expanduser())]
 
 
 def test_build_auth_args_expands_cookie_file_home():
@@ -63,7 +64,7 @@ def test_build_auth_args_expands_cookie_file_home():
         cookies_path="~/cookies.txt",
     )
 
-    assert build_auth_args(request)[1].endswith("/cookies.txt")
+    assert Path(build_auth_args(request)[1]).name == "cookies.txt"
     assert "~" not in build_auth_args(request)[1]
 
 
@@ -72,6 +73,34 @@ def test_cookie_file_mode_requires_path():
 
     with pytest.raises(ValueError, match="cookies_path"):
         build_auth_args(request)
+
+
+def test_default_ytdlp_runner_uses_current_python_module(monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Lesson",
+                "webpage_url": "https://example.com/watch",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    YtDlpRunner().fetch_metadata(ExtractRequest(url="https://www.youtube.com/watch?v=abc"))
+
+    assert calls[0][:3] == [sys.executable, "-m", "yt_dlp"]
 
 
 def test_fetch_metadata_parses_ytdlp_json(monkeypatch):
@@ -327,6 +356,132 @@ def test_fetch_metadata_raises_useful_error(monkeypatch):
         runner.fetch_metadata(request)
 
 
+def test_fetch_metadata_retries_without_browser_cookies_when_cookie_database_is_locked(monkeypatch):
+    calls = []
+
+    class FailedCookieResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271"
+
+    class MetadataResult:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Public Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {"en": [{"ext": "vtt"}]},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        return FailedCookieResult() if len(calls) == 1 else MetadataResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    metadata = runner.fetch_metadata(request)
+
+    assert metadata.id == "abc123"
+    assert "--cookies-from-browser" in calls[0]
+    assert "--cookies-from-browser" not in calls[1]
+
+
+def test_fetch_metadata_preserves_cookie_copy_error_when_normal_retry_still_requires_login(monkeypatch):
+    calls = []
+
+    class FailedCookieResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271"
+
+    class FailedLoginResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        return FailedCookieResult() if len(calls) == 1 else FailedLoginResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    with pytest.raises(YtDlpError, match="无法读取浏览器 Cookie 来源 chrome"):
+        runner.fetch_metadata(request)
+
+    assert "--cookies-from-browser" in calls[0]
+    assert "--cookies-from-browser" not in calls[1]
+
+
+def test_fetch_metadata_retries_plain_browser_with_detected_profile_when_login_required(monkeypatch):
+    calls = []
+
+    class FailedLoginResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
+
+    class MetadataResult:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Profile Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {"en": [{"ext": "vtt"}]},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        return FailedLoginResult() if len(calls) == 1 else MetadataResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ytdlp_module, "_browser_cookie_profile_sources", lambda browser: [f"{browser}:Default"])
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    metadata = runner.fetch_metadata(request)
+
+    assert metadata.id == "abc123"
+    assert calls[0][calls[0].index("--cookies-from-browser") + 1] == "chrome"
+    assert calls[1][calls[1].index("--cookies-from-browser") + 1] == "chrome:Default"
+
+
+def test_fetch_metadata_does_not_retry_explicit_browser_profile(monkeypatch):
+    calls = []
+
+    class FailedLoginResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        return FailedLoginResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ytdlp_module, "_browser_cookie_profile_sources", lambda browser: [f"{browser}:Default"])
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome:Default")
+
+    with pytest.raises(YtDlpError, match="Sign in"):
+        runner.fetch_metadata(request)
+
+    assert len(calls) == 1
+
+
 def test_extract_subtitles_reads_generated_vtt(monkeypatch, tmp_path):
     class Result:
         returncode = 0
@@ -506,6 +661,18 @@ def test_download_video_explains_missing_ffmpeg(monkeypatch, tmp_path):
         runner.download_video(request, tmp_path, "abc")
 
 
+def test_probe_local_video_duration_returns_none_when_ffprobe_is_missing(monkeypatch, tmp_path):
+    source = tmp_path / "Lesson.mp4"
+    source.write_bytes(b"video")
+
+    def fake_run(cmd, capture_output, text, check):
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert YtDlpRunner().probe_local_video_duration(source) is None
+
+
 def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_path):
     calls = []
 
@@ -582,6 +749,37 @@ def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypat
     assert "-b:a" in ffmpeg_cmd
     assert ffmpeg_cmd[ffmpeg_cmd.index("-b:a") + 1] == "64k"
     assert result[0].text == "online transcript"
+
+
+def test_online_asr_defaults_to_current_python_ytdlp_module(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        if "--extract-audio" in cmd:
+            (tmp_path / "abc.online-source.wav").write_text("audio", encoding="utf-8")
+        elif cmd[0] == "ffmpeg":
+            Path(cmd[-1]).write_bytes(b"mp3")
+        return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr(
+        "course_navigator.online_asr._transcribe_chunk",
+        lambda provider, service, audio_path, language: {
+            "segments": [{"start": 0.0, "end": 1.5, "text": "online transcript"}]
+        },
+    )
+
+    extract_online_asr_transcript(
+        ExtractRequest(url="https://www.youtube.com/watch?v=abc", subtitle_source="online_asr"),
+        tmp_path,
+        "abc",
+        None,
+        OnlineAsrSettings(provider="xai", xai={"api_key": "xai-test"}),
+    )
+
+    assert calls[0][:3] == [sys.executable, "-m", "yt_dlp"]
 
 
 def test_online_asr_turns_provider_http_errors_into_user_errors(monkeypatch, tmp_path):

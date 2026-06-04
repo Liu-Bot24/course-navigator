@@ -25,7 +25,7 @@ TaskParameterKey = Literal[
     "high_fidelity",
 ]
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 
 class TranscriptSegment(BaseModel):
@@ -317,6 +317,14 @@ class CourseItem(BaseModel):
     metadata: VideoMetadata | None = None
     study: "StudyMaterial | None" = None
     local_video_path: Path | None = None
+
+    @field_serializer("local_video_path")
+    def serialize_local_video_path(self, value: Path | None) -> str | None:
+        if value is None:
+            return None
+        if value.is_absolute():
+            return str(value)
+        return value.as_posix()
 
 
 class TimeRange(BaseModel):

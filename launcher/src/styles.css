@@ -157,6 +157,15 @@ h1 {
   font-weight: 700;
 }
 
+.status-message {
+  min-height: 1.25em;
+  margin: 9px 0 0;
+  color: #56604f;
+  font-size: 0.86rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
 .hero-actions > button,
 .port-editor button,
 .workspace-confirm-actions button {
@@ -758,12 +767,25 @@ h1 {
   border-radius: 20px;
 }
 
-.dependency-panel > span {
+.dependency-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.dependency-heading > span {
   color: #68715e;
   font-size: 0.78rem;
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
+}
+
+.dependency-heading > p {
+  margin: 0;
+  color: #56604f;
+  font-size: 0.76rem;
+  font-weight: 650;
+  line-height: 1.35;
 }
 
 .dependency-list {

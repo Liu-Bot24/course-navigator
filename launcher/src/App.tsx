@@ -43,8 +43,8 @@ import "./styles.css";
 
 const fallbackStatus: LauncherStatus = {
   state: "stopped",
-  apiUrl: "http://127.0.0.1:8000",
-  webUrl: "http://127.0.0.1:5173",
+  apiUrl: "http://127.0.0.1:18000",
+  webUrl: "http://127.0.0.1:15173",
   message: "尚未启动",
 };
 
@@ -341,6 +341,9 @@ function MainLauncher({
             </button>
             {notice ? <p>{notice}</p> : null}
           </div>
+          <p className="status-message" aria-label="状态消息">
+            {status.message}
+          </p>
         </div>
         <div className={`status-orb status-orb-${status.state}`} aria-label={`当前状态 ${status.state}`}>
           <Activity size={36} />
@@ -404,8 +407,11 @@ function MainLauncher({
         onOpenArchive={() => setModelArchiveOpen(true)}
       />
 
-      <section className="dependency-panel" aria-label="依赖检查">
-        <span>依赖检查</span>
+      <section className="dependency-panel" aria-label="运行环境">
+        <div className="dependency-heading">
+          <span>运行环境</span>
+          <p>这些组件用于打开课程、处理视频和提取字幕。</p>
+        </div>
         <div className="dependency-list">
           {dependencies.map((dependency) => (
             <div className={`dependency-row ${dependency.available ? "" : "dependency-row-failed"}`} key={dependency.name}>
@@ -877,8 +883,8 @@ function PortSettings({
 
   useEffect(() => {
     if (!editing) return;
-    setWebPort(String(config?.webPort ?? 5173));
-    setApiPort(String(config?.apiPort ?? 8000));
+    setWebPort(String(config?.webPort ?? 15173));
+    setApiPort(String(config?.apiPort ?? 18000));
     setError(null);
   }, [config, editing]);
 

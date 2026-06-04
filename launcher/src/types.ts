@@ -21,6 +21,8 @@ export type DependencyStatus = {
   name: string;
   available: boolean;
   purpose: string;
+  installTarget?: string;
+  installLabel?: string;
 };
 
 export type WorkspaceMigrationPlan = {

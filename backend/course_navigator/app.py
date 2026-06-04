@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -247,7 +248,7 @@ def create_app(
             if not paths:
                 return []
             imported = _import_video_paths(library, active_workspace_dir, ytdlp_runner, paths, request.mode)
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         with deleted_items_lock:
             for item in imported:
@@ -281,7 +282,7 @@ def create_app(
                 ytdlp_runner,
                 VideoSourceBindingRequest(source_type="external", path=str(paths[0])),
             )
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         library.save(updated)
         return _normalize_item_for_response(updated, active_workspace_dir)
@@ -303,7 +304,7 @@ def create_app(
                 ytdlp_runner,
                 paths[0],
             )
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         library.save(updated)
         return _normalize_item_for_response(updated, active_workspace_dir)
@@ -1478,6 +1479,14 @@ def _validate_local_video_source_path(path: Path) -> None:
 
 
 def _pick_local_video_paths(*, multiple: bool) -> list[Path]:
+    if sys.platform == "darwin":
+        return _pick_local_video_paths_with_osascript(multiple=multiple)
+    if sys.platform.startswith("win"):
+        return _pick_local_video_paths_with_windows_dialog(multiple=multiple)
+    raise ValueError("Local video picker is not supported on this platform")
+
+
+def _pick_local_video_paths_with_osascript(*, multiple: bool) -> list[Path]:
     multiple_selection_clause = " with multiple selections allowed" if multiple else ""
     script = """
 set chosenFiles to choose file with prompt "选择要导入的课程视频" of type {"public.movie"}MULTIPLE_SELECTION_CLAUSE
@@ -1498,6 +1507,49 @@ return output
             return []
         raise ValueError(error or "Unable to open Finder video picker")
     return [Path(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def _pick_local_video_paths_with_windows_dialog(*, multiple: bool) -> list[Path]:
+    extensions = sorted(LOCAL_VIDEO_EXTENSIONS)
+    wildcard = ";".join(f"*{extension}" for extension in extensions)
+    filter_label = f"Video files ({wildcard})|{wildcard}|All files (*.*)|*.*"
+    allow_multiple = "$true" if multiple else "$false"
+    script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.StartPosition = 'CenterScreen'
+$owner.Width = 1
+$owner.Height = 1
+$owner.Opacity = 0
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = '选择要导入的课程视频'
+$dialog.Filter = '{filter_label}'
+$dialog.Multiselect = {allow_multiple}
+$dialog.RestoreDirectory = $true
+try {{
+  $owner.Show()
+  $owner.Activate()
+  if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {{
+    $dialog.FileNames | ForEach-Object {{ Write-Output $_ }}
+  }}
+}} finally {{
+  $dialog.Dispose()
+  $owner.Close()
+  $owner.Dispose()
+}}
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        error = result.stderr.strip()
+        raise ValueError(error or "Unable to open Windows video picker")
+    return [Path(line.strip()) for line in result.stdout.splitlines() if line.strip()]
 
 
 def _bind_video_source_for_item(
@@ -1939,7 +1991,7 @@ def _extract_online_asr_transcript(
             request,
             transcript_dir,
             item_id,
-            getattr(runner, "binary", "yt-dlp"),
+            getattr(runner, "binary", None),
             settings.online_asr,
             progress=lambda value, message: progress("online_asr", value, message),
         )
@@ -1947,7 +1999,7 @@ def _extract_online_asr_transcript(
         request,
         transcript_dir,
         item_id,
-        getattr(runner, "binary", "yt-dlp"),
+        getattr(runner, "binary", None),
         settings.online_asr,
     )
 

@@ -1105,7 +1105,7 @@ def test_extract_route_can_force_online_asr_source(tmp_path, monkeypatch):
     assert runner.subtitle_called is False
     assert response.json()["transcript_source"] == "online_asr"
     assert response.json()["transcript"][0]["text"] == "Online ASR line."
-    assert captured == {"provider": "xai", "binary": "yt-dlp", "item_id": "abc123", "language": "en"}
+    assert captured == {"provider": "xai", "binary": None, "item_id": "abc123", "language": "en"}
 
 
 def test_extract_uses_safe_id_for_subtitle_directory(tmp_path):
@@ -2266,7 +2266,7 @@ def test_import_external_video_paths_links_files_without_copying(tmp_path):
     assert payload[0]["title"] == "NAS Lesson"
     assert payload[0]["source_url"] == "external-video://NAS-Lesson"
     assert payload[0]["video_source_type"] == "external"
-    assert payload[0]["local_video_path"] == str(source)
+    assert Path(payload[0]["local_video_path"]).resolve() == source.resolve()
     assert not (workspace_dir / "downloads" / "NAS-Lesson.mp4").exists()
 
 
@@ -2334,7 +2334,7 @@ def test_local_video_file_picker_imports_selected_paths(tmp_path, monkeypatch):
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["video_source_type"] == "external"
-    assert payload[0]["local_video_path"] == str(source)
+    assert Path(payload[0]["local_video_path"]).resolve() == source.resolve()
     assert picker_modes == [True]
 
 
@@ -2346,6 +2346,56 @@ def test_local_video_file_picker_returns_empty_list_when_cancelled(tmp_path, mon
 
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_local_video_file_picker_reports_picker_failures(tmp_path, monkeypatch):
+    def picker_failure(*, multiple: bool):
+        raise FileNotFoundError("picker command missing")
+
+    monkeypatch.setattr(app_module, "_pick_local_video_paths", picker_failure)
+    client = make_client(tmp_path / "process", workspace_dir=tmp_path / "workspace", runner=FakeLocalVideoRunner())
+
+    response = client.post("/api/local-video-file-picker", json={"mode": "external"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "picker command missing"
+
+
+def test_pick_local_video_paths_uses_windows_file_dialog(monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "C:\\Users\\LQ\\Videos\\First Lesson.mp4\r\nD:\\Course\\Second.webm\r\n"
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check):
+        calls.append(cmd)
+        return Result()
+
+    monkeypatch.setattr(app_module.sys, "platform", "win32")
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+
+    paths = app_module._pick_local_video_paths(multiple=True)
+
+    assert paths == [Path("C:\\Users\\LQ\\Videos\\First Lesson.mp4"), Path("D:\\Course\\Second.webm")]
+    assert calls[0][:4] == ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy"]
+    assert "$dialog.Multiselect = $true" in calls[0][-1]
+    assert "System.Windows.Forms.OpenFileDialog" in calls[0][-1]
+    assert "$owner.TopMost = $true" in calls[0][-1]
+    assert "$dialog.ShowDialog($owner)" in calls[0][-1]
+
+
+def test_pick_local_video_paths_returns_empty_list_when_windows_dialog_is_cancelled(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(app_module.sys, "platform", "win32")
+    monkeypatch.setattr(app_module.subprocess, "run", lambda *args, **kwargs: Result())
+
+    assert app_module._pick_local_video_paths(multiple=False) == []
 
 
 def test_existing_empty_workspace_receives_legacy_items_and_downloads(tmp_path):

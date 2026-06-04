@@ -22,9 +22,17 @@ type TauriConfig = {
     windows: TauriWindowConfig[];
   };
   bundle: {
+    targets?: string | string[];
     category?: string;
     icon: string[];
     resources?: Record<string, string>;
+    windows?: {
+      nsis?: {
+        installerIcon?: string;
+        uninstallerIcon?: string;
+        installerHooks?: string;
+      };
+    };
   };
 };
 
@@ -39,21 +47,73 @@ describe("Tauri app shell", () => {
   it("ships as Course Navigator with the product icon assets", () => {
     expect(config.productName).toBe("Course Navigator");
     expect(config.bundle.category).toBe("Education");
-    expect(config.bundle.icon).toEqual(["icons/icon.icns", "icons/icon.png"]);
+    expect(config.bundle.icon).toEqual(["icons/icon.icns", "icons/icon.png", "icons/icon.ico"]);
+    expect(config.bundle.windows?.nsis?.installerIcon).toBe("icons/icon.ico");
+    expect(config.bundle.windows?.nsis?.uninstallerIcon).toBe("icons/icon.ico");
+    expect(config.bundle.windows?.nsis?.installerHooks).toBe("windows/installer-hooks.nsh");
   });
 
-  it("bundles the runtime source needed by direct macOS distribution", () => {
+  it("stops only Course Navigator-owned Windows processes before overwriting bundled tools", async () => {
+    const hooks = await readFile(resolve(testDir, "../src-tauri/windows/installer-hooks.nsh"), "utf-8");
+
+    expect(hooks).toContain("NSIS_HOOK_PREINSTALL");
+    expect(hooks).toContain("$INSTDIR");
+    expect(hooks).toContain("LOCALAPPDATA");
+    expect(hooks).toContain("APPDATA");
+    expect(hooks).toContain("Course Navigator");
+    expect(hooks).toContain("Win32_Process");
+    expect(hooks).toContain("Stop-Process");
+    expect(hooks).not.toContain("/IM node.exe");
+    expect(hooks).not.toContain("/IM python.exe");
+  });
+
+  it("bundles the runtime source and Windows portable tools needed by direct distribution", () => {
     expect(config.bundle.resources).toEqual({
       "resources/runtime-source": "runtime-source",
+      "resources/runtime-tools": "runtime-tools",
     });
   });
 
-  it("keeps local collaboration notes out of packaged runtime source", async () => {
-    const prepareScript = await readFile(resolve(testDir, "../../scripts/prepare-mac-runtime-source.sh"), "utf-8");
+  it("uses a cross-platform runtime source preparation script for app bundles", async () => {
+    const packageJson = JSON.parse(await readFile(resolve(testDir, "../package.json"), "utf-8"));
 
-    expect(prepareScript).toContain("--exclude 'DEVELOPMENT_LOG.md'");
-    expect(prepareScript).toContain("--exclude '.internal-docs/'");
-    expect(prepareScript).toContain("--exclude 'output/'");
+    expect(packageJson.scripts["prepare:runtime"]).toBe("node ../scripts/prepare-runtime-source.mjs");
+    expect(packageJson.scripts["tauri:build:windows"]).toContain("tauri build --bundles nsis");
+  });
+
+  it("keeps Windows releases and spawned runtime commands from opening console windows", async () => {
+    const mainSource = await import("../src-tauri/src/main.rs?raw").then((module) => module.default as string);
+    const runtimeSource = await import("../src-tauri/src/runtime.rs?raw").then((module) => module.default as string);
+
+    expect(mainSource).toContain('windows_subsystem = "windows"');
+    expect(runtimeSource).toContain("CREATE_NO_WINDOW");
+    expect(runtimeSource).toContain("creation_flags(CREATE_NO_WINDOW)");
+    expect(runtimeSource).toContain("hidden_command(&command.program)");
+  });
+
+  it("bundles Windows runtime tools without a standalone yt-dlp executable", async () => {
+    const prepareScript = await readFile(resolve(testDir, "../../scripts/prepare-runtime-source.mjs"), "utf-8");
+    const runtimeSource = await import("../src-tauri/src/runtime.rs?raw").then((module) => module.default as string);
+
+    expect(prepareScript).toContain("runtime-tools");
+    expect(prepareScript).toContain("nodejs.org/dist");
+    expect(prepareScript).toContain("uv-x86_64-pc-windows-msvc");
+    expect(prepareScript).not.toContain("yt-dlp.exe");
+    expect(prepareScript).toContain("ffmpeg-release-essentials");
+    expect(prepareScript).toContain("ffprobe.exe");
+    expect(runtimeSource).toContain("windows_tool_program");
+    expect(runtimeSource).toContain("runtime-tools");
+    expect(runtimeSource).toContain("prepend_bundled_tool_paths");
+    expect(runtimeSource).not.toContain('"ytdlp"');
+    expect(runtimeSource).toContain('"ffmpeg"');
+  });
+
+  it("keeps local collaboration notes out of packaged runtime source", async () => {
+    const prepareScript = await readFile(resolve(testDir, "../../scripts/prepare-runtime-source.mjs"), "utf-8");
+
+    expect(prepareScript).toContain('"DEVELOPMENT_LOG.md"');
+    expect(prepareScript).toContain('".internal-docs"');
+    expect(prepareScript).toContain('"output"');
   });
 
   it("uses a compact default main window that can fit the full launcher", () => {

@@ -5,15 +5,15 @@ mod models;
 mod runtime;
 mod workspace;
 
-use std::process::Command;
-
 use models::{LauncherConfig, LauncherStatus};
 use tauri::{
     image::Image,
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
-    ActivationPolicy, Emitter, LogicalSize, Manager, RunEvent, Size,
+    Emitter, LogicalSize, Manager, Size,
 };
+#[cfg(target_os = "macos")]
+use tauri::{ActivationPolicy, RunEvent};
 
 const TRAY_ID: &str = "course-navigator-tray";
 const MAIN_WINDOW_WIDTH: f64 = 1000.0;
@@ -74,7 +74,8 @@ fn save_model_config(
 
 #[tauri::command]
 fn check_dependencies() -> Vec<runtime::DependencyStatus> {
-    runtime::check_dependencies()
+    let config = config::load_config();
+    runtime::check_dependencies(std::path::Path::new(&config.project_root))
 }
 
 #[tauri::command]
@@ -82,7 +83,7 @@ fn start_services(
     app: tauri::AppHandle,
     state: tauri::State<'_, runtime::ServiceState>,
 ) -> LauncherStatus {
-    let config = get_config();
+    let (config, port_messages) = start_config_with_available_ports(&app);
     let api_url = format!("http://{}:{}", config.api_host, config.api_port);
     let web_url = format!("http://{}:{}", config.web_host, config.web_port);
     let existing_services_ready = runtime::configured_services_listening(&config);
@@ -97,6 +98,8 @@ fn start_services(
                 web_url,
                 message: if existing_services_ready {
                     "检测到现有服务已可用，已复用并打开网页。".to_string()
+                } else if !port_messages.is_empty() {
+                    format!("{}；服务已启动", port_messages.join("；"))
                 } else {
                     "服务已启动".to_string()
                 },
@@ -153,32 +156,10 @@ fn plan_workspace_migration(
 
 #[tauri::command]
 fn choose_workspace_directory() -> Result<Option<String>, String> {
-    let output = Command::new("/usr/bin/osascript")
-        .args([
-            "-e",
-            r#"POSIX path of (choose folder with prompt "选择 Course Navigator Workspace")"#,
-        ])
-        .output()
-        .map_err(|error| format!("无法打开文件夹选择器: {error}"))?;
-
-    if output.status.success() {
-        let selected = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
-        if selected.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(selected))
-        }
-    } else {
-        let error = String::from_utf8_lossy(&output.stderr);
-        if error.contains("User canceled") || error.contains("-128") {
-            Ok(None)
-        } else {
-            Err(format!("选择 Workspace 失败: {}", error.trim()))
-        }
-    }
+    Ok(rfd::FileDialog::new()
+        .set_title("选择 Course Navigator Workspace")
+        .pick_folder()
+        .map(|path| path.display().to_string()))
 }
 
 #[tauri::command]
@@ -237,7 +218,7 @@ pub fn run() {
                             open::that(format!("http://{}:{}", config.web_host, config.web_port));
                     }
                     "start" => {
-                        let config = config::load_config();
+                        let (config, _) = start_config_with_available_ports(app);
                         if let Some(state) = app.try_state::<runtime::ServiceState>() {
                             let started = runtime::start_project_services(state.inner(), &config);
                             if started.is_ok() && config.open_browser_on_start {
@@ -310,8 +291,8 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build Course Navigator");
 
+    #[cfg(target_os = "macos")]
     app.run(|app, event| {
-        #[cfg(target_os = "macos")]
         if let RunEvent::Reopen {
             has_visible_windows,
             ..
@@ -322,6 +303,17 @@ pub fn run() {
             }
         }
     });
+    #[cfg(not(target_os = "macos"))]
+    app.run(|_app, _event| {});
+}
+
+fn start_config_with_available_ports(app: &tauri::AppHandle) -> (LauncherConfig, Vec<String>) {
+    let config = config::load_config();
+    let (resolved, messages) = runtime::resolve_available_ports(&config);
+    if config::save_config(&resolved).is_ok() && resolved != config {
+        let _ = refresh_tray_menu(app);
+    }
+    (resolved, messages)
 }
 
 fn template_tray_icon() -> Image<'static> {
