@@ -1,6 +1,6 @@
 cask "course-navigator" do
-  version "0.1.4"
-  sha256 "0d47d57eae7513901d748c5b478d6c730b1f79608d3c3531feab8170c449d671"
+  version "0.1.5"
+  sha256 "6861253b65ee44d670dfd07652abc9c0dd8a93f8948df6c33ae6d08f1c9328a1"
 
   url "https://github.com/Liu-Bot24/course-navigator/releases/download/v#{version}/Course.Navigator-#{version}-macos-arm64.dmg"
   name "Course Navigator"
@@ -8,10 +8,6 @@ cask "course-navigator" do
   homepage "https://github.com/Liu-Bot24/course-navigator"
 
   depends_on arch: :arm64
-  depends_on formula: "node"
-  depends_on formula: "python@3.11"
-  depends_on formula: "uv"
-  depends_on formula: "ffmpeg"
 
   app "Course Navigator.app"
 

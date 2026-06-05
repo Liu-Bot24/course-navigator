@@ -6,16 +6,9 @@ When Course Navigator is provided as a macOS installer, you can install and laun
 
 - macOS.
 - Apple Silicon Mac. The current DMG and Homebrew Cask do not provide an Intel Mac build yet.
-- Node.js 20.19+ on the Node 20 line, or Node.js 22.12+ on Node 22 and newer, with npm.
-- Python 3.11 or newer.
-- `uv` for Python backend dependencies.
-- `ffmpeg` for local video cache, audio extraction, and media conversion; it can be installed later if you do not use media conversion features.
+- An internet connection on the first service start, so the app can prepare project runtime dependencies.
 
-With Homebrew:
-
-```bash
-brew install node python@3.11 uv ffmpeg
-```
+The app bundle includes Node.js/npm, uv, and ffmpeg/ffprobe. Users do not need to install these tools in Terminal before launching the app.
 
 ## Install The App
 
@@ -51,7 +44,7 @@ On first launch, Course Navigator installs its runtime resources to:
 
 Course material is stored in `Workspace` by default. You can change the workspace location in the app.
 
-The first service start installs local runtime dependencies. It needs an internet connection and can take a few minutes. Later starts are faster.
+The first service start uses the bundled runtime tools to prepare local runtime dependencies. It needs an internet connection and can take a few minutes. Later starts are faster.
 
 ## First Open Prompt
 

@@ -146,6 +146,14 @@ export function App() {
     };
   }, []);
 
+  async function refreshDependencies() {
+    try {
+      setDependencies(await checkDependencies());
+    } catch {
+      // The status area remains usable even if a tool probe fails transiently.
+    }
+  }
+
   async function handleStart() {
     setNotice(null);
     setStatus((current) => ({
@@ -155,6 +163,7 @@ export function App() {
     }));
     const nextStatus = await startServices();
     setStatus(nextStatus);
+    await refreshDependencies();
   }
 
   async function handleStop() {

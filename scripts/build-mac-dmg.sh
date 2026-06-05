@@ -162,9 +162,15 @@ fi
 mkdir -p "$OUTPUT_DIR"
 rm -f "$DMG_PATH" "$DMG_PATH.sha256" "$TMP_DMG_PATH"
 
+APP_SIZE_KB="$(du -sk "$APP_PATH" | awk '{print $1}')"
+DMG_SIZE_MB="$(( APP_SIZE_KB / 1024 + 256 ))"
+if (( DMG_SIZE_MB < 220 )); then
+  DMG_SIZE_MB=220
+fi
+
 hdiutil create \
   -volname "$APP_NAME" \
-  -size 160m \
+  -size "${DMG_SIZE_MB}m" \
   -fs HFS+ \
   -type UDIF \
   -ov \

@@ -37,6 +37,18 @@ def test_build_auth_args_for_browser_cookie_mode():
     assert build_auth_args(request) == ["--cookies-from-browser", "chrome"]
 
 
+def test_build_auth_args_for_browser_cookie_mode_can_dump_to_cache(tmp_path):
+    cookies_path = tmp_path / "chrome.cookies.txt"
+    request = ExtractRequest(
+        url="https://www.youtube.com/watch?v=abc",
+        mode="browser",
+        browser="chrome",
+        cookies_path=str(cookies_path),
+    )
+
+    assert build_auth_args(request) == ["--cookies", str(cookies_path), "--cookies-from-browser", "chrome"]
+
+
 def test_build_auth_args_defaults_blank_browser_to_chrome():
     request = ExtractRequest(
         url="https://www.youtube.com/watch?v=abc",
@@ -92,7 +104,7 @@ def test_default_ytdlp_runner_uses_current_python_module(monkeypatch):
         )
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         return Result()
 
@@ -129,7 +141,7 @@ def test_fetch_metadata_parses_ytdlp_json(monkeypatch):
         )
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         return Result()
 
@@ -139,7 +151,13 @@ def test_fetch_metadata_parses_ytdlp_json(monkeypatch):
 
     metadata = runner.fetch_metadata(request)
 
-    assert calls[0][:4] == ["yt-dlp", "--skip-download", "--dump-json", "--no-warnings"]
+    assert calls[0][:5] == [
+        "yt-dlp",
+        "--skip-download",
+        "--dump-json",
+        "--no-warnings",
+        "--ignore-no-formats-error",
+    ]
     assert "--write-subs" in calls[0]
     assert "--write-auto-subs" in calls[0]
     assert calls[0][calls[0].index("--sub-langs") + 1] == "all"
@@ -156,6 +174,39 @@ def test_fetch_metadata_parses_ytdlp_json(monkeypatch):
     assert metadata.stream_url == "https://cdn.example.com/video.m3u8"
     assert metadata.subtitles == ["en"]
     assert metadata.automatic_captions == ["zh-Hans"]
+
+
+def test_fetch_metadata_uses_single_file_fallback_format(monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    YtDlpRunner(binary="yt-dlp").fetch_metadata(
+        ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+    )
+
+    assert "--format" in calls[0]
+    assert "--ignore-no-formats-error" in calls[0]
+    assert calls[0][calls[0].index("--format") + 1] == "best/bestvideo*+bestaudio/best"
+    assert calls[0].index("--format") < calls[0].index("--write-subs")
 
 
 def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(monkeypatch, tmp_path):
@@ -176,7 +227,7 @@ def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(mo
         )
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         run_calls.append(cmd)
         if "--write-subs" in cmd and "--dump-json" not in cmd:
             Path(tmp_path, "abc.en.vtt").write_text(
@@ -190,7 +241,7 @@ def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(mo
     class FakeProcess:
         returncode = 0
 
-        def __init__(self, cmd, stdout, stderr, text):
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
             popen_calls.append(cmd)
             self.stdout = iter([])
 
@@ -253,7 +304,7 @@ def test_fetch_metadata_keeps_bilibili_subtitles_visible(monkeypatch):
         )
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         return Result()
 
@@ -378,7 +429,7 @@ def test_fetch_metadata_retries_without_browser_cookies_when_cookie_database_is_
         )
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         return FailedCookieResult() if len(calls) == 1 else MetadataResult()
 
@@ -391,6 +442,86 @@ def test_fetch_metadata_retries_without_browser_cookies_when_cookie_database_is_
     assert metadata.id == "abc123"
     assert "--cookies-from-browser" in calls[0]
     assert "--cookies-from-browser" not in calls[1]
+
+
+def test_fetch_metadata_saves_browser_cookie_cache_when_configured(monkeypatch, tmp_path):
+    calls = []
+
+    class MetadataResult:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Cookie Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {"en": [{"ext": "vtt"}]},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        return MetadataResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp", cookie_cache_dir=tmp_path)
+
+    metadata = runner.fetch_metadata(
+        ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+    )
+
+    cache_file = tmp_path / "chrome.cookies.txt"
+    assert metadata.id == "abc123"
+    assert cache_file.exists()
+    assert "--cookies" in calls[0]
+    assert calls[0][calls[0].index("--cookies") + 1] == str(cache_file)
+    assert calls[0][calls[0].index("--cookies-from-browser") + 1] == "chrome"
+
+
+def test_fetch_metadata_uses_cached_browser_cookies_when_browser_database_is_locked(monkeypatch, tmp_path):
+    calls = []
+    cache_file = tmp_path / "chrome.cookies.txt"
+    cache_file.write_text(
+        "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tcached\n",
+        encoding="utf-8",
+    )
+
+    class FailedCookieResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: Could not copy Chrome cookie database"
+
+    class MetadataResult:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "Cached Cookie Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {"en": [{"ext": "vtt"}]},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        return FailedCookieResult() if len(calls) == 1 else MetadataResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp", cookie_cache_dir=tmp_path)
+
+    metadata = runner.fetch_metadata(
+        ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+    )
+
+    assert metadata.id == "abc123"
+    assert "--cookies-from-browser" in calls[0]
+    assert "--cookies-from-browser" not in calls[1]
+    assert calls[1][calls[1].index("--cookies") + 1] == str(cache_file)
 
 
 def test_fetch_metadata_preserves_cookie_copy_error_when_normal_retry_still_requires_login(monkeypatch):
@@ -406,7 +537,7 @@ def test_fetch_metadata_preserves_cookie_copy_error_when_normal_retry_still_requ
         stdout = ""
         stderr = "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         return FailedCookieResult() if len(calls) == 1 else FailedLoginResult()
 
@@ -443,7 +574,7 @@ def test_fetch_metadata_retries_plain_browser_with_detected_profile_when_login_r
         )
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         return FailedLoginResult() if len(calls) == 1 else MetadataResult()
 
@@ -459,6 +590,38 @@ def test_fetch_metadata_retries_plain_browser_with_detected_profile_when_login_r
     assert calls[1][calls[1].index("--cookies-from-browser") + 1] == "chrome:Default"
 
 
+def test_fetch_metadata_reports_cookie_database_error_from_profile_retry(monkeypatch):
+    calls = []
+
+    class FailedLoginResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
+
+    class FailedCookieResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: Could not copy Chrome cookie database"
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return FailedLoginResult()
+        if len(calls) == 2:
+            return FailedCookieResult()
+        return FailedLoginResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ytdlp_module, "_browser_cookie_profile_sources", lambda browser: [f"{browser}:Default"])
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    with pytest.raises(YtDlpError, match="无法读取浏览器 Cookie 来源 chrome:Default"):
+        runner.fetch_metadata(request)
+
+    assert len(calls) == 3
+
+
 def test_fetch_metadata_does_not_retry_explicit_browser_profile(monkeypatch):
     calls = []
 
@@ -467,7 +630,7 @@ def test_fetch_metadata_does_not_retry_explicit_browser_profile(monkeypatch):
         stdout = ""
         stderr = "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         return FailedLoginResult()
 
@@ -483,12 +646,15 @@ def test_fetch_metadata_does_not_retry_explicit_browser_profile(monkeypatch):
 
 
 def test_extract_subtitles_reads_generated_vtt(monkeypatch, tmp_path):
+    calls = []
+
     class Result:
         returncode = 0
         stdout = ""
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
         Path(tmp_path, "abc.en.vtt").write_text(
             "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi\n",
             encoding="utf-8",
@@ -501,6 +667,7 @@ def test_extract_subtitles_reads_generated_vtt(monkeypatch, tmp_path):
 
     segments = runner.extract_subtitles(request, tmp_path)
 
+    assert "--ignore-no-formats-error" in calls[0]
     assert segments[0].text == "Hi"
     assert segments[0].start == 1.0
 
@@ -513,7 +680,7 @@ def test_extract_subtitles_uses_auto_source_language(monkeypatch, tmp_path):
         stdout = ""
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         Path(tmp_path, "abc.ja.vtt").write_text(
             "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nこんにちは\n",
@@ -543,7 +710,7 @@ def test_extract_subtitles_clears_stale_subtitle_files(monkeypatch, tmp_path):
         stdout = ""
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         Path(tmp_path, "abc.ai-zh.vtt").write_text(
             "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n你好\n",
             encoding="utf-8",
@@ -604,7 +771,7 @@ def test_download_video_returns_generated_video(monkeypatch, tmp_path):
     class FakeProcess:
         returncode = 0
 
-        def __init__(self, cmd, stdout, stderr, text):
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
             self.cmd = cmd
             self.stdout = iter([])
 
@@ -625,7 +792,7 @@ def test_download_video_reports_percentage_progress(monkeypatch, tmp_path):
     class FakeProcess:
         returncode = 0
 
-        def __init__(self, cmd, stdout, stderr, text):
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
             self.cmd = cmd
             self.stdout = iter(["[download]   7.5% of 10.00MiB\n", "[download] 100% of 10.00MiB\n"])
 
@@ -647,7 +814,7 @@ def test_download_video_reports_percentage_progress(monkeypatch, tmp_path):
 
 def test_download_video_explains_missing_ffmpeg(monkeypatch, tmp_path):
     class FakeProcess:
-        def __init__(self, cmd, stdout, stderr, text):
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
             self.stdout = iter(["ERROR: ffmpeg not found. Please install or provide --ffmpeg-location\n"])
 
         def wait(self):
@@ -665,7 +832,7 @@ def test_probe_local_video_duration_returns_none_when_ffprobe_is_missing(monkeyp
     source = tmp_path / "Lesson.mp4"
     source.write_bytes(b"video")
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         raise FileNotFoundError("ffprobe")
 
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -676,7 +843,7 @@ def test_probe_local_video_duration_returns_none_when_ffprobe_is_missing(monkeyp
 def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_path):
     calls = []
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         if "--extract-audio" in cmd:
             Path(tmp_path, "abc.wav").write_text("audio", encoding="utf-8")
@@ -685,7 +852,7 @@ def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_pa
     class FakeProcess:
         returncode = 0
 
-        def __init__(self, cmd, stdout, stderr, text):
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
             calls.append(cmd)
             Path(tmp_path, "abc.vtt").write_text(
                 "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n這是一個測試\n",
@@ -716,7 +883,7 @@ def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_pa
 def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypatch, tmp_path):
     calls = []
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         if "--extract-audio" in cmd:
             (tmp_path / "abc.online-source.wav").write_text("audio", encoding="utf-8")
@@ -751,10 +918,63 @@ def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypat
     assert result[0].text == "online transcript"
 
 
+def test_online_asr_retries_plain_browser_with_profile_when_login_required(monkeypatch, tmp_path):
+    calls = []
+
+    class FailedLoginResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
+
+    class SuccessResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        if "--extract-audio" in cmd:
+            if len([call for call in calls if "--extract-audio" in call]) == 1:
+                return FailedLoginResult()
+            (tmp_path / "abc.online-source.wav").write_text("audio", encoding="utf-8")
+            return SuccessResult()
+        if cmd[0] == "ffmpeg":
+            Path(cmd[-1]).write_bytes(b"mp3")
+        return SuccessResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr(ytdlp_module, "_browser_cookie_profile_sources", lambda browser: [f"{browser}:Default"])
+    monkeypatch.setattr(
+        "course_navigator.online_asr._transcribe_chunk",
+        lambda provider, service, audio_path, language: {
+            "segments": [{"start": 0.0, "end": 1.5, "text": "online transcript"}]
+        },
+    )
+
+    result = extract_online_asr_transcript(
+        ExtractRequest(
+            url="https://www.youtube.com/watch?v=abc",
+            mode="browser",
+            browser="chrome",
+            subtitle_source="online_asr",
+        ),
+        tmp_path,
+        "abc",
+        "yt-dlp",
+        OnlineAsrSettings(provider="xai", xai={"api_key": "xai-test"}),
+    )
+
+    yt_dlp_calls = [cmd for cmd in calls if "--extract-audio" in cmd]
+    assert yt_dlp_calls[0][yt_dlp_calls[0].index("--cookies-from-browser") + 1] == "chrome"
+    assert yt_dlp_calls[1][yt_dlp_calls[1].index("--cookies-from-browser") + 1] == "chrome:Default"
+    assert result[0].text == "online transcript"
+
+
 def test_online_asr_defaults_to_current_python_ytdlp_module(monkeypatch, tmp_path):
     calls = []
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         if "--extract-audio" in cmd:
             (tmp_path / "abc.online-source.wav").write_text("audio", encoding="utf-8")
@@ -864,7 +1084,7 @@ def test_online_asr_splits_large_compressed_audio(monkeypatch, tmp_path):
     def fake_duration(path):
         return 120.0
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         chunk_path = Path(cmd[-1])
         chunk_path.write_bytes(b"chunk")
         chunks_created.append(chunk_path)

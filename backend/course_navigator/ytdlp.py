@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .models import DownloadRequest, ExtractRequest, TranscriptSegment, VideoMetadata
+from .processes import popen_hidden, run_hidden
 from .subtitles import parse_subtitle_text
 
 try:
@@ -48,7 +49,11 @@ def build_auth_args(request: ExtractRequest | DownloadRequest) -> list[str]:
         return []
     if request.mode == "browser":
         browser = (request.browser or "chrome").strip() or "chrome"
-        return ["--cookies-from-browser", browser]
+        args = []
+        if request.cookies_path:
+            args.extend(["--cookies", str(Path(request.cookies_path).expanduser())])
+        args.extend(["--cookies-from-browser", browser])
+        return args
     if request.mode == "cookies":
         if not request.cookies_path:
             raise ValueError("cookies_path is required when mode is cookies")
@@ -57,8 +62,9 @@ def build_auth_args(request: ExtractRequest | DownloadRequest) -> list[str]:
 
 
 class YtDlpRunner:
-    def __init__(self, binary: str | None = None) -> None:
+    def __init__(self, binary: str | None = None, cookie_cache_dir: Path | None = None) -> None:
         self.binary = binary
+        self.cookie_cache_dir = cookie_cache_dir
 
     def command_prefix(self) -> list[str]:
         if self.binary:
@@ -72,7 +78,10 @@ class YtDlpRunner:
                 "--skip-download",
                 "--dump-json",
                 "--no-warnings",
+                "--ignore-no-formats-error",
                 *build_runtime_args(),
+                "--format",
+                "best/bestvideo*+bestaudio/best",
                 "--write-subs",
                 "--write-auto-subs",
                 "--sub-langs",
@@ -83,7 +92,7 @@ class YtDlpRunner:
                 str(active_request.url),
             ]
 
-        result, active_request = _run_with_browser_cookie_retry(metadata_command, request)
+        result, active_request = _run_with_browser_cookie_retry(metadata_command, request, self.cookie_cache_dir)
         if result.returncode != 0:
             raise YtDlpError(_friendly_error(result.stderr.strip(), active_request, "yt-dlp metadata extraction failed"))
 
@@ -125,6 +134,7 @@ class YtDlpRunner:
             return [
                 *self.command_prefix(),
                 "--skip-download",
+                "--ignore-no-formats-error",
                 "--write-subs",
                 "--write-auto-subs",
                 "--sub-langs",
@@ -140,7 +150,7 @@ class YtDlpRunner:
                 str(active_request.url),
             ]
 
-        result, active_request = _run_with_browser_cookie_retry(subtitle_command, request)
+        result, active_request = _run_with_browser_cookie_retry(subtitle_command, request, self.cookie_cache_dir)
         if result.returncode != 0:
             raise YtDlpError(_friendly_error(result.stderr.strip(), active_request, "yt-dlp subtitle extraction failed"))
 
@@ -181,7 +191,7 @@ class YtDlpRunner:
         ]
         if progress:
             progress(1, "正在准备缓存视频")
-        process = subprocess.Popen(
+        process = popen_hidden(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -229,7 +239,7 @@ class YtDlpRunner:
                 str(active_request.url),
             ]
 
-        audio_result, active_request = _run_with_browser_cookie_retry(audio_command, request)
+        audio_result, active_request = _run_with_browser_cookie_retry(audio_command, request, self.cookie_cache_dir)
         if audio_result.returncode != 0:
             raise YtDlpError(_friendly_error(audio_result.stderr.strip(), active_request, "yt-dlp audio extraction failed"))
         if progress:
@@ -264,14 +274,19 @@ class YtDlpRunner:
 def _run_with_browser_cookie_retry(
     command_builder: Callable[[ExtractRequest | DownloadRequest], list[str]],
     request: ExtractRequest | DownloadRequest,
+    cookie_cache_dir: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], ExtractRequest | DownloadRequest]:
-    result = subprocess.run(command_builder(request), capture_output=True, text=True, check=False)
+    active_request = _request_with_browser_cookie_cache(request, cookie_cache_dir)
+    result = run_hidden(command_builder(active_request), capture_output=True, text=True, check=False)
     if request.mode != "browser" or result.returncode == 0:
-        return result, request
+        return result, active_request
 
+    cookie_error_result: subprocess.CompletedProcess[str] | None = None
+    cookie_error_request: ExtractRequest | DownloadRequest | None = None
     if _looks_like_login_required(result.stderr):
         for profile_request in _browser_cookie_profile_retry_requests(request):
-            profile_result = subprocess.run(
+            profile_request = _request_with_browser_cookie_cache(profile_request, cookie_cache_dir)
+            profile_result = run_hidden(
                 command_builder(profile_request),
                 capture_output=True,
                 text=True,
@@ -279,15 +294,87 @@ def _run_with_browser_cookie_retry(
             )
             if profile_result.returncode == 0:
                 return profile_result, profile_request
+            if _looks_like_cookie_database_copy_error(profile_result.stderr) and cookie_error_result is None:
+                cookie_error_result = profile_result
+                cookie_error_request = profile_request
 
-    if not _looks_like_cookie_database_copy_error(result.stderr):
-        return result, request
+    for cached_request in _cached_cookie_retry_requests(request, cookie_cache_dir):
+        cached_result = run_hidden(
+            command_builder(cached_request),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if cached_result.returncode == 0:
+            return cached_result, cached_request
+
+    if not _looks_like_cookie_database_copy_error(result.stderr) and cookie_error_result is None:
+        return result, active_request
 
     retry_request = request.model_copy(update={"mode": "normal"})
-    retry_result = subprocess.run(command_builder(retry_request), capture_output=True, text=True, check=False)
+    retry_result = run_hidden(command_builder(retry_request), capture_output=True, text=True, check=False)
     if retry_result.returncode == 0:
         return retry_result, retry_request
-    return result, request
+    if cookie_error_result is not None and cookie_error_request is not None:
+        return cookie_error_result, cookie_error_request
+    return result, active_request
+
+
+def _request_with_browser_cookie_cache(
+    request: ExtractRequest | DownloadRequest,
+    cookie_cache_dir: Path | None,
+) -> ExtractRequest | DownloadRequest:
+    if request.mode != "browser" or request.cookies_path or cookie_cache_dir is None:
+        return request
+    cache_path = _browser_cookie_cache_path(cookie_cache_dir, (request.browser or "chrome").strip() or "chrome")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_cookie_cache_file(cache_path)
+    return request.model_copy(update={"cookies_path": str(cache_path)})
+
+
+def _cached_cookie_retry_requests(
+    request: ExtractRequest | DownloadRequest,
+    cookie_cache_dir: Path | None,
+) -> list[ExtractRequest | DownloadRequest]:
+    if request.mode != "browser" or cookie_cache_dir is None:
+        return []
+    sources = [(request.browser or "chrome").strip() or "chrome"]
+    sources.extend(
+        profile.browser
+        for profile in _browser_cookie_profile_retry_requests(request)
+        if profile.browser not in sources
+    )
+    cached: list[ExtractRequest | DownloadRequest] = []
+    for source in sources:
+        cache_path = _browser_cookie_cache_path(cookie_cache_dir, source)
+        if _has_cookie_rows(cache_path):
+            cached.append(request.model_copy(update={"mode": "cookies", "cookies_path": str(cache_path)}))
+    return cached
+
+
+def _browser_cookie_cache_path(cookie_cache_dir: Path, browser_source: str) -> Path:
+    safe_source = re.sub(r"[^A-Za-z0-9_.-]+", "-", browser_source).strip(".-") or "browser"
+    return cookie_cache_dir / f"{safe_source}.cookies.txt"
+
+
+def _ensure_cookie_cache_file(cache_path: Path) -> None:
+    if cache_path.exists():
+        return
+    cache_path.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    try:
+        cache_path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _has_cookie_rows(cache_path: Path) -> bool:
+    if not cache_path.exists():
+        return False
+    try:
+        with cache_path.open("r", encoding="utf-8", errors="replace") as handle:
+            return any(line.strip() and not line.lstrip().startswith("#") for line in handle)
+    except OSError:
+        return False
 
 
 def _looks_like_cookie_database_copy_error(message: str) -> bool:
@@ -659,7 +746,7 @@ def _extract_audio_file(video_path: Path, target_dir: Path, item_id: str) -> Pat
         "16000",
         str(audio_file),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = run_hidden(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0 or not audio_file.exists():
         raise YtDlpError(result.stderr.strip() or "ffmpeg failed to extract local video audio")
     return audio_file
@@ -690,7 +777,7 @@ def _run_whisper_asr(
         asr_cmd.extend(["--language", _whisper_language(language)])
     if progress:
         progress(40, "本地 ASR 正在转写音频")
-    asr_process = subprocess.Popen(asr_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    asr_process = popen_hidden(asr_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     started_at = time.monotonic()
     stdout = ""
     stderr = ""
@@ -728,7 +815,7 @@ def _media_duration(path: Path) -> float:
         str(path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = run_hidden(cmd, capture_output=True, text=True, check=False)
     except FileNotFoundError:
         return 0.0
     if result.returncode != 0:

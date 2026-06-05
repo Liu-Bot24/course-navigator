@@ -148,9 +148,14 @@ pub fn api_command(config: &LauncherConfig) -> RuntimeCommand {
             ],
         }
     } else {
+        let command = shell_command_with_bundled_tool_paths(&format!(
+            "exec uv run uvicorn course_navigator.app:app --app-dir backend --host {} --port {}",
+            shell_quote(&config.api_host),
+            config.api_port
+        ));
         RuntimeCommand {
             program: LOGIN_SHELL_PATH.into(),
-            args: vec!["-lic".into(), format!("exec uv run uvicorn course_navigator.app:app --app-dir backend --host {} --port {}", shell_quote(&config.api_host), config.api_port)],
+            args: vec!["-lic".into(), command],
         }
     }
 }
@@ -170,16 +175,14 @@ pub fn web_command(config: &LauncherConfig) -> RuntimeCommand {
             ],
         }
     } else {
+        let command = shell_command_with_bundled_tool_paths(&format!(
+            "exec npm run dev -- --host {} --port {}",
+            shell_quote(&config.web_host),
+            config.web_port
+        ));
         RuntimeCommand {
             program: LOGIN_SHELL_PATH.into(),
-            args: vec![
-                "-lic".into(),
-                format!(
-                    "exec npm run dev -- --host {} --port {}",
-                    shell_quote(&config.web_host),
-                    config.web_port
-                ),
-            ],
+            args: vec!["-lic".into(), command],
         }
     }
 }
@@ -265,8 +268,8 @@ fn prepare_preferred_windows_tools() {
 #[cfg(windows)]
 fn prepare_latest_windows_tools() -> Result<(), String> {
     let mut errors = Vec::new();
-    if windows_tool_program("ffmpeg").is_none()
-        || windows_tool_program("ffprobe").is_none()
+    if bundled_tool_program("ffmpeg").is_none()
+        || bundled_tool_program("ffprobe").is_none()
     {
         if let Err(error) = download_latest_media_tools() {
             errors.push(format!("ffmpeg / ffprobe 更新失败: {error}"));
@@ -281,8 +284,8 @@ fn prepare_latest_windows_tools() -> Result<(), String> {
 
 #[cfg(windows)]
 fn download_latest_media_tools() -> Result<(), String> {
-    let target_dir = installed_windows_tools_root().join("ffmpeg");
-    let temp_root = installed_windows_tools_root()
+    let target_dir = installed_tools_root().join("ffmpeg");
+    let temp_root = installed_tools_root()
         .join(".tmp")
         .join(unique_temp_name("ffmpeg"));
     let zip_path = temp_root.join("ffmpeg-release-essentials.zip");
@@ -876,12 +879,12 @@ fn windows_taskkill_args(pid: u32, _signal: StopSignal) -> Vec<String> {
 }
 
 fn command_exists(name: &str) -> bool {
-    if windows_tool_program(name).is_some() {
+    if bundled_tool_program(name).is_some() {
         return true;
     }
     if cfg!(windows) {
         hidden_command("cmd")
-            .args(["/C", "where", windows_command_name(name)])
+            .args(["/C", "where", tool_command_name(name)])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -890,7 +893,9 @@ fn command_exists(name: &str) -> bool {
     } else {
         hidden_command(LOGIN_SHELL_PATH)
             .arg("-lic")
-            .arg(format!("command -v {name} >/dev/null 2>&1"))
+            .arg(shell_command_with_bundled_tool_paths(&format!(
+                "command -v {name} >/dev/null 2>&1"
+            )))
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
@@ -945,7 +950,10 @@ fn setup_uv_command() -> RuntimeCommand {
     } else {
         RuntimeCommand {
             program: LOGIN_SHELL_PATH.into(),
-            args: vec!["-lic".into(), "uv sync".into()],
+            args: vec![
+                "-lic".into(),
+                shell_command_with_bundled_tool_paths("uv sync"),
+            ],
         }
     }
 }
@@ -966,7 +974,9 @@ fn setup_npm_command(project_root: &Path) -> RuntimeCommand {
             program: LOGIN_SHELL_PATH.into(),
             args: vec![
                 "-lic".into(),
-                "if [ -f package-lock.json ]; then npm ci; else npm install; fi".into(),
+                shell_command_with_bundled_tool_paths(
+                    "if [ -f package-lock.json ]; then npm ci; else npm install; fi",
+                ),
             ],
         }
     }
@@ -994,8 +1004,10 @@ fn node_version() -> Option<String> {
         command.args(["-p", "process.versions.node"]);
         command
     } else {
+        let version_command =
+            shell_command_with_bundled_tool_paths("node -p \"process.versions.node\"");
         let mut command = hidden_command(LOGIN_SHELL_PATH);
-        command.args(["-lic", "node -p \"process.versions.node\""]);
+        command.args(["-lic", &version_command]);
         command
     };
     let output = command.output().ok()?;
@@ -1010,13 +1022,17 @@ fn node_version() -> Option<String> {
     }
 }
 
-fn windows_command_name(name: &str) -> &str {
-    match name {
-        "npm" => "npm.cmd",
-        "uv" => "uv.exe",
-        "ffmpeg" => "ffmpeg.exe",
-        "ffprobe" => "ffprobe.exe",
-        other => other,
+fn tool_command_name(name: &str) -> &str {
+    if cfg!(windows) {
+        match name {
+            "npm" => "npm.cmd",
+            "uv" => "uv.exe",
+            "ffmpeg" => "ffmpeg.exe",
+            "ffprobe" => "ffprobe.exe",
+            other => other,
+        }
+    } else {
+        name
     }
 }
 
@@ -1132,7 +1148,7 @@ fn set_hidden_window(command: &mut Command) {
 fn set_hidden_window(_command: &mut Command) {}
 
 fn prepend_bundled_tool_paths(command: &mut Command) {
-    let tool_paths = windows_tool_paths();
+    let tool_paths = bundled_tool_paths();
     if tool_paths.is_empty() {
         return;
     }
@@ -1146,52 +1162,79 @@ fn prepend_bundled_tool_paths(command: &mut Command) {
     }
 }
 
-#[cfg(windows)]
-fn windows_tool_paths() -> Vec<PathBuf> {
+fn bundled_tool_paths() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(root) = bundled_windows_tools_root() {
+    if let Some(root) = bundled_tools_root() {
         roots.push(root);
     }
-    roots.push(installed_windows_tools_root());
-    ["node", "uv", "ffmpeg"]
+    roots.push(installed_tools_root());
+    roots
         .into_iter()
-        .flat_map(|name| roots.iter().map(move |root| root.join(name)))
+        .flat_map(|root| tool_path_entries_from_root(&root))
         .filter(|path| path.exists())
         .collect()
 }
 
-#[cfg(not(windows))]
-fn windows_tool_paths() -> Vec<PathBuf> {
-    Vec::new()
+fn tool_path_entries_from_root(root: &Path) -> Vec<PathBuf> {
+    if cfg!(windows) {
+        ["node", "uv", "ffmpeg"]
+            .into_iter()
+            .map(|name| root.join(name))
+            .collect()
+    } else {
+        vec![
+            root.join("node").join("bin"),
+            root.join("uv"),
+            root.join("ffmpeg"),
+        ]
+    }
 }
 
-#[cfg(windows)]
-fn windows_tool_program(name: &str) -> Option<PathBuf> {
-    let executable = windows_command_name(name);
-    windows_tool_paths()
+fn bundled_tool_program(name: &str) -> Option<PathBuf> {
+    let executable = tool_command_name(name);
+    bundled_tool_paths()
         .into_iter()
         .map(|dir| dir.join(executable))
         .find(|path| path.exists())
 }
 
-#[cfg(not(windows))]
-fn windows_tool_program(_name: &str) -> Option<PathBuf> {
-    None
+fn bundled_tools_root() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    bundled_tools_root_from_exe(&exe, platform_tool_dir())
 }
 
-#[cfg(windows)]
-fn bundled_windows_tools_root() -> Option<PathBuf> {
-    env::current_exe()
-        .ok()?
-        .parent()
-        .map(|dir| dir.join("runtime-tools").join("windows"))
+fn bundled_tools_root_from_exe(exe: &Path, platform_dir: &str) -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        exe.parent()?
+            .parent()
+            .map(|contents_dir| {
+                contents_dir
+                    .join("Resources")
+                    .join("runtime-tools")
+                    .join(platform_dir)
+            })
+    } else {
+        exe.parent()
+            .map(|dir| dir.join("runtime-tools").join(platform_dir))
+    }
 }
 
-#[cfg(windows)]
-fn installed_windows_tools_root() -> PathBuf {
+fn installed_tools_root() -> PathBuf {
     crate::config::application_support_dir()
         .join("runtime-tools")
-        .join("windows")
+        .join(platform_tool_dir())
+}
+
+fn platform_tool_dir() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "darwin-arm64"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "darwin-x64"
+    } else {
+        "unix"
+    }
 }
 
 #[cfg(unix)]
@@ -1206,6 +1249,28 @@ fn set_service_process_group(_command: &mut Command) {}
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(not(windows))]
+fn shell_command_with_bundled_tool_paths(command: &str) -> String {
+    shell_command_with_tool_paths(command, &bundled_tool_paths())
+}
+
+#[cfg(windows)]
+fn shell_command_with_bundled_tool_paths(command: &str) -> String {
+    command.to_string()
+}
+
+fn shell_command_with_tool_paths(command: &str, paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return command.to_string();
+    }
+    let joined = paths
+        .iter()
+        .map(|path| shell_quote(&path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(":");
+    format!("export PATH={joined}:$PATH; {command}")
 }
 
 pub fn endpoint_listening(host: &str, port: u16) -> bool {
@@ -1327,6 +1392,20 @@ mod tests {
     fn shell_quote_wraps_values_for_login_shell_commands() {
         assert_eq!(shell_quote("127.0.0.1"), "'127.0.0.1'");
         assert_eq!(shell_quote("can't"), "'can'\\''t'");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn login_shell_commands_can_pin_bundled_tool_paths() {
+        let paths = vec![
+            PathBuf::from("/Applications/Course Navigator.app/Contents/Resources/runtime-tools/darwin-arm64/node/bin"),
+            PathBuf::from("/Applications/Course Navigator.app/Contents/Resources/runtime-tools/darwin-arm64/uv"),
+        ];
+
+        assert_eq!(
+            shell_command_with_tool_paths("exec uv run uvicorn", &paths),
+            "export PATH='/Applications/Course Navigator.app/Contents/Resources/runtime-tools/darwin-arm64/node/bin':'/Applications/Course Navigator.app/Contents/Resources/runtime-tools/darwin-arm64/uv':$PATH; exec uv run uvicorn"
+        );
     }
 
     #[test]
@@ -1479,6 +1558,38 @@ mod tests {
         assert!(!node_version_supported("22.11.0"));
         assert!(node_version_supported("22.12.0"));
         assert!(node_version_supported("23.0.0"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_bundled_tools_root_uses_app_resources_dir() {
+        let exe = Path::new(
+            "/Applications/Course Navigator.app/Contents/MacOS/Course Navigator",
+        );
+
+        assert_eq!(
+            bundled_tools_root_from_exe(exe, "darwin-arm64"),
+            Some(PathBuf::from(
+                "/Applications/Course Navigator.app/Contents/Resources/runtime-tools/darwin-arm64"
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_tool_path_entries_include_portable_tool_bins() {
+        let root = Path::new(
+            "/Applications/Course Navigator.app/Contents/Resources/runtime-tools/darwin-arm64",
+        );
+
+        assert_eq!(
+            tool_path_entries_from_root(root),
+            vec![
+                root.join("node").join("bin"),
+                root.join("uv"),
+                root.join("ffmpeg"),
+            ]
+        );
     }
 
     #[test]

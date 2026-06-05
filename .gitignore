@@ -1,4 +1,5 @@
 .DS_Store
+._*
 DEVELOPMENT_LOG.md
 .env
 .env.*

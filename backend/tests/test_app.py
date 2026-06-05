@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from threading import Event
 from time import sleep
 
 from fastapi.testclient import TestClient
@@ -63,6 +64,58 @@ def test_health_route(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["ok"] is True
+
+
+def test_save_cookie_text_accepts_cookie_header(tmp_path):
+    client = make_client(tmp_path)
+
+    response = client.post(
+        "/api/cookies/text",
+        json={"text": "Cookie: SID=one; YSC=two"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["path"].endswith("manual.cookies.txt")
+    cookie_file = Path(payload["path"])
+    assert cookie_file.exists()
+    content = cookie_file.read_text(encoding="utf-8")
+    assert ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tone" in content
+    assert ".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\ttwo" in content
+
+
+def test_save_cookie_text_accepts_browser_extension_json(tmp_path):
+    client = make_client(tmp_path)
+
+    response = client.post(
+        "/api/cookies/text",
+        json={
+            "text": json.dumps(
+                [
+                    {
+                        "domain": ".youtube.com",
+                        "path": "/",
+                        "secure": True,
+                        "expirationDate": 1893456000,
+                        "name": "SID",
+                        "value": "json-value",
+                    }
+                ]
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    content = Path(response.json()["path"]).read_text(encoding="utf-8")
+    assert ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tjson-value" in content
+
+
+def test_save_cookie_text_rejects_unusable_cookie_text(tmp_path):
+    client = make_client(tmp_path)
+
+    response = client.post("/api/cookies/text", json={"text": "not a cookie"})
+
+    assert response.status_code == 400
 
 
 def test_extract_route_saves_course_item(tmp_path):
@@ -861,7 +914,7 @@ def test_preview_route_preserves_existing_transcript_and_cache(tmp_path):
     assert payload["local_video_path"].endswith("abc123.mp4")
 
 
-def test_extract_route_saves_item_when_subtitles_are_unavailable(tmp_path):
+def test_extract_route_fails_when_subtitles_and_asr_are_unavailable(tmp_path):
     class NoSubtitleRunner(FakeRunner):
         def fetch_metadata(self, request):
             metadata = super().fetch_metadata(request)
@@ -877,11 +930,39 @@ def test_extract_route_saves_item_when_subtitles_are_unavailable(tmp_path):
         json={"url": "https://learn.deeplearning.ai/courses/example", "mode": "normal"},
     )
 
+    assert response.status_code == 400
+    assert "站方字幕不可用" in response.json()["detail"]
+    assert "字幕兜底失败" in response.json()["detail"]
+
+
+def test_extract_job_fails_when_source_first_fallback_returns_no_transcript(tmp_path):
+    class NoSubtitleRunner(FakeRunner):
+        def fetch_metadata(self, request):
+            metadata = super().fetch_metadata(request)
+            return metadata.model_copy(update={"subtitles": [], "automatic_captions": []})
+
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise YtDlpError("yt-dlp did not produce a subtitle file")
+
+    client = make_client(tmp_path, runner=NoSubtitleRunner())
+
+    response = client.post(
+        "/api/extract-jobs",
+        json={"url": "https://learn.deeplearning.ai/courses/example", "mode": "normal"},
+    )
+
     assert response.status_code == 200
+    job_id = response.json()["job_id"]
     payload = response.json()
-    assert payload["id"] == "abc123"
-    assert payload["transcript"] == []
-    assert payload["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "failed"
+    assert "字幕兜底失败" in payload["error"]
+    assert client.get("/api/items/abc123").status_code == 404
 
 
 def test_extract_route_falls_back_to_asr_when_subtitles_are_unavailable(tmp_path):
@@ -907,6 +988,50 @@ def test_extract_route_falls_back_to_asr_when_subtitles_are_unavailable(tmp_path
     payload = response.json()
     assert payload["transcript_source"] == "asr"
     assert payload["transcript"][0]["text"] == "ASR transcript line."
+
+
+def test_extract_route_source_first_falls_back_to_online_asr_when_configured(tmp_path, monkeypatch):
+    class SourceFirstOnlineFallbackRunner(FakeRunner):
+        def fetch_metadata(self, request):
+            metadata = super().fetch_metadata(request)
+            return metadata.model_copy(update={"subtitles": [], "automatic_captions": [], "language": "en"})
+
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise YtDlpError("yt-dlp did not produce a subtitle file")
+
+        def extract_asr(self, request, target_dir: Path, item_id: str):
+            raise AssertionError("local ASR should not run before configured online ASR")
+
+    captured = {}
+
+    def fake_online_asr(request, target_dir, item_id, yt_dlp_binary, settings):
+        captured["provider"] = settings.provider
+        captured["language"] = request.language
+        return [TranscriptSegment(start=0, end=3, text="Online fallback line.")]
+
+    monkeypatch.setattr("course_navigator.app.extract_online_asr_transcript", fake_online_asr)
+    client = make_client(
+        tmp_path,
+        runner=SourceFirstOnlineFallbackRunner(),
+        settings=Settings(
+            data_dir=tmp_path,
+            online_asr=OnlineAsrSettings(
+                provider="xai",
+                xai={"api_key": "xai-test"},
+            ),
+        ),
+    )
+
+    response = client.post(
+        "/api/extract",
+        json={"url": "https://learn.deeplearning.ai/courses/example", "mode": "normal"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["transcript_source"] == "online_asr"
+    assert payload["transcript"][0]["text"] == "Online fallback line."
+    assert captured == {"provider": "xai", "language": "en"}
 
 
 def test_extract_route_does_not_fall_back_to_asr_when_source_subtitles_are_advertised(tmp_path):
@@ -1489,6 +1614,83 @@ def test_study_job_full_failure_restores_existing_study_after_partial_save(tmp_p
     study = client.get("/api/items/abc123").json()["study"]
     assert study["one_line"] == "已有导览"
     assert study["high_fidelity_text"] == "已有详解"
+
+
+def test_study_jobs_for_same_course_run_serially_without_old_failure_overwriting_new_success(tmp_path, monkeypatch):
+    first_started = Event()
+    release_first = Event()
+    calls: list[int] = []
+
+    def generate_with_first_failure(**kwargs):
+        calls.append(len(calls) + 1)
+        if calls[-1] == 1:
+            kwargs["partial_study"](
+                StudyMaterial(
+                    one_line="第一条临时导览",
+                    time_map=[],
+                    outline=[],
+                    detailed_notes="第一条临时解读",
+                    high_fidelity_text="第一条临时详解",
+                )
+            )
+            first_started.set()
+            assert release_first.wait(2)
+            raise RuntimeError("first job failed late")
+        return StudyMaterial(
+            one_line="第二条成功导览",
+            time_map=[],
+            outline=[],
+            detailed_notes="第二条成功解读",
+            high_fidelity_text="第二条成功详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", generate_with_first_failure)
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            llm_base_url="https://example.test/v1",
+            llm_api_key="sk-test",
+            llm_model="test-model",
+        ),
+    )
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    item = CourseLibrary(tmp_path).get("abc123")
+    assert item is not None
+    item.study = StudyMaterial(
+        one_line="原始导览",
+        time_map=[],
+        outline=[],
+        detailed_notes="原始解读",
+        high_fidelity_text="原始详解",
+    )
+    CourseLibrary(tmp_path).save(item)
+
+    first = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "all"}).json()
+    assert first_started.wait(2)
+    second = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "all"}).json()
+    sleep(0.05)
+    assert client.get(f"/api/jobs/{second['job_id']}").json()["status"] == "queued"
+    release_first.set()
+
+    payloads = {}
+    for job in (first, second):
+        payload = job
+        for _ in range(50):
+            payload = client.get(f"/api/jobs/{job['job_id']}").json()
+            if payload["status"] in {"succeeded", "failed"}:
+                break
+            sleep(0.02)
+        payloads[job["job_id"]] = payload
+
+    assert payloads[first["job_id"]]["status"] == "failed"
+    assert payloads[second["job_id"]]["status"] == "succeeded"
+    study = client.get("/api/items/abc123").json()["study"]
+    assert study["one_line"] == "第二条成功导览"
+    assert study["high_fidelity_text"] == "第二条成功详解"
 
 
 def test_translation_job_writes_translated_transcript(tmp_path, monkeypatch):
@@ -2369,7 +2571,7 @@ def test_pick_local_video_paths_uses_windows_file_dialog(monkeypatch):
         stdout = "C:\\Users\\LQ\\Videos\\First Lesson.mp4\r\nD:\\Course\\Second.webm\r\n"
         stderr = ""
 
-    def fake_run(cmd, capture_output, text, check):
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
         calls.append(cmd)
         return Result()
 
@@ -2382,6 +2584,7 @@ def test_pick_local_video_paths_uses_windows_file_dialog(monkeypatch):
     assert calls[0][:4] == ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy"]
     assert "$dialog.Multiselect = $true" in calls[0][-1]
     assert "System.Windows.Forms.OpenFileDialog" in calls[0][-1]
+    assert "SetProcessDpiAwarenessContext" in calls[0][-1]
     assert "$owner.TopMost = $true" in calls[0][-1]
     assert "$dialog.ShowDialog($owner)" in calls[0][-1]
 
@@ -2581,6 +2784,72 @@ def test_local_video_extract_job_runs_asr_from_workspace_file(tmp_path):
     assert item["transcript"][0]["text"] == "Local transcript"
 
 
+def test_local_video_extract_job_source_first_falls_back_to_local_asr_when_online_is_disabled(tmp_path):
+    client = make_client(tmp_path, runner=FakeLocalVideoRunner())
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    ).json()
+
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": imported["source_url"],
+            "mode": "normal",
+            "subtitle_source": "subtitles",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    item = client.get("/api/items/Local-Lesson").json()
+    assert item["transcript_source"] == "asr"
+    assert item["transcript"][0]["text"] == "Local transcript"
+
+
+def test_local_video_extract_job_source_first_fails_when_asr_fallback_fails(tmp_path):
+    class FailingLocalAsrRunner(FakeLocalVideoRunner):
+        def extract_asr_from_file(self, video_path: Path, target_dir: Path, item_id: str, language: str = "auto", progress=None):
+            raise YtDlpError("local ASR engine unavailable")
+
+    client = make_client(tmp_path, runner=FailingLocalAsrRunner())
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    ).json()
+
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": imported["source_url"],
+            "mode": "normal",
+            "subtitle_source": "subtitles",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "failed"
+    assert "字幕兜底失败" in payload["error"]
+    item = client.get("/api/items/Local-Lesson").json()
+    assert item["transcript"] == []
+
+
 def test_external_video_route_serves_linked_file(tmp_path):
     source = tmp_path / "NAS Lesson.mp4"
     source.write_bytes(b"external video")
@@ -2594,6 +2863,36 @@ def test_external_video_route_serves_linked_file(tmp_path):
 
     assert response.status_code == 200
     assert response.content == b"external video"
+
+
+def test_external_video_path_is_not_rewritten_to_workspace_file_with_same_name(tmp_path):
+    source = tmp_path / "nas" / "Lesson.mp4"
+    source.parent.mkdir()
+    source.write_bytes(b"external video")
+    workspace_dir = tmp_path / "workspace"
+    downloads_dir = workspace_dir / "downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "Lesson.mp4").write_bytes(b"workspace video")
+    library = CourseLibrary(workspace_dir)
+    library.save(
+        CourseItem(
+            id="linked-lesson",
+            source_url="external-video://linked-lesson",
+            title="Linked Lesson",
+            created_at="2026-05-03T00:00:00Z",
+            transcript=[],
+            local_video_path=source,
+            video_source_type="external",
+        )
+    )
+
+    client = make_client(tmp_path / "process", workspace_dir=workspace_dir, runner=FakeLocalVideoRunner())
+    item = client.get("/api/items/linked-lesson").json()
+    video = client.get("/api/items/linked-lesson/video")
+
+    assert Path(item["local_video_path"]).resolve() == source.resolve()
+    assert video.status_code == 200
+    assert video.content == b"external video"
 
 
 def test_delete_external_video_course_keeps_original_file(tmp_path):
@@ -2688,6 +2987,59 @@ def test_local_video_extract_job_supports_online_asr_from_workspace_file(tmp_pat
     assert item["transcript"][0]["text"] == "Online transcript"
     assert captured["source_video_path"].name == "Local-Lesson.mp4"
     assert captured["yt_dlp_binary"] is None
+
+
+def test_local_video_extract_job_source_first_falls_back_to_online_asr_when_configured(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_online_asr(request, transcript_dir, item_id, yt_dlp_binary, settings, source_video_path=None, progress=None):
+        captured["source_video_path"] = source_video_path
+        captured["provider"] = settings.provider
+        if progress:
+            progress(45, "正在请求在线 ASR")
+        return [TranscriptSegment(start=0, end=2, text="Online fallback transcript")]
+
+    monkeypatch.setattr(app_module, "extract_online_asr_transcript", fake_online_asr)
+    client = make_client(
+        tmp_path,
+        runner=FakeLocalVideoRunner(),
+        settings=Settings(
+            data_dir=tmp_path,
+            online_asr=OnlineAsrSettings(
+                provider="xai",
+                xai={"api_key": "xai-test"},
+            ),
+        ),
+    )
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    ).json()
+
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": imported["source_url"],
+            "mode": "normal",
+            "subtitle_source": "subtitles",
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    item = client.get("/api/items/Local-Lesson").json()
+    assert item["transcript_source"] == "online_asr"
+    assert item["transcript"][0]["text"] == "Online fallback transcript"
+    assert captured["source_video_path"].name == "Local-Lesson.mp4"
+    assert captured["provider"] == "xai"
 
 
 def test_local_video_download_route_rejects_recaching(tmp_path):

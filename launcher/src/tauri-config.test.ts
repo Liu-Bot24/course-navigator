@@ -53,6 +53,17 @@ describe("Tauri app shell", () => {
     expect(config.bundle.windows?.nsis?.installerHooks).toBe("windows/installer-hooks.nsh");
   });
 
+  it("uses the macOS template tray icon only on macOS and the product icon elsewhere", async () => {
+    const libSource = await import("../src-tauri/src/lib.rs?raw").then((module) => module.default as string);
+
+    expect(libSource).toContain("platform_tray_icon()");
+    expect(libSource).toContain('icon_as_template(cfg!(target_os = "macos"))');
+    expect(libSource).toContain('#[cfg(target_os = "macos")]');
+    expect(libSource).toContain('include_bytes!("../icons/tray-book.png")');
+    expect(libSource).toContain("#[cfg(not(target_os = \"macos\"))]");
+    expect(libSource).toContain('include_bytes!("../icons/icon.png")');
+  });
+
   it("stops only Course Navigator-owned Windows processes before overwriting bundled tools", async () => {
     const hooks = await readFile(resolve(testDir, "../src-tauri/windows/installer-hooks.nsh"), "utf-8");
 
@@ -101,11 +112,51 @@ describe("Tauri app shell", () => {
     expect(prepareScript).not.toContain("yt-dlp.exe");
     expect(prepareScript).toContain("ffmpeg-release-essentials");
     expect(prepareScript).toContain("ffprobe.exe");
-    expect(runtimeSource).toContain("windows_tool_program");
+    expect(runtimeSource).toContain("bundled_tool_program");
     expect(runtimeSource).toContain("runtime-tools");
     expect(runtimeSource).toContain("prepend_bundled_tool_paths");
     expect(runtimeSource).not.toContain('"ytdlp"');
     expect(runtimeSource).toContain('"ffmpeg"');
+  });
+
+  it("bundles macOS runtime tools for direct DMG installs", async () => {
+    const prepareScript = await readFile(resolve(testDir, "../../scripts/prepare-runtime-source.mjs"), "utf-8");
+    const runtimeSource = await import("../src-tauri/src/runtime.rs?raw").then((module) => module.default as string);
+
+    expect(prepareScript).toContain("prepareMacRuntimeTools");
+    expect(prepareScript).toContain("pruneMacNodeRuntime");
+    expect(prepareScript).toContain("writeMacNodeCliWrappers");
+    expect(prepareScript).toContain("node-${nodeVersion}-darwin-${arch}.tar.gz");
+    expect(prepareScript).toContain("uv-aarch64-apple-darwin.tar.gz");
+    expect(prepareScript).toContain("ffmpeg-ffprobe-static");
+    const wrapperFunction = prepareScript.slice(
+      prepareScript.indexOf("async function writeMacNodeCliWrappers"),
+      prepareScript.indexOf("async function copyExecutable"),
+    );
+    expect(wrapperFunction).toContain("await fs.rm(target, { force: true });");
+    expect(wrapperFunction.indexOf("await fs.rm(target")).toBeLessThan(wrapperFunction.indexOf("await fs.writeFile(target"));
+    expect(runtimeSource).toContain("darwin-arm64");
+    expect(runtimeSource).toContain("Contents");
+    expect(runtimeSource).toContain("Resources");
+  });
+
+  it("sizes the macOS DMG from the built app instead of a fixed capacity", async () => {
+    const dmgScript = await readFile(resolve(testDir, "../../scripts/build-mac-dmg.sh"), "utf-8");
+
+    expect(dmgScript).toContain('du -sk "$APP_PATH"');
+    expect(dmgScript).toContain("DMG_SIZE_MB");
+    expect(dmgScript).toContain('-size "${DMG_SIZE_MB}m"');
+    expect(dmgScript).not.toContain("-size 160m");
+  });
+
+  it("does not force Homebrew formula dependencies for the self-contained macOS app", async () => {
+    const cask = await readFile(resolve(testDir, "../../Casks/course-navigator.rb"), "utf-8");
+
+    expect(cask).toContain("depends_on arch: :arm64");
+    expect(cask).not.toContain('depends_on formula: "node"');
+    expect(cask).not.toContain('depends_on formula: "python@3.11"');
+    expect(cask).not.toContain('depends_on formula: "uv"');
+    expect(cask).not.toContain('depends_on formula: "ffmpeg"');
   });
 
   it("keeps local collaboration notes out of packaged runtime source", async () => {

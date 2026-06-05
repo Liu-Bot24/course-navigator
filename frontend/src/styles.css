@@ -157,7 +157,7 @@ button:disabled {
 
 .url-form {
   display: grid;
-  grid-template-columns: 38px minmax(72px, 1fr) 38px 112px 78px 108px 72px 72px 104px 108px;
+  grid-template-columns: 38px minmax(72px, 1fr) 38px 112px 156px 108px 72px 72px 104px 108px;
   gap: 5px;
   align-items: center;
 }
@@ -188,6 +188,28 @@ button:disabled {
 
 .auth-source-placeholder {
   height: 38px;
+}
+
+.auth-cookie-field {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  gap: 5px;
+  align-items: center;
+}
+
+.url-form .cookie-text-button {
+  width: 38px;
+  border: 1px solid #cfd6e2;
+  background: #ffffff;
+  color: #344054;
+  padding: 0;
+}
+
+.url-form .cookie-text-button:hover:not(:disabled) {
+  border-color: #2454d6;
+  background: #eef3ff;
+  color: #153ea8;
 }
 
 .control-field {
@@ -782,6 +804,42 @@ button:disabled {
 
 .video-import-modal {
   width: min(560px, 100%);
+}
+
+.cookie-text-modal {
+  width: min(620px, 100%);
+}
+
+.cookie-text-form {
+  display: grid;
+  gap: 12px;
+}
+
+.cookie-text-form label {
+  display: grid;
+  gap: 6px;
+  color: #344054;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.cookie-text-form textarea {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  border: 1px solid #cfd6e2;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #111827;
+  padding: 10px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.cookie-text-form textarea:focus {
+  outline: 2px solid #2454d6;
+  outline-offset: 1px;
 }
 
 .video-import-options {
@@ -4090,7 +4148,7 @@ body.is-resizing-layout {
   }
 
   .url-form {
-    grid-template-columns: 38px minmax(104px, 1fr) 38px 92px 82px 86px 74px 74px 100px 100px;
+    grid-template-columns: 38px minmax(104px, 1fr) 38px 92px 140px 86px 74px 74px 100px 100px;
     gap: 6px;
   }
 

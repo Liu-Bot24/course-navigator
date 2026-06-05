@@ -32,6 +32,7 @@ from .config import (
     Settings,
     load_settings,
 )
+from .cookies import normalize_cookie_text
 from .library import CourseLibrary
 from .models import (
     AsrCacheCleanupResponse,
@@ -41,6 +42,8 @@ from .models import (
     CourseImportResponse,
     CourseItemUpdate,
     CourseSharePackage,
+    CookieTextRequest,
+    CookieTextResponse,
     AsrCorrectionRequest,
     AsrCorrectionResult,
     AsrCorrectionSearchConfig,
@@ -73,6 +76,7 @@ from .models import (
     VideoSourceBindingRequest,
 )
 from .online_asr import extract_online_asr_transcript
+from .processes import run_hidden
 from .ytdlp import YtDlpError, YtDlpRunner, is_subtitle_unavailable_error
 
 logger = logging.getLogger("course_navigator.app")
@@ -107,7 +111,7 @@ def create_app(
     _normalize_library_video_paths(library, active_workspace_dir)
     _backfill_video_source_types(library, active_workspace_dir)
     _backfill_study_guidance_fields(library)
-    ytdlp_runner = runner or YtDlpRunner()
+    ytdlp_runner = runner or YtDlpRunner(cookie_cache_dir=active_data_dir / "cookies")
     _backfill_local_video_items(library, active_workspace_dir, ytdlp_runner)
     jobs: dict[str, StudyJobStatus] = {}
     asr_results: dict[str, AsrCorrectionResult] = {}
@@ -115,6 +119,8 @@ def create_app(
     asr_results_lock = Lock()
     deleted_items: set[str] = set()
     deleted_items_lock = Lock()
+    study_item_locks: dict[str, Lock] = {}
+    study_item_locks_lock = Lock()
     study_executor = ThreadPoolExecutor(max_workers=2)
     download_executor = ThreadPoolExecutor(max_workers=1)
     extract_executor = ThreadPoolExecutor(max_workers=1)
@@ -138,6 +144,24 @@ def create_app(
     @app.get("/api/health")
     def health() -> dict[str, bool | str]:
         return {"ok": True, "name": "Course Navigator"}
+
+    @app.post("/api/cookies/text")
+    def save_cookie_text(request: CookieTextRequest) -> CookieTextResponse:
+        try:
+            normalized = normalize_cookie_text(request.text)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        cookie_path = active_data_dir / "cookies" / "manual.cookies.txt"
+        try:
+            cookie_path.parent.mkdir(parents=True, exist_ok=True)
+            cookie_path.write_text(normalized, encoding="utf-8")
+            try:
+                cookie_path.chmod(0o600)
+            except OSError:
+                pass
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"无法保存 Cookie 文件: {exc}") from exc
+        return CookieTextResponse(path=str(cookie_path))
 
     @app.get("/api/items")
     def list_items() -> list[CourseItem]:
@@ -433,8 +457,7 @@ def create_app(
         if not video_path:
             raise YtDlpError("Linked video file is unavailable" if _is_external_video_item(item) else "Local video not found")
         transcript_dir = active_data_dir / "subtitles" / item.id
-        source = request.subtitle_source if request.subtitle_source in {"asr", "online_asr"} else "asr"
-        if source == "online_asr":
+        if request.subtitle_source == "online_asr":
             transcript = _extract_online_asr_transcript_from_file(
                 video_path,
                 request,
@@ -444,7 +467,7 @@ def create_app(
                 progress,
             )
             transcript_source = "online_asr"
-        else:
+        elif request.subtitle_source == "asr":
             transcript = _extract_asr_transcript_from_file(
                 video_path,
                 request,
@@ -454,6 +477,16 @@ def create_app(
                 progress,
             )
             transcript_source = "asr"
+        else:
+            transcript, transcript_source = _extract_file_video_source_first_fallback(
+                video_path,
+                request,
+                transcript_dir,
+                item.id,
+                settings_state["value"],
+                ytdlp_runner,
+                progress,
+            )
 
         keep_existing_study = bool(_same_transcript(item.transcript, transcript))
         next_item = item.model_copy(
@@ -576,40 +609,41 @@ def create_app(
 
     @app.post("/api/items/{item_id}/study")
     def generate_study(item_id: str, request: StudyRequest | None = None) -> StudyMaterial:
-        item = library.get(item_id)
-        if not item:
-            raise HTTPException(status_code=404, detail="Course item not found")
-        output_language = request.output_language if request else "zh-CN"
-        section = request.section if request else "all"
-        detail_level = request.detail_level if request and request.detail_level else settings_state["value"].study_detail_level
-        if section == "all":
-            study = generate_study_material(
-                title=item.title,
-                transcript=item.transcript,
-                provider=settings_state["value"].provider_set,
-                output_language=output_language,
-                detail_level=detail_level,
-                existing_translation=item.study.translated_transcript if item.study else None,
-                existing_context_summary=item.study.context_summary if item.study else None,
-                existing_translated_title=item.study.translated_title if item.study else None,
-                source_language=item.metadata.language if item.metadata else None,
-                metadata=item.metadata,
-            )
-        else:
-            study = regenerate_study_section(
-                title=item.title,
-                transcript=item.transcript,
-                existing_study=item.study,
-                provider=settings_state["value"].provider_set,
-                output_language=output_language,
-                section=section,
-                detail_level=detail_level,
-                source_language=item.metadata.language if item.metadata else None,
-                metadata=item.metadata,
-            )
-        item.study = study
-        library.save(item)
-        return study
+        with _study_item_lock(item_id):
+            item = library.get(item_id)
+            if not item:
+                raise HTTPException(status_code=404, detail="Course item not found")
+            output_language = request.output_language if request else "zh-CN"
+            section = request.section if request else "all"
+            detail_level = request.detail_level if request and request.detail_level else settings_state["value"].study_detail_level
+            if section == "all":
+                study = generate_study_material(
+                    title=item.title,
+                    transcript=item.transcript,
+                    provider=settings_state["value"].provider_set,
+                    output_language=output_language,
+                    detail_level=detail_level,
+                    existing_translation=item.study.translated_transcript if item.study else None,
+                    existing_context_summary=item.study.context_summary if item.study else None,
+                    existing_translated_title=item.study.translated_title if item.study else None,
+                    source_language=item.metadata.language if item.metadata else None,
+                    metadata=item.metadata,
+                )
+            else:
+                study = regenerate_study_section(
+                    title=item.title,
+                    transcript=item.transcript,
+                    existing_study=item.study,
+                    provider=settings_state["value"].provider_set,
+                    output_language=output_language,
+                    section=section,
+                    detail_level=detail_level,
+                    source_language=item.metadata.language if item.metadata else None,
+                    metadata=item.metadata,
+                )
+            item.study = study
+            library.save(item)
+            return study
 
     @app.post("/api/items/{item_id}/study-jobs")
     def create_study_job(item_id: str, request: StudyRequest | None = None) -> StudyJobStatus:
@@ -691,8 +725,6 @@ def create_app(
             item = _file_video_item_for_request(request)
             if not item:
                 raise HTTPException(status_code=404, detail="Local video course not found")
-            if request.subtitle_source not in {"asr", "online_asr"}:
-                request = request.model_copy(update={"subtitle_source": "asr"})
             item_id = item.id
         else:
             item_id = ""
@@ -1001,7 +1033,19 @@ def create_app(
                 error=str(exc),
             )
 
+    def _study_item_lock(item_id: str) -> Lock:
+        with study_item_locks_lock:
+            lock = study_item_locks.get(item_id)
+            if lock is None:
+                lock = Lock()
+                study_item_locks[item_id] = lock
+            return lock
+
     def _run_study_job(job_id: str, item_id: str, output_language: str, section: str, detail_level: StudyDetailLevel) -> None:
+        with _study_item_lock(item_id):
+            _run_study_job_locked(job_id, item_id, output_language, section, detail_level)
+
+    def _run_study_job_locked(job_id: str, item_id: str, output_language: str, section: str, detail_level: StudyDetailLevel) -> None:
         _set_job(
             job_id,
             status="running",
@@ -1399,6 +1443,8 @@ def _copy_legacy_child_dir(source: Path, target: Path) -> None:
 
 def _normalize_library_video_paths(library: CourseLibrary, workspace_dir: Path) -> None:
     for item in library.list_items():
+        if _is_external_video_item(item):
+            continue
         normalized = _normalized_local_video_reference(workspace_dir, item)
         if normalized is not None and str(normalized) != str(item.local_video_path):
             item.local_video_path = normalized
@@ -1516,6 +1562,22 @@ def _pick_local_video_paths_with_windows_dialog(*, multiple: bool) -> list[Path]
     allow_multiple = "$true" if multiple else "$false"
     script = f"""
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class NativeDpi {{
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+  [DllImport("shcore.dll", SetLastError=true)]
+  public static extern int SetProcessDpiAwareness(int awareness);
+}}
+"@
+try {{
+  [NativeDpi]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
+}} catch {{
+  try {{ [NativeDpi]::SetProcessDpiAwareness(2) | Out-Null }} catch {{}}
+}}
+[System.Windows.Forms.Application]::EnableVisualStyles()
 $owner = New-Object System.Windows.Forms.Form
 $owner.TopMost = $true
 $owner.ShowInTaskbar = $false
@@ -1540,7 +1602,7 @@ try {{
   $owner.Dispose()
 }}
 """
-    result = subprocess.run(
+    result = run_hidden(
         ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
         capture_output=True,
         text=True,
@@ -1931,11 +1993,7 @@ def _extract_transcript_with_source(
         if _metadata_has_source_subtitles(metadata):
             raise YtDlpError("站方字幕存在，但当前访问方式没有下载到字幕；请使用浏览器模式或 cookies 重新提取。") from exc
 
-    try:
-        transcript = _extract_asr_transcript(runner, asr_request, transcript_dir, item_id, progress)
-    except YtDlpError:
-        return [], None
-    return transcript, "asr" if transcript else None
+    return _extract_source_first_asr_fallback(runner, asr_request, transcript_dir, item_id, settings, progress)
 
 
 def _request_with_metadata_language(request: ExtractRequest, metadata) -> ExtractRequest:
@@ -1954,6 +2012,98 @@ def _metadata_has_source_subtitles(metadata: VideoMetadata | None) -> bool:
         language.strip().lower() not in {"danmaku", "live_chat", "comments", "rechat"}
         for language in [*metadata.subtitles, *metadata.automatic_captions]
     )
+
+
+def _extract_source_first_asr_fallback(
+    runner: YtDlpRunner,
+    request: ExtractRequest,
+    transcript_dir: Path,
+    item_id: str,
+    settings: Settings,
+    progress: Callable[[str, int, str], None] | None = None,
+) -> tuple[list[TranscriptSegment], str | None]:
+    fallback_errors: list[str] = []
+    if _online_asr_is_available(settings.online_asr):
+        try:
+            if progress:
+                progress("online_asr", 32, "站方字幕不可用，正在切换在线 ASR")
+            transcript = _extract_online_asr_transcript(runner, request, transcript_dir, item_id, settings, progress)
+            if transcript:
+                return transcript, "online_asr"
+            fallback_errors.append("在线 ASR 没有返回字幕")
+        except YtDlpError as exc:
+            fallback_errors.append(f"在线 ASR 失败：{exc}")
+            if progress:
+                progress("asr", 39, "在线 ASR 不可用，正在切换本地 ASR")
+
+    try:
+        transcript = _extract_asr_transcript(runner, request, transcript_dir, item_id, progress)
+    except YtDlpError as exc:
+        fallback_errors.append(f"本地 ASR 失败：{exc}")
+        _raise_source_first_fallback_error("站方字幕不可用", fallback_errors)
+    if transcript:
+        return transcript, "asr"
+    fallback_errors.append("本地 ASR 没有返回字幕")
+    _raise_source_first_fallback_error("站方字幕不可用", fallback_errors)
+
+
+def _extract_file_video_source_first_fallback(
+    video_path: Path,
+    request: ExtractRequest,
+    transcript_dir: Path,
+    item_id: str,
+    settings: Settings,
+    runner: YtDlpRunner,
+    progress: Callable[[str, int, str], None] | None = None,
+) -> tuple[list[TranscriptSegment], str | None]:
+    fallback_errors: list[str] = []
+    if _online_asr_is_available(settings.online_asr):
+        try:
+            if progress:
+                progress("online_asr", 32, "本地视频无站方字幕，正在切换在线 ASR")
+            transcript = _extract_online_asr_transcript_from_file(
+                video_path,
+                request,
+                transcript_dir,
+                item_id,
+                settings,
+                progress,
+            )
+            if transcript:
+                return transcript, "online_asr"
+            fallback_errors.append("在线 ASR 没有返回字幕")
+        except YtDlpError as exc:
+            fallback_errors.append(f"在线 ASR 失败：{exc}")
+            if progress:
+                progress("asr", 39, "在线 ASR 不可用，正在切换本地 ASR")
+
+    try:
+        transcript = _extract_asr_transcript_from_file(video_path, request, transcript_dir, item_id, runner, progress)
+    except YtDlpError as exc:
+        fallback_errors.append(f"本地 ASR 失败：{exc}")
+        _raise_source_first_fallback_error("本地视频无站方字幕", fallback_errors)
+    if transcript:
+        return transcript, "asr"
+    fallback_errors.append("本地 ASR 没有返回字幕")
+    _raise_source_first_fallback_error("本地视频无站方字幕", fallback_errors)
+
+
+def _raise_source_first_fallback_error(reason: str, fallback_errors: list[str]) -> None:
+    details = "；".join(error for error in fallback_errors if error)
+    if details:
+        raise YtDlpError(f"{reason}，且字幕兜底失败：{details}")
+    raise YtDlpError(f"{reason}，且字幕兜底失败。")
+
+
+def _online_asr_is_available(settings: OnlineAsrSettings) -> bool:
+    if settings.provider == "none":
+        return False
+    service = settings.service_for(settings.provider)
+    if not service.api_key:
+        return False
+    if settings.provider == "custom" and not (service.base_url and service.model):
+        return False
+    return True
 
 
 def _extract_asr_transcript(

@@ -62,6 +62,7 @@ import {
   listItems,
   listAvailableModels,
   previewCourse,
+  saveCookieText,
   saveModelSettings,
   saveAsrSearchSettings,
   saveAsrCacheSettings,
@@ -138,6 +139,7 @@ type StudyQueueTask = {
   itemId: string;
   itemTitle: string;
   section: StudySection;
+  isInitialGeneration: boolean;
   outputLanguage: OutputLanguage;
   detailLevel: StudyMapDetailMode;
   status: StudyQueueTaskStatus;
@@ -151,7 +153,7 @@ function requestTranscriptSource(source: SubtitleSourceChoice): TranscriptSource
 }
 
 function usesBackgroundSubtitleExtraction(source: SubtitleSourceChoice): boolean {
-  return source === "asr" || source === "online_asr";
+  return source !== "local_upload";
 }
 type ModelProfileDraft = Omit<ModelProfile, "context_window" | "max_tokens"> & {
   api_key: string;
@@ -285,6 +287,12 @@ const COPY = {
     cookieSource: "Cookie 来源",
     cookieFile: "Cookie 文件",
     browserCookieHint: "chrome、safari、firefox 或 chrome:Default",
+    fillCookieText: "填写 Cookie",
+    cookieText: "Cookie 内容",
+    cookieTextHelp: "可粘贴 cookies.txt、浏览器插件导出的 JSON，或请求头里的 Cookie 内容。",
+    cookieTextPlaceholder: "Cookie: SID=...; YSC=...",
+    saveCookie: "保存 Cookie",
+    cookieSaved: "Cookie 已保存",
     interfaceLanguage: "界面",
     outputLanguage: "输出",
     displayMode: "显示模式",
@@ -354,6 +362,7 @@ const COPY = {
     modelApiKey: "API Key",
     modelConfigured: "已配置",
     modelNotConfigured: "未配置",
+    cancel: "取消",
     closeDialog: "关闭",
     closeSettings: "关闭设置",
     saveSettings: "保存档案",
@@ -642,6 +651,12 @@ const COPY = {
     cookieSource: "Cookie source",
     cookieFile: "Cookie file",
     browserCookieHint: "chrome, safari, firefox, or chrome:Default",
+    fillCookieText: "Enter Cookie",
+    cookieText: "Cookie content",
+    cookieTextHelp: "Paste cookies.txt, browser-extension JSON, or a Cookie header.",
+    cookieTextPlaceholder: "Cookie: SID=...; YSC=...",
+    saveCookie: "Save Cookie",
+    cookieSaved: "Cookie saved",
     interfaceLanguage: "Interface",
     outputLanguage: "Output",
     displayMode: "Display mode",
@@ -711,6 +726,7 @@ const COPY = {
     modelApiKey: "API Key",
     modelConfigured: "Configured",
     modelNotConfigured: "Not configured",
+    cancel: "Cancel",
     closeDialog: "Close",
     closeSettings: "Close settings",
     saveSettings: "Save profile",
@@ -1031,6 +1047,10 @@ export function App() {
   const [mode, setMode] = useState<ExtractMode>("browser");
   const [browser, setBrowser] = useState("chrome");
   const [cookiesPath, setCookiesPath] = useState("");
+  const [cookieTextModalOpen, setCookieTextModalOpen] = useState(false);
+  const [cookieText, setCookieText] = useState("");
+  const [cookieSaveBusy, setCookieSaveBusy] = useState(false);
+  const [cookieSaveMessage, setCookieSaveMessage] = useState<string | null>(null);
   const [subtitleSource, setSubtitleSource] = useState<SubtitleSourceChoice>("subtitles");
   const [uiLanguage, setUiLanguage] = useState<UiLanguage>("zh-CN");
   const [outputLanguage, setOutputLanguage] = useState<OutputLanguage>("zh-CN");
@@ -1246,6 +1266,12 @@ export function App() {
     () => groupLibraryCollections(groupedItems, manualCollectionGroups, collectionGroupOrder),
     [groupedItems, manualCollectionGroups, collectionGroupOrder],
   );
+  const topLevelCollectionKeys = useMemo(
+    () => libraryEntries
+      .filter((entry): entry is Extract<LibraryCollectionEntry, { type: "collection" }> => entry.type === "collection")
+      .map((entry) => entry.group.key),
+    [libraryEntries],
+  );
   const libraryCategoryEntries = useMemo(
     () => libraryEntries.filter((entry): entry is Extract<LibraryCollectionEntry, { type: "group" }> => entry.type === "group"),
     [libraryEntries],
@@ -1300,6 +1326,7 @@ export function App() {
       itemId: selected.id,
       itemTitle: selected.title,
       section,
+      isInitialGeneration: section === "all" && !hasStudyMaterial(selected.study ?? null),
       outputLanguage,
       detailLevel: studyMapDetailMode,
       status: "queued",
@@ -1510,6 +1537,24 @@ export function App() {
 
   function openLocalSubtitlePicker() {
     subtitleUploadInputRef.current?.click();
+  }
+
+  async function handleSaveCookieText() {
+    const nextCookieText = cookieText.trim();
+    if (!nextCookieText) return;
+    setCookieSaveBusy(true);
+    setCookieSaveMessage(null);
+    try {
+      const result = await saveCookieText(nextCookieText);
+      setCookiesPath(result.path);
+      setCookieText("");
+      setCookieSaveMessage(copy.cookieSaved);
+      setCookieTextModalOpen(false);
+    } catch (err) {
+      setCookieSaveMessage(errorMessage(err, copy.unknownError));
+    } finally {
+      setCookieSaveBusy(false);
+    }
   }
 
   async function handleLocalSubtitleFile(event: ReactChangeEvent<HTMLInputElement>) {
@@ -1775,7 +1820,7 @@ export function App() {
   }
 
   async function runStudyJob(task: StudyQueueTask) {
-    const label = studyTaskActionLabel(task.section, copy);
+    const label = studyTaskActionLabel(task, copy);
     setActiveJobKind("study");
     setBusy(`${task.itemTitle} · ${label}`);
     const firstStatus = await startStudyJob(task.itemId, task.outputLanguage, task.section, task.detailLevel);
@@ -2046,8 +2091,8 @@ export function App() {
     });
   }
 
-  function handleMoveCollection(group: LibraryCollectionGroup, direction: -1 | 1) {
-    const visibleKeys = groupedItems.map((entry) => entry.key);
+  function handleMoveCollection(group: LibraryCollectionGroup, direction: -1 | 1, siblingKeys: string[]) {
+    const visibleKeys = mergeStringKeys(siblingKeys);
     const index = visibleKeys.indexOf(group.key);
     const targetIndex = index + direction;
     if (index < 0 || targetIndex < 0 || targetIndex >= visibleKeys.length) return;
@@ -2055,8 +2100,11 @@ export function App() {
     [nextVisibleKeys[index], nextVisibleKeys[targetIndex]] = [nextVisibleKeys[targetIndex], nextVisibleKeys[index]];
     setCollectionOrder((current) => {
       const visibleSet = new Set(visibleKeys);
-      const hiddenKeys = current.filter((key) => !visibleSet.has(key));
-      const next = mergeStringKeys([...nextVisibleKeys, ...hiddenKeys]);
+      const nextSiblingQueue = [...nextVisibleKeys];
+      const next = mergeStringKeys([...current, ...visibleKeys]).map((key) => {
+        if (!visibleSet.has(key)) return key;
+        return nextSiblingQueue.shift() ?? key;
+      });
       saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, next);
       return next;
     });
@@ -2642,7 +2690,8 @@ export function App() {
     });
   }
 
-  function renderLibraryCollection(group: LibraryCollectionGroup, groupIndex: number) {
+  function renderLibraryCollection(group: LibraryCollectionGroup, siblingKeys: string[]) {
+    const groupIndex = siblingKeys.indexOf(group.key);
     const collectionCollapsed = collapsedCollectionKeys.has(group.key);
     const collectionEditing = editingCollectionKey === group.key;
     const canDeleteCollection = group.key !== collectionStorageKey("");
@@ -2732,17 +2781,17 @@ export function App() {
                   aria-label={`${copy.moveCollectionUp} ${group.title}`}
                   className="library-collection-move"
                   title={copy.moveCollectionUp}
-                  onClick={() => handleMoveCollection(group, -1)}
+                  onClick={() => handleMoveCollection(group, -1, siblingKeys)}
                 >
                   <ArrowUp size={12} />
                 </button>
               ) : <span className="library-collection-spacer" aria-hidden="true" />}
-              {groupIndex < groupedItems.length - 1 ? (
+              {groupIndex >= 0 && groupIndex < siblingKeys.length - 1 ? (
                 <button
                   aria-label={`${copy.moveCollectionDown} ${group.title}`}
                   className="library-collection-move"
                   title={copy.moveCollectionDown}
-                  onClick={() => handleMoveCollection(group, 1)}
+                  onClick={() => handleMoveCollection(group, 1, siblingKeys)}
                 >
                   <ArrowDown size={12} />
                 </button>
@@ -3079,15 +3128,29 @@ export function App() {
               />
             </label>
           ) : mode === "cookies" ? (
-            <label className="control-field auth-source-field">
-              <span>{copy.cookieFile}</span>
-              <input
-                className="path-input"
-                value={cookiesPath}
-                onChange={(event) => setCookiesPath(event.target.value)}
-                placeholder="/path/to/cookies.txt"
-              />
-            </label>
+            <div className="auth-cookie-field">
+              <label className="control-field auth-source-field">
+                <span>{copy.cookieFile}</span>
+                <input
+                  className="path-input"
+                  value={cookiesPath}
+                  onChange={(event) => setCookiesPath(event.target.value)}
+                  placeholder="/path/to/cookies.txt"
+                />
+              </label>
+              <button
+                aria-label={copy.fillCookieText}
+                className="top-icon-button cookie-text-button"
+                title={copy.fillCookieText}
+                type="button"
+                onClick={() => {
+                  setCookieSaveMessage(null);
+                  setCookieTextModalOpen(true);
+                }}
+              >
+                <FileText size={16} />
+              </button>
+            </div>
           ) : (
             <div className="auth-source-placeholder" aria-hidden="true" />
           )}
@@ -3202,6 +3265,21 @@ export function App() {
         />
       ) : null}
 
+      {cookieTextModalOpen ? (
+        <CookieTextModal
+          copy={copy}
+          busy={cookieSaveBusy}
+          message={cookieSaveMessage}
+          text={cookieText}
+          onTextChange={setCookieText}
+          onSave={() => void handleSaveCookieText()}
+          onClose={() => {
+            setCookieTextModalOpen(false);
+            setCookieSaveMessage(null);
+          }}
+        />
+      ) : null}
+
       {videoSourceModalOpen && selected ? (
         <VideoSourceModal
           copy={copy}
@@ -3272,7 +3350,7 @@ export function App() {
           {studyQueueDrawerOpen ? (
             <div className="study-queue-drawer-list">
               {visibleStudyQueueTasks.map((task) => {
-                const taskLabel = studyTaskActionLabel(task.section, copy);
+                const taskLabel = studyTaskActionLabel(task, copy);
                 return (
                   <div className={`study-queue-drawer-item ${task.status}`} key={task.id}>
                     <span className="study-queue-task-status">{studyTaskStatusLabel(task.status, copy)}</span>
@@ -3391,8 +3469,7 @@ export function App() {
             <div className="library-list">
               {libraryEntries.map((entry) => {
                 if (entry.type === "collection") {
-                  const groupIndex = groupedItems.findIndex((group) => group.key === entry.group.key);
-                  return renderLibraryCollection(entry.group, groupIndex);
+                  return renderLibraryCollection(entry.group, topLevelCollectionKeys);
                 }
                 const collectionGroupCollapsed = collapsedCollectionGroupKeys.has(entry.key);
                 const collectionGroupEmpty = entry.collections.length === 0;
@@ -3461,10 +3538,10 @@ export function App() {
                         }
                       >
                         {entry.collections.length ? (
-                          entry.collections.map((group) => {
-                            const groupIndex = groupedItems.findIndex((candidate) => candidate.key === group.key);
-                            return renderLibraryCollection(group, groupIndex);
-                          })
+                          entry.collections.map((group) => renderLibraryCollection(
+                            group,
+                            entry.collections.map((candidate) => candidate.key),
+                          ))
                         ) : (
                           <p className="empty library-empty library-node-empty library-category-empty">{copy.emptyCollectionGroup}</p>
                         )}
@@ -3715,10 +3792,10 @@ export function App() {
                 type="button"
                 onClick={handleRegenerateFullStudy}
                 disabled={studyActionBusy || !selectedHasStudy || !selected?.transcript.length}
-                title={copy.regenerateFullStudy}
+                title={selectedHasStudy ? copy.regenerateFullStudy : copy.generateStudy}
               >
                 <RefreshCcw size={13} />
-                <span>{copy.regenerateFullStudy}</span>
+                <span>{selectedHasStudy ? copy.regenerateFullStudy : copy.generateStudy}</span>
               </button>
               <div className="study-detail-control" aria-label={copy.studyMapDetailLevel}>
                 <span>{copy.studyMapDetailLevel}</span>
@@ -3807,6 +3884,67 @@ function VideoImportModal({
             <small>{copy.importVideoLinkHelp}</small>
           </button>
         </div>
+      </section>
+    </div>
+  );
+}
+
+function CookieTextModal({
+  copy,
+  busy,
+  message,
+  text,
+  onTextChange,
+  onSave,
+  onClose,
+}: {
+  copy: (typeof COPY)[UiLanguage];
+  busy: boolean;
+  message: string | null;
+  text: string;
+  onTextChange: (value: string) => void;
+  onSave: () => void;
+  onClose: () => void;
+}) {
+  function handleSubmit(event: ReactFormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onSave();
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="settings-modal cookie-text-modal" role="dialog" aria-modal="true" aria-labelledby="cookie-text-title">
+        <div className="modal-head">
+          <div>
+            <h2 id="cookie-text-title">{copy.fillCookieText}</h2>
+            <p>{copy.cookieTextHelp}</p>
+          </div>
+          <button className="icon-only" aria-label={copy.closeDialog} onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <form className="cookie-text-form" onSubmit={handleSubmit}>
+          <label>
+            <span>{copy.cookieText}</span>
+            <textarea
+              aria-label={copy.cookieText}
+              value={text}
+              onChange={(event) => onTextChange(event.target.value)}
+              placeholder={copy.cookieTextPlaceholder}
+              rows={8}
+            />
+          </label>
+          <div className="modal-actions">
+            {message ? <span>{message}</span> : null}
+            <button className="secondary-modal-action" type="button" onClick={onClose}>
+              {copy.cancel}
+            </button>
+            <button type="submit" disabled={busy || !text.trim()}>
+              {busy ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+              {copy.saveCookie}
+            </button>
+          </div>
+        </form>
       </section>
     </div>
   );
@@ -7680,8 +7818,11 @@ function regenerateLabelForTab(tab: StudySection, copy: (typeof COPY)[UiLanguage
   return copy.regenerateGuide;
 }
 
-function studyTaskActionLabel(section: StudySection, copy: (typeof COPY)[UiLanguage]): string {
-  return section === "all" ? copy.regenerateFullStudy : regenerateLabelForTab(section, copy);
+function studyTaskActionLabel(task: Pick<StudyQueueTask, "section" | "isInitialGeneration">, copy: (typeof COPY)[UiLanguage]): string {
+  if (task.section === "all") {
+    return task.isInitialGeneration ? copy.generateStudy : copy.regenerateFullStudy;
+  }
+  return regenerateLabelForTab(task.section, copy);
 }
 
 function studyTaskStatusLabel(status: StudyQueueTaskStatus, copy: (typeof COPY)[UiLanguage]): string {

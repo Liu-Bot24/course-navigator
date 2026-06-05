@@ -11,9 +11,10 @@ from typing import Any
 import httpx
 
 from .config import OnlineAsrServiceConfig, OnlineAsrSettings
-from .models import ExtractRequest, OnlineAsrProvider, TranscriptSegment
+from .models import DownloadRequest, ExtractRequest, OnlineAsrProvider, TranscriptSegment
+from .processes import run_hidden
 from .subtitles import parse_subtitle_text
-from .ytdlp import YtDlpError, build_auth_args, build_runtime_args
+from .ytdlp import YtDlpError, _friendly_error, _run_with_browser_cookie_retry, build_auth_args, build_runtime_args
 
 
 DEFAULT_CHUNK_LIMIT_BYTES = 20 * 1024 * 1024
@@ -68,20 +69,23 @@ def _yt_dlp_command_prefix(yt_dlp_binary: str | None) -> list[str]:
 
 def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_dlp_binary: str | None) -> Path:
     output_template = str(target_dir / f"{item_id}.online-source.%(ext)s")
-    cmd = [
-        *_yt_dlp_command_prefix(yt_dlp_binary),
-        "--extract-audio",
-        "--audio-format",
-        "wav",
-        "--output",
-        output_template,
-        *build_runtime_args(),
-        *build_auth_args(request),
-        str(request.url),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    def audio_command(active_request: ExtractRequest | DownloadRequest) -> list[str]:
+        return [
+            *_yt_dlp_command_prefix(yt_dlp_binary),
+            "--extract-audio",
+            "--audio-format",
+            "wav",
+            "--output",
+            output_template,
+            *build_runtime_args(),
+            *build_auth_args(active_request),
+            str(active_request.url),
+        ]
+
+    result, active_request = _run_with_browser_cookie_retry(audio_command, request)
     if result.returncode != 0:
-        raise YtDlpError(result.stderr.strip() or "yt-dlp audio extraction failed")
+        raise YtDlpError(_friendly_error(result.stderr.strip(), active_request, "yt-dlp audio extraction failed"))
     candidates = sorted(target_dir.glob(f"{item_id}.online-source.*"), key=lambda path: path.stat().st_mtime)
     if not candidates:
         raise YtDlpError("yt-dlp did not produce an audio file for online ASR")
@@ -104,7 +108,7 @@ def _extract_audio_from_file(source_video_path: Path, target_dir: Path, item_id:
         "16000",
         str(target),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = run_hidden(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0 or not target.exists():
         raise YtDlpError(result.stderr.strip() or "ffmpeg failed to extract audio from local video")
     return target
@@ -127,7 +131,7 @@ def _compress_audio(source: Path, target: Path) -> Path:
         TARGET_AUDIO_BITRATE,
         str(target),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = run_hidden(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0 or not target.exists():
         raise YtDlpError(result.stderr.strip() or "ffmpeg failed to compress audio for online ASR")
     return target
@@ -166,7 +170,7 @@ def _audio_chunks(audio_path: Path, item_id: str, target_dir: Path, limit_bytes:
             TARGET_AUDIO_BITRATE,
             str(chunk_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = run_hidden(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0 or not chunk_path.exists():
             raise YtDlpError(result.stderr.strip() or "ffmpeg failed to split audio for online ASR")
         chunks.append((chunk_path, start))
@@ -184,7 +188,7 @@ def _audio_duration(audio_path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(audio_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = run_hidden(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         return 0.0
     try:

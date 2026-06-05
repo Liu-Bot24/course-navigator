@@ -125,6 +125,13 @@ export async function previewCourse(input: {
   });
 }
 
+export async function saveCookieText(text: string): Promise<{ path: string }> {
+  return requestJson<{ path: string }>("/cookies/text", {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
+}
+
 export async function generateStudy(
   itemId: string,
   outputLanguage: OutputLanguage,

@@ -50,6 +50,14 @@ class DownloadRequest(BaseModel):
     cookies_path: str | None = None
 
 
+class CookieTextRequest(BaseModel):
+    text: str = Field(min_length=1)
+
+
+class CookieTextResponse(BaseModel):
+    path: str
+
+
 class LocalVideoPathImportRequest(BaseModel):
     paths: list[str] = Field(min_length=1)
     mode: LocalVideoPathImportMode = "external"

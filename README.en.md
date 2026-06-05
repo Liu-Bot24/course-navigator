@@ -149,9 +149,9 @@ The startup script supports custom local ports:
 | Setting | Controls | Default |
 | --- | --- | --- |
 | `COURSE_NAVIGATOR_API_HOST` | API host | `127.0.0.1` |
-| `COURSE_NAVIGATOR_API_PORT` | API port | `8000` |
+| `COURSE_NAVIGATOR_API_PORT` | API port | `18000` |
 | `COURSE_NAVIGATOR_WEB_HOST` | Web app host | `127.0.0.1` |
-| `COURSE_NAVIGATOR_WEB_PORT` | Web app port | `5173` |
+| `COURSE_NAVIGATOR_WEB_PORT` | Web app port | `15173` |
 
 ## Video Access
 

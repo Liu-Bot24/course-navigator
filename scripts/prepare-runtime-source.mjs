@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -57,6 +58,9 @@ function isExcluded(relativePath, isDirectory) {
     return false;
   }
   if (name === ".env" || name.startsWith(".env.")) {
+    return true;
+  }
+  if (name.startsWith("._")) {
     return true;
   }
   if (name === "__pycache__") {
@@ -137,6 +141,8 @@ async function prepareRuntimeTools() {
   await fs.mkdir(runtimeToolsDir, { recursive: true });
   if (process.platform === "win32") {
     await prepareWindowsRuntimeTools();
+  } else if (process.platform === "darwin") {
+    await prepareMacRuntimeTools();
   }
   await fs.writeFile(path.join(runtimeToolsDir, ".gitkeep"), "");
 }
@@ -147,17 +153,13 @@ async function prepareWindowsRuntimeTools() {
   await fs.mkdir(windowsDir, { recursive: true });
   await fs.mkdir(tempDir, { recursive: true });
 
-  const nodeVersion = process.env.COURSE_NAVIGATOR_WINDOWS_NODE_VERSION || (await latestNodeLtsVersion());
+  const nodeVersion = process.env.COURSE_NAVIGATOR_WINDOWS_NODE_VERSION || (await latestNodeLtsVersion("win-x64-zip"));
   const nodeZip = path.join(tempDir, `node-${nodeVersion}-win-x64.zip`);
   const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/node-${nodeVersion}-win-x64.zip`;
   await downloadFile(nodeUrl, nodeZip);
   const nodeExtractDir = path.join(tempDir, "node");
   await expandArchive(nodeZip, nodeExtractDir);
-  const nodeTopDir = (await fs.readdir(nodeExtractDir, { withFileTypes: true })).find((entry) => entry.isDirectory());
-  if (!nodeTopDir) {
-    throw new Error("Downloaded Node archive did not contain a directory");
-  }
-  await fs.rename(path.join(nodeExtractDir, nodeTopDir.name), path.join(windowsDir, "node"));
+  await renameOnlyChildDirectory(nodeExtractDir, path.join(windowsDir, "node"), "Downloaded Node archive did not contain a directory");
 
   const uvZip = path.join(tempDir, "uv-x86_64-pc-windows-msvc.zip");
   await downloadFile(
@@ -167,6 +169,109 @@ async function prepareWindowsRuntimeTools() {
   await expandArchive(uvZip, path.join(windowsDir, "uv"));
   await prepareWindowsMediaTools(windowsDir, tempDir);
   await fs.rm(tempDir, { recursive: true, force: true });
+}
+
+async function prepareMacRuntimeTools() {
+  const arch = macRuntimeArch();
+  const macDir = path.join(runtimeToolsDir, `darwin-${arch}`);
+  const tempDir = path.join(runtimeToolsDir, ".tmp");
+  await fs.mkdir(macDir, { recursive: true });
+  await fs.mkdir(tempDir, { recursive: true });
+
+  const nodeVersion =
+    process.env.COURSE_NAVIGATOR_MAC_NODE_VERSION ||
+    (await latestNodeLtsVersion(`osx-${arch}-tar`));
+  const nodeArchive = path.join(tempDir, `node-${nodeVersion}-darwin-${arch}.tar.gz`);
+  const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/node-${nodeVersion}-darwin-${arch}.tar.gz`;
+  await downloadFile(nodeUrl, nodeArchive);
+  const nodeExtractDir = path.join(tempDir, "node");
+  await expandArchive(nodeArchive, nodeExtractDir);
+  const nodeDir = path.join(macDir, "node");
+  await renameOnlyChildDirectory(nodeExtractDir, nodeDir, "Downloaded Node archive did not contain a directory");
+  await pruneMacNodeRuntime(nodeDir);
+  await writeMacNodeCliWrappers(nodeDir);
+
+  const uvArchiveName = macUvArchiveName(arch);
+  const uvArchive = path.join(tempDir, uvArchiveName);
+  await downloadFile(
+    `https://github.com/astral-sh/uv/releases/latest/download/${uvArchiveName}`,
+    uvArchive,
+  );
+  const uvExtractDir = path.join(tempDir, "uv");
+  await expandArchive(uvArchive, uvExtractDir);
+  await renameOnlyChildDirectory(uvExtractDir, path.join(macDir, "uv"), "Downloaded uv archive did not contain a directory");
+
+  await prepareMacMediaTools(macDir, tempDir);
+  await fs.rm(tempDir, { recursive: true, force: true });
+}
+
+function macRuntimeArch() {
+  const requested = process.env.COURSE_NAVIGATOR_MAC_ARCH || process.arch;
+  if (requested === "arm64" || requested === "x64") {
+    return requested;
+  }
+  throw new Error(`Unsupported macOS runtime architecture: ${requested}`);
+}
+
+function macUvArchiveName(arch) {
+  if (arch === "arm64") {
+    return "uv-aarch64-apple-darwin.tar.gz";
+  }
+  if (arch === "x64") {
+    return "uv-x86_64-apple-darwin.tar.gz";
+  }
+  throw new Error(`Unsupported macOS uv architecture: ${arch}`);
+}
+
+async function prepareMacMediaTools(macDir, tempDir) {
+  const mediaDir = path.join(tempDir, "media");
+  await fs.mkdir(mediaDir, { recursive: true });
+  await execFileAsync("npm", [
+    "install",
+    "--prefix",
+    mediaDir,
+    "--no-save",
+    "--omit=dev",
+    "--no-audit",
+    "--no-fund",
+    "ffmpeg-ffprobe-static@6.1.2-rc.1",
+  ]);
+
+  const requireFromMedia = createRequire(path.join(mediaDir, "package.json"));
+  const media = requireFromMedia("ffmpeg-ffprobe-static");
+  const targetDir = path.join(macDir, "ffmpeg");
+  await fs.mkdir(targetDir, { recursive: true });
+  await copyExecutable(media.ffmpegPath, path.join(targetDir, "ffmpeg"));
+  await copyExecutable(media.ffprobePath, path.join(targetDir, "ffprobe"));
+}
+
+async function pruneMacNodeRuntime(nodeDir) {
+  for (const entry of ["CHANGELOG.md", "README.md", "include", "share"]) {
+    await fs.rm(path.join(nodeDir, entry), { recursive: true, force: true });
+  }
+}
+
+async function writeMacNodeCliWrappers(nodeDir) {
+  const commands = [
+    ["npm", "npm-cli.js"],
+    ["npx", "npx-cli.js"],
+  ];
+  for (const [command, scriptName] of commands) {
+    const wrapper = `#!/bin/sh
+set -e
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec "$SCRIPT_DIR/node" "$SCRIPT_DIR/../lib/node_modules/npm/bin/${scriptName}" "$@"
+    `;
+    const target = path.join(nodeDir, "bin", command);
+    await fs.rm(target, { force: true });
+    await fs.writeFile(target, wrapper);
+    await fs.chmod(target, 0o755);
+  }
+}
+
+async function copyExecutable(source, target) {
+  await fs.copyFile(source, target);
+  await fs.chmod(target, 0o755);
 }
 
 async function prepareWindowsMediaTools(windowsDir, tempDir) {
@@ -206,37 +311,63 @@ async function findDirectoryContaining(dir, filenames) {
   throw error;
 }
 
-async function latestNodeLtsVersion() {
+async function renameOnlyChildDirectory(source, target, errorMessage) {
+  const topDir = (await fs.readdir(source, { withFileTypes: true })).find((entry) => entry.isDirectory());
+  if (!topDir) {
+    throw new Error(errorMessage);
+  }
+  await fs.rm(target, { recursive: true, force: true });
+  await fs.rename(path.join(source, topDir.name), target);
+}
+
+async function latestNodeLtsVersion(requiredFile) {
   const response = await fetch("https://nodejs.org/dist/index.json");
   if (!response.ok) {
     throw new Error(`Unable to read Node release index: ${response.status}`);
   }
   const releases = await response.json();
-  const release = releases.find((entry) => entry.lts && entry.files?.includes("win-x64-zip"));
+  const release = releases.find((entry) => entry.lts && entry.files?.includes(requiredFile));
   if (!release?.version) {
-    throw new Error("Unable to find a Windows x64 Node LTS release");
+    throw new Error(`Unable to find a Node LTS release with ${requiredFile}`);
   }
   return release.version;
 }
 
 async function downloadFile(url, target) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Unable to download ${url}: ${response.status}`);
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      console.log(`Downloading ${url} (${attempt}/${maxAttempts})`);
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`status ${response.status}`);
+      }
+      await fs.writeFile(target, Buffer.from(await response.arrayBuffer()));
+      return;
+    } catch (error) {
+      await fs.rm(target, { force: true });
+      if (attempt === maxAttempts) {
+        throw new Error(`Unable to download ${url}: ${error.message}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+    }
   }
-  await fs.writeFile(target, Buffer.from(await response.arrayBuffer()));
 }
 
 async function expandArchive(zipPath, destination) {
   await fs.rm(destination, { recursive: true, force: true });
   await fs.mkdir(destination, { recursive: true });
-  await execFileAsync("powershell", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    `Expand-Archive -LiteralPath ${powershellQuote(zipPath)} -DestinationPath ${powershellQuote(destination)} -Force`,
-  ]);
+  if (process.platform === "win32") {
+    await execFileAsync("powershell", [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      `Expand-Archive -LiteralPath ${powershellQuote(zipPath)} -DestinationPath ${powershellQuote(destination)} -Force`,
+    ]);
+  } else {
+    await execFileAsync("tar", ["-xf", zipPath, "-C", destination]);
+  }
 }
 
 function powershellQuote(value) {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -18,6 +18,7 @@ import {
   previewCourse,
   saveAsrSearchSettings,
   saveAsrCacheSettings,
+  saveCookieText,
   saveOnlineAsrSettings,
   saveModelSettings,
   saveTranscript,
@@ -99,6 +100,7 @@ vi.mock("./api", () => ({
     threshold_bytes: 524288000,
     auto_cleanup_enabled: true,
   }),
+  saveCookieText: vi.fn().mockResolvedValue({ path: "/Users/LQ/cookies/manual.cookies.txt" }),
   saveOnlineAsrSettings: vi.fn().mockResolvedValue({
     provider: "xai",
     openai: { has_api_key: false, api_key_preview: null },
@@ -163,6 +165,28 @@ describe("App language defaults", () => {
     expect(screen.getByRole("button", { name: "解读" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "详解" })).toBeTruthy();
     expect(screen.queryByPlaceholderText("en")).toBeNull();
+  });
+
+  it("saves pasted cookie text and fills the cookie file path", async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "翻译字幕" })).toBeTruthy();
+    });
+
+    fireEvent.change(screen.getByRole("combobox", { name: "提取登录" }), {
+      target: { value: "cookies" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "填写 Cookie" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Cookie 内容" }), {
+      target: { value: "Cookie: SID=one" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存 Cookie" }));
+
+    await waitFor(() => {
+      expect(saveCookieText).toHaveBeenCalledWith("Cookie: SID=one");
+    });
+    expect(screen.getByDisplayValue("/Users/LQ/cookies/manual.cookies.txt")).toBeTruthy();
   });
 
   it("uses a compact default study rail width", async () => {
@@ -731,7 +755,7 @@ describe("App language defaults", () => {
     expect(screen.queryByText("[object Object]")).toBeNull();
   });
 
-  it("does not start online ASR when no online ASR service is configured", async () => {
+  it("does not force online ASR when no online ASR service is configured", async () => {
     const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => undefined);
     vi.mocked(getOnlineAsrSettings).mockResolvedValueOnce({
       provider: "none",
@@ -740,19 +764,34 @@ describe("App language defaults", () => {
       xai: { has_api_key: false, api_key_preview: null },
       custom: { base_url: null, model: null, has_api_key: false, api_key_preview: null },
     });
+    const localItem = {
+      id: "local-video",
+      source_url: "local-video://local-video",
+      title: "Local Video",
+      duration: 67.5,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: "downloads/local-video.mp4",
+    };
     vi.mocked(listItems).mockResolvedValueOnce([
+      localItem,
+    ]).mockResolvedValueOnce([
       {
-        id: "local-video",
-        source_url: "local-video://local-video",
-        title: "Local Video",
-        duration: 67.5,
-        created_at: new Date().toISOString(),
-        transcript: [],
-        metadata: null,
-        study: null,
-        local_video_path: "downloads/local-video.mp4",
+        ...localItem,
+        transcript: [{ start: 0, end: 2, text: "Generated subtitle" }],
       },
     ]);
+    vi.mocked(startExtractJob).mockResolvedValueOnce({
+      job_id: "extract-job",
+      item_id: "local-video",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "字幕提取完成",
+      error: null,
+    });
 
     render(<App />);
 
@@ -765,7 +804,10 @@ describe("App language defaults", () => {
     });
     expect(sourceSelect.value).toBe("subtitles");
     fireEvent.click(screen.getByRole("button", { name: "获取字幕" }));
-    expect(startExtractJob).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(startExtractJob).toHaveBeenCalledWith(expect.objectContaining({ subtitle_source: "subtitles" }));
+    });
+    expect(startExtractJob).not.toHaveBeenCalledWith(expect.objectContaining({ subtitle_source: "online_asr" }));
     alertSpy.mockRestore();
   });
 
@@ -815,6 +857,55 @@ describe("App language defaults", () => {
     });
     expect(screen.queryByText("这个来源暂时不能嵌入播放，但字幕导航仍可使用。")).toBeNull();
     expect(screen.getByRole("button", { name: "本地" }).className).toContain("active");
+  });
+
+  it("uses the extraction job for source-first local video fallback progress", async () => {
+    const localItem = {
+      id: "local-video",
+      source_url: "local-video://local-video",
+      title: "Local Video",
+      duration: 67.5,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: "downloads/local-video.mp4",
+    };
+    vi.mocked(listItems)
+      .mockResolvedValueOnce([localItem])
+      .mockResolvedValueOnce([
+        {
+          ...localItem,
+          transcript: [{ start: 0, end: 2, text: "Generated subtitle" }],
+        },
+      ]);
+    vi.mocked(startExtractJob).mockResolvedValueOnce({
+      job_id: "extract-job",
+      item_id: "local-video",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "字幕提取完成",
+      error: null,
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "获取字幕" })).toBeTruthy();
+    });
+    expect((screen.getByRole("combobox", { name: "字幕来源" }) as HTMLSelectElement).value).toBe("subtitles");
+    fireEvent.click(screen.getByRole("button", { name: "获取字幕" }));
+
+    await waitFor(() => {
+      expect(startExtractJob).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: "local-video://local-video",
+          subtitle_source: "subtitles",
+        }),
+      );
+    });
+    expect(extractCourse).not.toHaveBeenCalled();
   });
 
   it("supports keyboard review shortcuts for ASR suggestions", async () => {
@@ -1110,10 +1201,19 @@ describe("App language defaults", () => {
       ...previewItem,
       transcript: [{ start: 1, end: 3, text: "Opening idea." }],
     };
-    let resolveExtract!: (item: typeof extractedItem) => void;
+    let resolveExtractJob!: (status: {
+      job_id: string;
+      item_id: string;
+      status: "succeeded";
+      progress: number;
+      phase: string;
+      message: string;
+      error: null;
+    }) => void;
+    vi.mocked(listItems).mockResolvedValueOnce([]).mockResolvedValueOnce([extractedItem]);
     vi.mocked(previewCourse).mockResolvedValueOnce(previewItem);
-    vi.mocked(extractCourse).mockReturnValueOnce(new Promise((resolve) => {
-      resolveExtract = resolve;
+    vi.mocked(startExtractJob).mockReturnValueOnce(new Promise((resolve) => {
+      resolveExtractJob = resolve;
     }));
     render(<App />);
 
@@ -1127,10 +1227,21 @@ describe("App language defaults", () => {
 
     expect((await screen.findAllByText("AI Prompting for Everyone")).length).toBeGreaterThan(0);
     expect(previewCourse).toHaveBeenCalledWith(expect.objectContaining({ url: "https://learn.deeplearning.ai/courses/example" }));
-    expect(screen.getByText("正在提取字幕")).toBeTruthy();
-    resolveExtract(extractedItem);
+    expect(screen.getByText("正在提取字幕 0%")).toBeTruthy();
+    await act(async () => {
+      resolveExtractJob({
+        job_id: "extract-job",
+        item_id: "dlai-lesson",
+        status: "succeeded",
+        progress: 100,
+        phase: "complete",
+        message: "字幕提取完成",
+        error: null,
+      });
+    });
     expect(await screen.findByText("Opening idea.")).toBeTruthy();
-    expect(extractCourse).toHaveBeenCalledWith(expect.objectContaining({ url: "https://learn.deeplearning.ai/courses/example" }));
+    expect(startExtractJob).toHaveBeenCalledWith(expect.objectContaining({ url: "https://learn.deeplearning.ai/courses/example" }));
+    expect(extractCourse).not.toHaveBeenCalled();
   });
 
   it("caches an already extracted URL without a hidden extraction step", async () => {
@@ -1155,8 +1266,17 @@ describe("App language defaults", () => {
       study: null,
       local_video_path: null,
     };
+    vi.mocked(listItems).mockResolvedValueOnce([]).mockResolvedValueOnce([previewItem]);
     vi.mocked(previewCourse).mockResolvedValueOnce(previewItem);
-    vi.mocked(extractCourse).mockResolvedValueOnce(previewItem);
+    vi.mocked(startExtractJob).mockResolvedValueOnce({
+      job_id: "extract-job",
+      item_id: "dlai-lesson",
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "字幕提取完成",
+      error: null,
+    });
     vi.mocked(startDownloadJob).mockResolvedValueOnce({
       job_id: "download-job",
       item_id: "dlai-lesson",
@@ -1196,7 +1316,7 @@ describe("App language defaults", () => {
     fireEvent.submit(input.closest("form") as HTMLFormElement);
 
     await waitFor(() => {
-      expect(extractCourse).toHaveBeenCalledWith(
+      expect(startExtractJob).toHaveBeenCalledWith(
         expect.objectContaining({
           url: "https://learn.deeplearning.ai/courses/example",
         }),
@@ -1587,9 +1707,12 @@ describe("App language defaults", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
     expect(await screen.findByText("详细程度")).toBeTruthy();
-    const regenerateAllButton = screen.getByRole("button", { name: "全部重新生成" }) as HTMLButtonElement;
-    expect(regenerateAllButton.closest(".study-settings-panel")).toBeTruthy();
-    expect(regenerateAllButton.disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "全部重新生成" })).toBeNull();
+    const settingsGenerateButton = screen
+      .getAllByRole("button", { name: "生成学习地图" })
+      .find((button) => button.closest(".study-settings-panel")) as HTMLButtonElement | undefined;
+    expect(settingsGenerateButton).toBeTruthy();
+    expect(settingsGenerateButton?.disabled).toBe(true);
   });
 
   it("can regenerate the full study map from the right-rail settings panel", async () => {
@@ -1734,6 +1857,43 @@ describe("App language defaults", () => {
     await waitFor(() => {
       expect(startStudyJob).toHaveBeenCalledWith("strict-new-study", "zh-CN", "all", "standard");
     });
+  });
+
+  it("labels first study-map generation as generation instead of regeneration", async () => {
+    const item: CourseItem = {
+      id: "first-study-label",
+      source_url: "https://www.youtube.com/watch?v=first-label",
+      title: "First Study Label Lesson",
+      duration: 42,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "Opening idea." }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValue([item]);
+    vi.mocked(startStudyJob).mockResolvedValue({
+      job_id: "first-study-label-job",
+      item_id: "first-study-label",
+      status: "running",
+      progress: 12,
+      phase: "guide",
+      message: "正在生成学习导览",
+      error: null,
+    });
+    vi.mocked(getStudyJob).mockImplementation(
+      () =>
+        new Promise<StudyJobStatus>(() => {
+          // Keep the job running so the status strip remains visible.
+        }),
+    );
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "生成学习地图" }));
+
+    expect(await screen.findByText("First Study Label Lesson · 生成学习地图")).toBeTruthy();
+    expect(screen.queryByText(/First Study Label Lesson · 全部重新生成/)).toBeNull();
   });
 
   it("shows beginner and experienced guide suggestions as additional guide modules", async () => {
@@ -2606,6 +2766,52 @@ describe("App language defaults", () => {
     expect(getTopLevelLibraryEntryNames().slice(0, 3)).toEqual(["摄影", "产品", "AI Prompting"]);
   });
 
+  it("moves collections only within their current category", async () => {
+    const productA = {
+      id: "product-a",
+      source_url: "https://example.com/product-a",
+      title: "Product A Lesson",
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+      collection_group_title: "产品",
+      collection_title: "产品入门 A",
+      course_index: 1,
+      sort_order: 1,
+    };
+    const productB = {
+      ...productA,
+      id: "product-b",
+      source_url: "https://example.com/product-b",
+      title: "Product B Lesson",
+      collection_title: "产品入门 B",
+    };
+    const photo = {
+      ...productA,
+      id: "photo-a",
+      source_url: "https://example.com/photo-a",
+      title: "Photo Lesson",
+      collection_group_title: "摄影",
+      collection_title: "摄影入门",
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([productA, productB, photo]);
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "收起分类 产品" })).toBeTruthy());
+    const productCategory = screen.getByRole("button", { name: "收起分类 产品" }).closest(".library-collection-group") as HTMLElement;
+    expect(getCollectionNamesInCategory(productCategory)).toEqual(["产品入门 A", "产品入门 B"]);
+    expect(within(productCategory).queryByRole("button", { name: "下移专辑 产品入门 B" })).toBeNull();
+
+    fireEvent.click(within(productCategory).getByRole("button", { name: "下移专辑 产品入门 A" }));
+
+    expect(getCollectionNamesInCategory(productCategory)).toEqual(["产品入门 B", "产品入门 A"]);
+    expect(getTopLevelLibraryEntryNames().slice(0, 2)).toEqual(["产品", "摄影"]);
+  });
+
   it("creates a collection from the course editor and assigns the course to it", async () => {
     const item = {
       id: "single-lesson",
@@ -2885,6 +3091,15 @@ function getTopLevelLibraryEntryNames(): string[] {
       return label ? [label] : [];
     }
     return [];
+  });
+}
+
+function getCollectionNamesInCategory(category: HTMLElement): string[] {
+  const body = category.querySelector(".library-collection-group-body");
+  return Array.from(body?.children ?? []).flatMap((child) => {
+    if (!(child instanceof HTMLElement) || !child.classList.contains("library-collection")) return [];
+    const label = child.querySelector(".library-collection-toggle span:last-child")?.textContent?.trim();
+    return label ? [label] : [];
   });
 }
 

@@ -155,11 +155,14 @@ fn plan_workspace_migration(
 }
 
 #[tauri::command]
-fn choose_workspace_directory() -> Result<Option<String>, String> {
-    Ok(rfd::FileDialog::new()
-        .set_title("选择 Course Navigator Workspace")
-        .pick_folder()
-        .map(|path| path.display().to_string()))
+fn choose_workspace_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let mut dialog = rfd::FileDialog::new().set_title("选择 Course Navigator Workspace");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        dialog = dialog.set_parent(&window);
+    }
+    Ok(dialog.pick_folder().map(|path| path.display().to_string()))
 }
 
 #[tauri::command]
@@ -202,11 +205,11 @@ pub fn run() {
 
             config::prepare_bundled_runtime(app.handle()).map_err(std::io::Error::other)?;
             let menu = build_tray_menu(app.handle())?;
-            let tray_icon = template_tray_icon();
+            let tray_icon = platform_tray_icon();
             configure_main_window(app.handle());
             TrayIconBuilder::with_id(TRAY_ID)
                 .icon(tray_icon)
-                .icon_as_template(true)
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Course Navigator")
                 .menu(&menu)
                 .show_menu_on_left_click(true)
@@ -316,9 +319,17 @@ fn start_config_with_available_ports(app: &tauri::AppHandle) -> (LauncherConfig,
     (resolved, messages)
 }
 
-fn template_tray_icon() -> Image<'static> {
+#[cfg(target_os = "macos")]
+fn platform_tray_icon() -> Image<'static> {
     Image::from_bytes(include_bytes!("../icons/tray-book.png"))
-        .expect("embedded tray icon should be a valid PNG")
+        .expect("embedded macOS tray icon should be a valid PNG")
+        .to_owned()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_tray_icon() -> Image<'static> {
+    Image::from_bytes(include_bytes!("../icons/icon.png"))
+        .expect("embedded product tray icon should be a valid PNG")
         .to_owned()
 }
 
