@@ -92,6 +92,14 @@ class CourseItemUpdate(BaseModel):
     sort_order: float | None = None
 
 
+class LibraryState(BaseModel):
+    manual_collections: list[str] = Field(default_factory=list)
+    manual_collection_groups: list[str] = Field(default_factory=list)
+    collection_order: list[str] = Field(default_factory=list)
+    collection_group_order: list[str] = Field(default_factory=list)
+    collection_group_assignments: dict[str, str] = Field(default_factory=dict)
+
+
 class StudyJobStatus(BaseModel):
     job_id: str
     item_id: str

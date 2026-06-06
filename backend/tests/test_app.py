@@ -841,6 +841,45 @@ def test_course_collection_and_index_can_be_edited_and_cleared(tmp_path):
     assert cleared.json()["course_index"] is None
 
 
+def test_library_state_is_persisted_and_normalized(tmp_path):
+    client = make_client(tmp_path)
+
+    assert client.get("/api/library-state").json() == {
+        "manual_collections": [],
+        "manual_collection_groups": [],
+        "collection_order": [],
+        "collection_group_order": [],
+        "collection_group_assignments": {},
+    }
+
+    updated = client.put(
+        "/api/library-state",
+        json={
+            "manual_collections": [" 摄影 ", "摄影", ""],
+            "manual_collection_groups": [" 产品 ", "摄影", "产品"],
+            "collection_order": ["collection:a", "collection:a", ""],
+            "collection_group_order": ["group:product", "group:photo"],
+            "collection_group_assignments": {
+                " collection:a ": " 产品 ",
+                "collection:b": "",
+                "": "摄影",
+            },
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json() == {
+        "manual_collections": ["摄影"],
+        "manual_collection_groups": ["产品", "摄影"],
+        "collection_order": ["collection:a"],
+        "collection_group_order": ["group:product", "group:photo"],
+        "collection_group_assignments": {"collection:a": "产品"},
+    }
+
+    reloaded = make_client(tmp_path)
+    assert reloaded.get("/api/library-state").json() == updated.json()
+
+
 def test_extract_route_uses_transcript_duration_when_metadata_has_none(tmp_path):
     class NoDurationRunner(FakeRunner):
         def fetch_metadata(self, request):

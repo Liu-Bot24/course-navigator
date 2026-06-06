@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .models import CourseItem
+from .models import CourseItem, LibraryState
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -15,6 +15,7 @@ class CourseLibrary:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir
         self.items_dir = self.data_dir / "items"
+        self.library_state_path = self.data_dir / "library-state.json"
         self.items_dir.mkdir(parents=True, exist_ok=True)
 
     def save(self, item: CourseItem) -> None:
@@ -52,6 +53,26 @@ class CourseLibrary:
             if path.is_file()
         ]
         return sorted(items, key=_course_sort_key)
+
+    def load_state(self) -> LibraryState:
+        if not self.library_state_path.exists():
+            return LibraryState()
+        payload = json.loads(self.library_state_path.read_text(encoding="utf-8"))
+        return LibraryState.model_validate(payload)
+
+    def save_state(self, state: LibraryState) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.library_state_path.with_name(
+            f".{self.library_state_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            tmp_path.write_text(
+                state.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self.library_state_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     def _item_path(self, item_id: str) -> Path | None:
         if not SAFE_ID_RE.match(item_id):

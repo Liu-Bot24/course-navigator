@@ -9,6 +9,7 @@ import type {
   CourseItem,
   CourseSharePackage,
   ExtractMode,
+  LibraryState,
   LocalVideoImportMode,
   ModelSettings,
   ModelSettingsInput,
@@ -34,6 +35,17 @@ export function apiPath(path: string): string {
 
 export async function listItems(): Promise<CourseItem[]> {
   return requestJson<CourseItem[]>("/items");
+}
+
+export async function getLibraryState(): Promise<LibraryState> {
+  return requestJson<LibraryState>("/library-state");
+}
+
+export async function saveLibraryState(input: LibraryState): Promise<LibraryState> {
+  return requestJson<LibraryState>("/library-state", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
 }
 
 export async function importCoursePackage(input: CourseSharePackage): Promise<CourseImportResponse> {

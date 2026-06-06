@@ -57,6 +57,7 @@ from .models import (
     ExtractRequest,
     LocalVideoFilePickerRequest,
     LocalVideoPathImportRequest,
+    LibraryState,
     ModelListRequest,
     ModelListResponse,
     ModelSettingsResponse,
@@ -173,6 +174,16 @@ def create_app(
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
         return _normalize_item_for_response(item, active_workspace_dir)
+
+    @app.get("/api/library-state")
+    def get_library_state() -> LibraryState:
+        return library.load_state()
+
+    @app.put("/api/library-state")
+    def update_library_state(request: LibraryState) -> LibraryState:
+        state = _normalized_library_state(request)
+        library.save_state(state)
+        return state
 
     @app.post("/api/import")
     def import_course_package(package: CourseSharePackage) -> CourseImportResponse:
@@ -2210,6 +2221,32 @@ def _normalize_item_for_response(item: CourseItem, workspace_dir: Path | None = 
     item = _with_display_title_fallback(item)
     item = _with_complete_translation_for_response(item)
     return _with_course_defaults(item)
+
+
+def _normalized_library_state(state: LibraryState) -> LibraryState:
+    return LibraryState(
+        manual_collections=_deduped_strings(state.manual_collections),
+        manual_collection_groups=_deduped_strings(state.manual_collection_groups),
+        collection_order=_deduped_strings(state.collection_order),
+        collection_group_order=_deduped_strings(state.collection_group_order),
+        collection_group_assignments={
+            key.strip(): value.strip()
+            for key, value in state.collection_group_assignments.items()
+            if key.strip() and value.strip()
+        },
+    )
+
+
+def _deduped_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        result.append(normalized)
+        seen.add(normalized)
+    return result
 
 
 def _with_available_video_source_for_response(item: CourseItem, workspace_dir: Path | None) -> CourseItem:

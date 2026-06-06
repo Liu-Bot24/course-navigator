@@ -48,6 +48,15 @@ export type OnlineAsrProvider = "none" | "openai" | "groq" | "xai" | "custom";
 export type StudySection = "all" | "guide" | "outline" | "detailed" | "high";
 export type ModelProviderType = "openai" | "anthropic";
 export type StudyDetailLevel = "fast" | "standard" | "detailed" | "faithful";
+
+export type LibraryState = {
+  manual_collections: string[];
+  manual_collection_groups: string[];
+  collection_order: string[];
+  collection_group_order: string[];
+  collection_group_assignments: Record<string, string>;
+};
+
 export type TaskParameterKey =
   | "title_translation"
   | "subtitle_translation"

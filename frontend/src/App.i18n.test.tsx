@@ -9,6 +9,7 @@ import {
   extractCourse,
   getAsrCacheSettings,
   getOnlineAsrSettings,
+  getLibraryState,
   getModelSettings,
   getAsrCorrectionResult,
   getStudyJob,
@@ -19,6 +20,7 @@ import {
   saveAsrSearchSettings,
   saveAsrCacheSettings,
   saveCookieText,
+  saveLibraryState,
   saveOnlineAsrSettings,
   saveModelSettings,
   saveTranscript,
@@ -29,7 +31,7 @@ import {
   updateCourseItem,
 } from "./api";
 import { App } from "./App";
-import type { CourseItem, StudyJobStatus } from "./types";
+import type { CourseItem, LibraryState, StudyJobStatus } from "./types";
 
 vi.mock("./api", () => ({
   cleanupAsrCache: vi.fn().mockResolvedValue({
@@ -75,6 +77,13 @@ vi.mock("./api", () => ({
   }),
   getStudyJob: vi.fn(),
   getAsrCorrectionResult: vi.fn(),
+  getLibraryState: vi.fn().mockResolvedValue({
+    manual_collections: [],
+    manual_collection_groups: [],
+    collection_order: [],
+    collection_group_order: [],
+    collection_group_assignments: {},
+  }),
   getAsrSearchSettings: vi.fn().mockResolvedValue({
     enabled: false,
     provider: "tavily",
@@ -101,6 +110,7 @@ vi.mock("./api", () => ({
     auto_cleanup_enabled: true,
   }),
   saveCookieText: vi.fn().mockResolvedValue({ path: "/Users/LQ/cookies/manual.cookies.txt" }),
+  saveLibraryState: vi.fn().mockImplementation(async (state) => state),
   saveOnlineAsrSettings: vi.fn().mockResolvedValue({
     provider: "xai",
     openai: { has_api_key: false, api_key_preview: null },
@@ -2810,6 +2820,122 @@ describe("App language defaults", () => {
 
     expect(getCollectionNamesInCategory(productCategory)).toEqual(["产品入门 B", "产品入门 A"]);
     expect(getTopLevelLibraryEntryNames().slice(0, 2)).toEqual(["产品", "摄影"]);
+  });
+
+  it("loads collection categories from persisted library state", async () => {
+    const photo = {
+      id: "photo-lesson",
+      source_url: "https://example.com/photo",
+      title: "Photo Lesson",
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+      collection_group_title: "",
+      collection_title: "当代经典摄影20讲",
+      course_index: 1,
+      sort_order: 1,
+    };
+    vi.mocked(getLibraryState).mockResolvedValueOnce({
+      manual_collections: [],
+      manual_collection_groups: ["摄影"],
+      collection_order: [],
+      collection_group_order: ["collection-group:摄影"],
+      collection_group_assignments: {
+        "collection:当代经典摄影20讲": "摄影",
+      },
+    });
+    vi.mocked(listItems).mockResolvedValueOnce([photo]);
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "收起分类 摄影" })).toBeTruthy());
+    const photoCategory = screen.getByRole("button", { name: "收起分类 摄影" }).closest(".library-collection-group") as HTMLElement;
+    expect(getCollectionNamesInCategory(photoCategory)).toEqual(["当代经典摄影20讲"]);
+  });
+
+  it("migrates legacy local category state to the backend when remote state is empty", async () => {
+    window.localStorage.setItem("course-navigator-manual-collection-groups", JSON.stringify(["摄影"]));
+    window.localStorage.setItem(
+      "course-navigator-collection-group-assignments",
+      JSON.stringify({ "collection:当代经典摄影20讲": "摄影" }),
+    );
+    const photo = {
+      id: "photo-lesson",
+      source_url: "https://example.com/photo",
+      title: "Photo Lesson",
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+      collection_group_title: "",
+      collection_title: "当代经典摄影20讲",
+      course_index: 1,
+      sort_order: 1,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([photo]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(saveLibraryState).toHaveBeenCalledWith(
+        expect.objectContaining({
+          manual_collection_groups: ["摄影"],
+          collection_group_assignments: { "collection:当代经典摄影20讲": "摄影" },
+        }),
+      );
+    });
+    expect(screen.getByRole("button", { name: "收起分类 摄影" })).toBeTruthy();
+  });
+
+  it("serializes library state saves so a stale request cannot overwrite the latest category state", async () => {
+    let resolveFirstSave: ((value: LibraryState | PromiseLike<LibraryState>) => void) | null = null;
+    vi.mocked(saveLibraryState).mockImplementationOnce(
+      (state) => new Promise((resolve) => {
+        resolveFirstSave = resolve;
+      }),
+    );
+    vi.mocked(saveLibraryState).mockImplementation(async (state) => state);
+    const promptSpy = vi
+      .spyOn(window, "prompt")
+      .mockReturnValueOnce("产品")
+      .mockReturnValueOnce("摄影");
+
+    render(<App />);
+
+    await waitFor(() => expect(saveLibraryState).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "新建" }));
+    fireEvent.click(screen.getByRole("button", { name: "新建分类" }));
+    fireEvent.click(screen.getByRole("button", { name: "新建" }));
+    fireEvent.click(screen.getByRole("button", { name: "新建分类" }));
+
+    expect(screen.getByRole("button", { name: "收起分类 产品" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "收起分类 摄影" })).toBeTruthy();
+    expect(saveLibraryState).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveFirstSave?.({
+        manual_collections: [],
+        manual_collection_groups: [],
+        collection_order: [],
+        collection_group_order: [],
+        collection_group_assignments: {},
+      });
+    });
+
+    await waitFor(() => expect(saveLibraryState).toHaveBeenCalledTimes(2));
+    expect(saveLibraryState).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        manual_collection_groups: ["产品", "摄影"],
+        collection_group_order: ["collection-group:产品", "collection-group:摄影"],
+      }),
+    );
+
+    promptSpy.mockRestore();
   });
 
   it("creates a collection from the course editor and assigns the course to it", async () => {

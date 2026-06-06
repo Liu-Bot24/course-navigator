@@ -50,6 +50,7 @@ import {
   extractCourse,
   getAsrCacheSettings,
   getAsrCorrectionResult,
+  getLibraryState,
   getAsrSearchSettings,
   getModelSettings,
   getOnlineAsrSettings,
@@ -63,6 +64,7 @@ import {
   listAvailableModels,
   previewCourse,
   saveCookieText,
+  saveLibraryState,
   saveModelSettings,
   saveAsrSearchSettings,
   saveAsrCacheSettings,
@@ -99,6 +101,7 @@ import type {
   CourseSharePackage,
   CourseItem,
   ExtractMode,
+  LibraryState,
   LocalVideoImportMode,
   ModelProfile,
   ModelProfileInput,
@@ -1108,6 +1111,7 @@ export function App() {
   const [collectionGroupAssignments, setCollectionGroupAssignments] = useState<Record<string, string>>(() =>
     loadStoredStringRecord(COLLECTION_GROUP_ASSIGNMENTS_STORAGE_KEY),
   );
+  const [libraryStateReady, setLibraryStateReady] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [videoImportModalOpen, setVideoImportModalOpen] = useState(false);
   const [bulkVideoSourceModalOpen, setBulkVideoSourceModalOpen] = useState(false);
@@ -1138,6 +1142,8 @@ export function App() {
   const studyQueueTasksRef = useRef<StudyQueueTask[]>([]);
   const studyQueueProcessingRef = useRef(false);
   const studyQueueTaskIdRef = useRef(0);
+  const libraryStatePendingSaveRef = useRef<LibraryState | null>(null);
+  const libraryStateSaveInFlightRef = useRef(false);
   const workspaceRef = useRef<HTMLElement | null>(null);
   const mainColumnRef = useRef<HTMLElement | null>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
@@ -1153,10 +1159,34 @@ export function App() {
         appMountedRef.current = false;
         studyQueueTasksRef.current = [];
         studyQueueProcessingRef.current = false;
+        libraryStatePendingSaveRef.current = null;
+        libraryStateSaveInFlightRef.current = false;
       };
     },
     [],
   );
+
+  function queueLibraryStateSave(state: LibraryState) {
+    libraryStatePendingSaveRef.current = state;
+    if (libraryStateSaveInFlightRef.current) return;
+    void flushLibraryStateSave();
+  }
+
+  async function flushLibraryStateSave() {
+    libraryStateSaveInFlightRef.current = true;
+    while (libraryStatePendingSaveRef.current) {
+      const state = libraryStatePendingSaveRef.current;
+      libraryStatePendingSaveRef.current = null;
+      try {
+        await saveLibraryState(state);
+      } catch (err: unknown) {
+        if (appMountedRef.current) {
+          setError(errorMessage(err, copy.unknownError));
+        }
+      }
+    }
+    libraryStateSaveInFlightRef.current = false;
+  }
 
   useEffect(() => {
     listItems()
@@ -1166,6 +1196,53 @@ export function App() {
       })
       .catch((err: unknown) => setError(errorMessage(err, copy.unknownError)));
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    getLibraryState()
+      .then((remoteState) => {
+        if (cancelled) return;
+        const localState = loadLocalLibraryState();
+        const nextState = isLibraryStateEmpty(remoteState) && !isLibraryStateEmpty(localState)
+          ? localState
+          : remoteState;
+        applyLibraryStateToLocalStorage(nextState);
+        setManualCollections(nextState.manual_collections);
+        setManualCollectionGroups(nextState.manual_collection_groups);
+        setCollectionOrder(nextState.collection_order);
+        setCollectionGroupOrder(nextState.collection_group_order);
+        setCollectionGroupAssignments(nextState.collection_group_assignments);
+        setLibraryStateReady(true);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setLibraryStateReady(true);
+        setError(errorMessage(err, copy.unknownError));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!libraryStateReady) return;
+    const state = currentLibraryState(
+      manualCollections,
+      manualCollectionGroups,
+      collectionOrder,
+      collectionGroupOrder,
+      collectionGroupAssignments,
+    );
+    queueLibraryStateSave(state);
+  }, [
+    libraryStateReady,
+    manualCollections,
+    manualCollectionGroups,
+    collectionOrder,
+    collectionGroupOrder,
+    collectionGroupAssignments,
+    copy.unknownError,
+  ]);
 
   useEffect(() => {
     getModelSettings()
@@ -7585,6 +7662,48 @@ function loadManualCollections(): string[] {
   return loadStoredStrings(MANUAL_COLLECTIONS_STORAGE_KEY);
 }
 
+function loadLocalLibraryState(): LibraryState {
+  return currentLibraryState(
+    loadManualCollections(),
+    loadStoredStrings(MANUAL_COLLECTION_GROUPS_STORAGE_KEY),
+    loadStoredStrings(COLLECTION_ORDER_STORAGE_KEY),
+    loadStoredStrings(COLLECTION_GROUP_ORDER_STORAGE_KEY),
+    loadStoredStringRecord(COLLECTION_GROUP_ASSIGNMENTS_STORAGE_KEY),
+  );
+}
+
+function currentLibraryState(
+  manualCollections: string[],
+  manualCollectionGroups: string[],
+  collectionOrder: string[],
+  collectionGroupOrder: string[],
+  collectionGroupAssignments: Record<string, string>,
+): LibraryState {
+  return {
+    manual_collections: mergeCollectionNames(manualCollections),
+    manual_collection_groups: mergeCollectionNames(manualCollectionGroups),
+    collection_order: mergeStringKeys(collectionOrder),
+    collection_group_order: mergeStringKeys(collectionGroupOrder),
+    collection_group_assignments: normalizedStringRecord(collectionGroupAssignments),
+  };
+}
+
+function isLibraryStateEmpty(state: LibraryState): boolean {
+  return state.manual_collections.length === 0
+    && state.manual_collection_groups.length === 0
+    && state.collection_order.length === 0
+    && state.collection_group_order.length === 0
+    && Object.keys(state.collection_group_assignments).length === 0;
+}
+
+function applyLibraryStateToLocalStorage(state: LibraryState) {
+  saveStoredStrings(MANUAL_COLLECTIONS_STORAGE_KEY, state.manual_collections);
+  saveStoredStrings(MANUAL_COLLECTION_GROUPS_STORAGE_KEY, state.manual_collection_groups);
+  saveStoredStrings(COLLECTION_ORDER_STORAGE_KEY, state.collection_order);
+  saveStoredStrings(COLLECTION_GROUP_ORDER_STORAGE_KEY, state.collection_group_order);
+  saveStoredStringRecord(COLLECTION_GROUP_ASSIGNMENTS_STORAGE_KEY, state.collection_group_assignments);
+}
+
 function loadStoredStrings(key: string): string[] {
   try {
     const raw = window.localStorage.getItem(key);
@@ -7621,10 +7740,18 @@ function loadStoredStringRecord(key: string): Record<string, string> {
 
 function saveStoredStringRecord(key: string, values: Record<string, string>) {
   try {
-    window.localStorage.setItem(key, JSON.stringify(values));
+    window.localStorage.setItem(key, JSON.stringify(normalizedStringRecord(values)));
   } catch {
     // Storage is a convenience layer. Losing it should not block the current edit.
   }
+}
+
+function normalizedStringRecord(values: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(values)
+      .map(([key, value]) => [key.trim(), value.trim()])
+      .filter(([key, value]) => Boolean(key) && Boolean(value)),
+  );
 }
 
 function loadBooleanPreference(key: string, fallback: boolean): boolean {
