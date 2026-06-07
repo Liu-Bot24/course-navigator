@@ -380,7 +380,7 @@ def test_chat_text_retries_transient_rate_limit(monkeypatch):
     assert len(calls) == 2
 
 
-def test_learning_block_generation_runs_serially_by_default(monkeypatch):
+def test_learning_block_generation_uses_three_workers_by_default(monkeypatch):
     transcript = [
         TranscriptSegment(start=0, end=30, text="Opening."),
         TranscriptSegment(start=30, end=60, text="Topic shift."),
@@ -430,7 +430,70 @@ def test_learning_block_generation_runs_serially_by_default(monkeypatch):
         output_language="zh-CN",
     )
 
-    assert max_active == 1
+    assert max_active == 3
+
+
+def test_learning_block_generation_downgrades_concurrency_after_transient_failure(monkeypatch):
+    transcript = [
+        TranscriptSegment(start=0, end=30, text="Opening."),
+        TranscriptSegment(start=30, end=60, text="Topic shift."),
+        TranscriptSegment(start=60, end=90, text="Example."),
+    ]
+    translated = [
+        TranscriptSegment(start=segment.start, end=segment.end, text=f"译文 {segment.text}")
+        for segment in transcript
+    ]
+    ranges = [
+        TimeRange(start=0, end=30, title="第一块", summary="开场。", priority="focus"),
+        TimeRange(start=30, end=60, title="第二块", summary="转折。", priority="skim"),
+        TimeRange(start=60, end=90, title="第三块", summary="例子。", priority="skim"),
+    ]
+    lock = Lock()
+    active = 0
+    max_active_by_attempt: list[int] = []
+    transient_failure_sent = False
+
+    def fake_block(*args, **kwargs):
+        nonlocal active, transient_failure_sent
+        index = args[1]
+        with lock:
+            active += 1
+            if len(max_active_by_attempt) < 1:
+                max_active_by_attempt.append(active)
+            else:
+                max_active_by_attempt[-1] = max(max_active_by_attempt[-1], active)
+        sleep(0.02)
+        with lock:
+            active -= 1
+        if index == 1 and not transient_failure_sent:
+            transient_failure_sent = True
+            max_active_by_attempt.append(0)
+            raise httpx.ReadTimeout("temporary model timeout")
+        return {
+            "id": f"block-{index + 1}",
+            "title": f"块 {index + 1}",
+            "summary": "摘要",
+            "priority": "focus",
+            "key_points": [],
+            "detailed_notes": "解读",
+            "high_fidelity_text": "详解",
+        }
+
+    monkeypatch.setattr(ai, "_generate_learning_block_with_provider", fake_block)
+
+    blocks = ai._generate_learning_blocks_for_ranges_with_provider(
+        title="Lesson",
+        source_transcript=transcript,
+        translated_transcript=translated,
+        ranges=ranges,
+        context_summary="summary",
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="learning"),
+        output_language="zh-CN",
+    )
+
+    assert [block["title"] for block in blocks] == ["块 1", "块 2", "块 3"]
+    assert max_active_by_attempt[0] == 3
+    assert max_active_by_attempt[1] <= 2
 
 
 def test_long_transcript_uses_role_specific_model_slots(monkeypatch):

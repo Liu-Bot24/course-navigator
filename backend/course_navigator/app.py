@@ -103,6 +103,40 @@ ASR_CACHE_AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".opus", ".wav", ".
 _DEFAULT_ENV_PATH = object()
 
 
+def _merge_partial_study(existing: StudyMaterial | None, partial: StudyMaterial) -> StudyMaterial:
+    if not existing:
+        return partial
+
+    merged = partial.model_copy(deep=True)
+    if not merged.one_line.strip():
+        merged.one_line = existing.one_line
+    if merged.translated_title is None:
+        merged.translated_title = existing.translated_title
+    if merged.context_summary is None:
+        merged.context_summary = existing.context_summary
+    if not merged.time_map and existing.time_map:
+        merged.time_map = [entry.model_copy(deep=True) for entry in existing.time_map]
+    if not merged.outline and existing.outline:
+        merged.outline = [entry.model_copy(deep=True) for entry in existing.outline]
+    if not merged.detailed_notes.strip():
+        merged.detailed_notes = existing.detailed_notes
+    if not merged.high_fidelity_text.strip():
+        merged.high_fidelity_text = existing.high_fidelity_text
+    if not merged.translated_transcript and existing.translated_transcript:
+        merged.translated_transcript = [entry.model_copy(deep=True) for entry in existing.translated_transcript]
+    if not merged.prerequisites and existing.prerequisites:
+        merged.prerequisites = list(existing.prerequisites)
+    if not merged.thought_prompts and existing.thought_prompts:
+        merged.thought_prompts = list(existing.thought_prompts)
+    if not merged.review_suggestions and existing.review_suggestions:
+        merged.review_suggestions = list(existing.review_suggestions)
+    if not merged.beginner_focus and existing.beginner_focus:
+        merged.beginner_focus = list(existing.beginner_focus)
+    if not merged.experienced_guidance and existing.experienced_guidance:
+        merged.experienced_guidance = list(existing.experienced_guidance)
+    return merged
+
+
 def create_app(
     data_dir: Path | None = None,
     workspace_dir: Path | None = None,
@@ -1200,7 +1234,7 @@ def create_app(
             item = library.get(item_id)
             if not item:
                 return
-            item.study = study
+            item.study = _merge_partial_study(item.study, study)
             library.save(item)
 
         original_study: StudyMaterial | None = None

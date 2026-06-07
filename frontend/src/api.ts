@@ -37,6 +37,10 @@ export async function listItems(): Promise<CourseItem[]> {
   return requestJson<CourseItem[]>("/items");
 }
 
+export async function getItem(itemId: string): Promise<CourseItem> {
+  return requestJson<CourseItem>(`/items/${itemId}`);
+}
+
 export async function getLibraryState(): Promise<LibraryState> {
   return requestJson<LibraryState>("/library-state");
 }

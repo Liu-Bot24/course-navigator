@@ -51,6 +51,7 @@ import {
   extractCourse,
   getAsrCacheSettings,
   getAsrCorrectionResult,
+  getItem,
   getLibraryState,
   getAsrSearchSettings,
   getModelSettings,
@@ -1397,6 +1398,16 @@ export function App() {
     setSelected((current) => (current ? loaded.find((item) => item.id === current.id) ?? current : current));
   }
 
+  async function refreshItemInList(itemId: string) {
+    const updated = await getItem(itemId);
+    if (!updated) return;
+    setItems((current) => {
+      const exists = current.some((item) => item.id === updated.id);
+      return exists ? current.map((item) => (item.id === updated.id ? updated : item)) : [updated, ...current];
+    });
+    setSelected((current) => (current?.id === updated.id ? updated : current));
+  }
+
   function updateStudyQueueTasks(updater: (current: StudyQueueTask[]) => StudyQueueTask[]) {
     const next = updater(studyQueueTasksRef.current);
     studyQueueTasksRef.current = next;
@@ -1948,7 +1959,7 @@ export function App() {
       setJobStatus(current);
       setBusy(`${task.itemTitle} · ${label}: ${current.message} ${current.progress}%`);
       if (current.status === "running") {
-        await refreshItemsPreservingSelection();
+        await refreshItemInList(task.itemId);
       }
     }
     if (current.status === "failed") {
@@ -1957,7 +1968,7 @@ export function App() {
     if (current.status === "cancelled") {
       return;
     }
-    await refreshItemsPreservingSelection();
+    await refreshItemInList(task.itemId);
   }
 
   async function runTranslationJob(itemId: string) {

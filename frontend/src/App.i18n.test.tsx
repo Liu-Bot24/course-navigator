@@ -34,6 +34,10 @@ import {
 import { App } from "./App";
 import type { CourseItem, LibraryState, StudyJobStatus } from "./types";
 
+const apiMocks = vi.hoisted(() => ({
+  getItem: vi.fn(),
+}));
+
 vi.mock("./api", () => ({
   cleanupAsrCache: vi.fn().mockResolvedValue({
     size_bytes: 0,
@@ -77,6 +81,7 @@ vi.mock("./api", () => ({
     xai: { has_api_key: true, api_key_preview: "xai...test" },
     custom: { base_url: null, model: null, has_api_key: false, api_key_preview: null },
   }),
+  getItem: apiMocks.getItem,
   getStudyJob: vi.fn(),
   getAsrCorrectionResult: vi.fn(),
   getLibraryState: vi.fn().mockResolvedValue({
@@ -2086,7 +2091,8 @@ describe("App language defaults", () => {
       },
     };
     let resolveSecondStatus: ((value: StudyJobStatus) => void) | undefined;
-    vi.mocked(listItems).mockResolvedValueOnce([item]).mockResolvedValue([partialItem]);
+    vi.mocked(listItems).mockResolvedValue([item]);
+    apiMocks.getItem.mockResolvedValue(partialItem);
     vi.mocked(startStudyJob).mockResolvedValue({
       job_id: "study-job-1",
       item_id: "abc123",
@@ -2115,9 +2121,13 @@ describe("App language defaults", () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "生成学习地图" }));
+    const generateButton = await screen.findByRole("button", { name: "生成学习地图" });
+    fireEvent.click(generateButton);
 
     expect(await screen.findByText("先出的预备知识", {}, { timeout: 2500 })).toBeTruthy();
+    expect(apiMocks.getItem).toHaveBeenCalledWith("abc123");
+    const firstItemRefreshOrder = apiMocks.getItem.mock.invocationCallOrder[0];
+    expect(vi.mocked(listItems).mock.invocationCallOrder.some((order) => order > firstItemRefreshOrder)).toBe(false);
     resolveSecondStatus?.({
       job_id: "study-job-1",
       item_id: "abc123",
@@ -2128,6 +2138,7 @@ describe("App language defaults", () => {
       error: null,
     });
     await waitFor(() => expect(getStudyJob).toHaveBeenCalledTimes(2), { timeout: 3500 });
+    expect(vi.mocked(listItems).mock.invocationCallOrder.some((order) => order > firstItemRefreshOrder)).toBe(false);
   });
 
   it("does not steal course selection while a study job refreshes in the background", async () => {

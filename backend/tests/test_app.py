@@ -10,7 +10,7 @@ import course_navigator.app as app_module
 from course_navigator.app import create_app
 from course_navigator.config import OnlineAsrSettings, Settings
 from course_navigator.library import CourseLibrary
-from course_navigator.models import CourseItem, StudyMaterial, TranscriptSegment, VideoMetadata
+from course_navigator.models import CourseItem, StudyMaterial, TimeRange, TranscriptSegment, VideoMetadata
 from course_navigator.ytdlp import YtDlpError
 
 
@@ -1528,6 +1528,71 @@ def test_study_job_saves_partial_study_sections_before_completion(tmp_path, monk
 
     assert payload["status"] == "succeeded"
     assert client.get("/api/items/abc123").json()["study"]["high_fidelity_text"] == "最终详解"
+
+
+def test_study_job_partial_study_preserves_existing_time_map_until_new_ranges(tmp_path, monkeypatch):
+    partial_saved = Event()
+    finish_generation = Event()
+
+    def fake_generate(**kwargs):
+        kwargs["partial_study"](
+            StudyMaterial(
+                one_line="正在重新生成导览。",
+                time_map=[],
+                outline=[],
+                detailed_notes="",
+                high_fidelity_text="",
+                prerequisites=["新的预备知识"],
+            )
+        )
+        partial_saved.set()
+        assert finish_generation.wait(2)
+        return StudyMaterial(
+            one_line="最终学习地图。",
+            time_map=[TimeRange(start=0, end=4, title="新学习块", summary="新摘要", priority="focus")],
+            outline=[],
+            detailed_notes="最终解读",
+            high_fidelity_text="最终详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fake_generate)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    library = CourseLibrary(tmp_path)
+    item = library.get("abc123")
+    assert item is not None
+    item.study = StudyMaterial(
+        one_line="已有导览",
+        time_map=[TimeRange(start=0, end=4, title="旧学习块", summary="旧摘要", priority="focus")],
+        outline=[],
+        detailed_notes="已有解读",
+        high_fidelity_text="已有详解",
+    )
+    library.save(item)
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "all"})
+    job_id = response.json()["job_id"]
+    assert partial_saved.wait(2)
+
+    partial_item = client.get("/api/items/abc123").json()
+    assert partial_item["study"]["one_line"] == "正在重新生成导览。"
+    assert partial_item["study"]["time_map"][0]["title"] == "旧学习块"
+    assert partial_item["study"]["detailed_notes"] == "已有解读"
+
+    finish_generation.set()
+    payload = client.get(f"/api/jobs/{job_id}").json()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    final_item = client.get("/api/items/abc123").json()
+    assert final_item["study"]["time_map"][0]["title"] == "新学习块"
 
 
 def test_study_job_section_failure_marks_failed_and_keeps_existing_study(tmp_path, monkeypatch):
