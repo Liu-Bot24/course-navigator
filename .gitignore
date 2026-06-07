@@ -32,3 +32,7 @@ launcher/src-tauri/resources/runtime-tools/**
 !launcher/src-tauri/resources/runtime-tools/
 !launcher/src-tauri/resources/runtime-tools/.gitkeep
 launcher/src-tauri/target/
+ios/**/xcuserdata/
+ios/**/DerivedData/
+ios/**/.build/
+ios/**/*.xcuserstate
