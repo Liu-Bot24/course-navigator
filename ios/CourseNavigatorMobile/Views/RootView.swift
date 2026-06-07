@@ -2,7 +2,6 @@ import SwiftUI
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
-    @State private var showingImport = false
     @State private var showingDevices = false
     @State private var didOfferInitialBackendSetup = false
 
@@ -11,7 +10,6 @@ struct RootView: View {
         NavigationSplitView {
             CourseSidebar(
                 selectedCourseID: $model.selectedCourseID,
-                showingImport: $showingImport,
                 showingDevices: $showingDevices
             )
         } detail: {
@@ -21,9 +19,6 @@ struct RootView: View {
                 BackendRequiredView(showingDevices: $showingDevices)
             }
         }
-        .sheet(isPresented: $showingImport) {
-            ImportCourseSheet()
-        }
         .sheet(isPresented: $showingDevices) {
             BackendSettingsView()
         }
@@ -32,6 +27,9 @@ struct RootView: View {
         }
         .onChange(of: model.connectionStatus) { _, _ in
             offerInitialBackendSetupIfNeeded()
+        }
+        .onChange(of: model.selectedCourseID) { _, _ in
+            Task { await model.refreshSelectedCourse() }
         }
         .alert("需要处理", isPresented: Binding(
             get: { model.errorMessage != nil },
@@ -47,7 +45,6 @@ struct RootView: View {
         guard Self.shouldOfferInitialBackendSetup(
             didOffer: didOfferInitialBackendSetup,
             isShowingDevices: showingDevices,
-            isShowingImport: showingImport,
             endpointCount: model.endpoints.count,
             connectionStatus: model.connectionStatus
         ) else { return }
@@ -58,11 +55,10 @@ struct RootView: View {
     static func shouldOfferInitialBackendSetup(
         didOffer: Bool,
         isShowingDevices: Bool,
-        isShowingImport: Bool,
         endpointCount: Int,
         connectionStatus: ConnectionStatus
     ) -> Bool {
-        guard !didOffer, !isShowingDevices, !isShowingImport else { return false }
+        guard !didOffer, !isShowingDevices else { return false }
         switch connectionStatus {
         case .online, .checking:
             return false

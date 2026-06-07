@@ -16,6 +16,11 @@ struct StatusBadge: View {
 
 extension View {
     @ViewBuilder
+    func adaptiveSegmentedPickerStyle() -> some View {
+        modifier(AdaptiveSegmentedPickerStyle())
+    }
+
+    @ViewBuilder
     func urlInputHints() -> some View {
         #if os(iOS)
         self
@@ -62,6 +67,23 @@ extension View {
         self.navigationBarTitleDisplayMode(.inline)
         #else
         self
+        #endif
+    }
+}
+
+private struct AdaptiveSegmentedPickerStyle: ViewModifier {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        if horizontalSizeClass == .compact {
+            content.pickerStyle(.menu)
+        } else {
+            content.pickerStyle(.segmented)
+        }
+        #else
+        content.pickerStyle(.segmented)
         #endif
     }
 }

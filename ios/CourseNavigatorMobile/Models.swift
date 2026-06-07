@@ -201,8 +201,8 @@ enum StudySection: String, Codable, CaseIterable, Identifiable {
         case .all: "全部"
         case .guide: "导读"
         case .outline: "大纲"
-        case .detailed: "解释"
-        case .high: "高保真"
+        case .detailed: "解读"
+        case .high: "详解"
         }
     }
 }
@@ -811,6 +811,12 @@ struct CourseItem: Codable, Identifiable, Hashable {
     var collectionDisplayName: String {
         let value = collectionTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         return value?.isEmpty == false ? value! : "未归档"
+    }
+
+    var collectionSectionDisplayName: String {
+        let group = collectionGroupTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !group.isEmpty else { return collectionDisplayName }
+        return "\(group) / \(collectionDisplayName)"
     }
 
     var hasPlayableLocalVideo: Bool {

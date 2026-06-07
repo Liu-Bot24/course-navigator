@@ -26,10 +26,31 @@ section() {
   printf '\n== %s ==\n' "$1"
 }
 
+volume_root_for_path() {
+  local path="$1"
+  local relative_volume_path volume_name
+  relative_volume_path="${path#/Volumes/}"
+  volume_name="${relative_volume_path%%/*}"
+  if [[ -n "$volume_name" && "$path" == /Volumes/* ]]; then
+    printf '/Volumes/%s' "$volume_name"
+  fi
+}
+
+is_mounted_volume_root() {
+  local volume_root="$1"
+  [[ -n "$volume_root" ]] && mount | grep -F " on $volume_root (" >/dev/null 2>&1
+}
+
 require_external_derived_data() {
-  if [[ "$DERIVED_DATA_DIR" == "$EXTERNAL_SSD/"* && ! -d "$EXTERNAL_SSD" ]]; then
-    printf 'External SSD is not mounted: %s\n' "$EXTERNAL_SSD" >&2
-    printf 'No build was started. Mount the SSD or set COURSE_NAVIGATOR_IOS_DERIVED_DATA to another safe path.\n' >&2
+  if [[ "$DERIVED_DATA_DIR" != /Volumes/* ]]; then
+    return
+  fi
+
+  local volume_root
+  volume_root="$(volume_root_for_path "$DERIVED_DATA_DIR")"
+  if ! is_mounted_volume_root "$volume_root"; then
+    printf 'DerivedData external volume is not mounted: %s\n' "$volume_root" >&2
+    printf 'No build was started. Mount the external volume or set COURSE_NAVIGATOR_IOS_DERIVED_DATA to another safe path.\n' >&2
     exit 1
   fi
 }
@@ -210,11 +231,8 @@ EOF
 install_app() {
   local device_id="$1"
   local device_name="$2"
-  local app_path="$DERIVED_DATA_DIR/Build/Products/$CONFIGURATION-iphoneos/$APP_NAME.app"
-  if [[ ! -d "$app_path" ]]; then
-    printf 'Built app was not found: %s\n' "$app_path" >&2
-    exit 1
-  fi
+  local app_path
+  app_path="$(find_built_app_path)" || exit 1
 
   section "Install: $device_name"
   xcrun devicectl device install app --device "$device_id" "$app_path"
@@ -223,6 +241,39 @@ install_app() {
     section "Launch: $device_name"
     xcrun devicectl device process launch --terminate-existing --device "$device_id" "$BUNDLE_ID" || true
   fi
+}
+
+find_built_app_path() {
+  local build_products_dir="$DERIVED_DATA_DIR/Build/Products/$CONFIGURATION-iphoneos"
+  local expected_app_path="$build_products_dir/$APP_NAME.app"
+  if [[ -d "$expected_app_path" ]]; then
+    printf '%s\n' "$expected_app_path"
+    return 0
+  fi
+
+  local candidates=()
+  local candidate
+  while IFS= read -r -d '' candidate; do
+    candidates+=("$candidate")
+  done < <(find "$build_products_dir" -maxdepth 1 -type d -name '*.app' -print0 2>/dev/null)
+
+  if [[ "${#candidates[@]}" -eq 1 ]]; then
+    printf '%s\n' "${candidates[0]}"
+    return 0
+  fi
+
+  printf 'Built app was not found: %s\n' "$expected_app_path" >&2
+  if [[ "${#candidates[@]}" -gt 1 ]]; then
+    printf 'Multiple built apps were found; set COURSE_NAVIGATOR_IOS_APP_NAME to the product name to install.\n' >&2
+    for candidate in "${candidates[@]}"; do
+      printf '  %s\n' "$candidate" >&2
+    done
+  elif [[ -d "$build_products_dir" ]]; then
+    printf 'Build products directory exists but contains no .app bundle: %s\n' "$build_products_dir" >&2
+  else
+    printf 'Build products directory does not exist: %s\n' "$build_products_dir" >&2
+  fi
+  return 1
 }
 
 section "Disk"

@@ -36,7 +36,7 @@
 		AFFD8981CA45EBBC888656B0 /* BackendDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackendDiscovery.swift; sourceTree = "<group>"; };
 		B55C667315EED33AEFF7024D /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
 		B8F63A4B7DD86A67E8E6B7F4 /* CourseNavigatorMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CourseNavigatorMobileApp.swift; sourceTree = "<group>"; };
-		CAAEEA5DAEAC1C926D2800EA /* CourseNavigatorMobile.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = CourseNavigatorMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CAAEEA5DAEAC1C926D2800EA /* Course Navigator.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Course Navigator.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		D1CD27A3CB7CFD5041E29008 /* CourseSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CourseSidebar.swift; sourceTree = "<group>"; };
 		E2C4FE9E8291B0D24C2EDD4D /* CourseAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CourseAPI.swift; sourceTree = "<group>"; };
 		FE6D72211F3A241002BF97A4 /* ImportCourseSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportCourseSheet.swift; sourceTree = "<group>"; };
@@ -46,7 +46,7 @@
 		0B2EFD5ECC22E2BF5C9CA305 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				CAAEEA5DAEAC1C926D2800EA /* CourseNavigatorMobile.app */,
+				CAAEEA5DAEAC1C926D2800EA /* Course Navigator.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -115,7 +115,7 @@
 			packageProductDependencies = (
 			);
 			productName = CourseNavigatorMobile;
-			productReference = CAAEEA5DAEAC1C926D2800EA /* CourseNavigatorMobile.app */;
+			productReference = CAAEEA5DAEAC1C926D2800EA /* Course Navigator.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */

@@ -3,29 +3,49 @@ import SwiftUI
 struct CourseSidebar: View {
     @Environment(AppModel.self) private var model
     @Binding var selectedCourseID: String?
-    @Binding var showingImport: Bool
     @Binding var showingDevices: Bool
     @State private var searchText = ""
+    @State private var expandedCategories = Set<String>()
+    @State private var expandedAlbums = Set<String>()
 
-    var groupedCourses: [(String, [CourseItem])] {
-        let groups = Dictionary(grouping: filteredCourses, by: \.collectionDisplayName)
-        return groups.keys.sorted().map { key in
-            (key, groups[key] ?? [])
+    private var groupedCourses: [CourseCategoryGroup] {
+        let categoryGroups = Dictionary(grouping: filteredCourses, by: Self.categoryTitle)
+        return categoryGroups.keys.sorted(by: Self.localizedAscending).map { categoryTitle in
+            let categoryCourses = categoryGroups[categoryTitle] ?? []
+            let albumGroups = Dictionary(grouping: categoryCourses, by: \.collectionDisplayName)
+            let albums = albumGroups.keys.sorted(by: Self.localizedAscending).map { albumTitle in
+                CourseAlbumGroup(
+                    categoryTitle: categoryTitle,
+                    title: albumTitle,
+                    courses: sortedCourses(albumGroups[albumTitle] ?? [])
+                )
+            }
+            return CourseCategoryGroup(title: categoryTitle, albums: albums)
         }
     }
 
-    var filteredCourses: [CourseItem] {
+    private var filteredCourses: [CourseItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return model.courses }
         return model.courses.filter { item in
             item.displayTitle.localizedCaseInsensitiveContains(query)
                 || item.title.localizedCaseInsensitiveContains(query)
                 || item.collectionDisplayName.localizedCaseInsensitiveContains(query)
+                || item.collectionSectionDisplayName.localizedCaseInsensitiveContains(query)
+                || Self.categoryTitle(for: item).localizedCaseInsensitiveContains(query)
         }
     }
 
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var courseIDs: [String] {
+        model.courses.map(\.id)
+    }
+
     var body: some View {
-        List(selection: $selectedCourseID) {
+        List {
             Section {
                 BackendHeader(showingDevices: $showingDevices)
             }
@@ -48,20 +68,51 @@ struct CourseSidebar: View {
                 ContentUnavailableView.search(text: searchText)
                     .listRowSeparator(.hidden)
             } else {
-                ForEach(groupedCourses, id: \.0) { collection, courses in
-                    Section(collection) {
-                        ForEach(courses) { item in
-                            NavigationLink(value: item.id) {
-                                CourseRow(item: item)
+                ForEach(groupedCourses) { category in
+                    DisclosureGroup(isExpanded: categoryExpansionBinding(for: category.title)) {
+                        ForEach(category.albums) { album in
+                            DisclosureGroup(isExpanded: albumExpansionBinding(for: album)) {
+                                ForEach(album.courses) { item in
+                                    Button {
+                                        selectedCourseID = item.id
+                                    } label: {
+                                        CourseRow(item: item)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .listRowBackground(courseRowBackground(for: item))
+                                }
+                            } label: {
+                                CourseGroupLabel(
+                                    title: album.title,
+                                    count: album.courses.count,
+                                    systemImage: "rectangle.stack"
+                                )
                             }
-                                .tag(item.id)
                         }
+                    } label: {
+                        CourseGroupLabel(
+                            title: category.title,
+                            count: category.courseCount,
+                            systemImage: "folder"
+                        )
                     }
                 }
             }
         }
+        .onAppear {
+            expandSelectedCoursePath()
+        }
+        .onChange(of: selectedCourseID) { _, _ in
+            expandSelectedCoursePath()
+        }
+        .onChange(of: courseIDs) { _, _ in
+            expandSelectedCoursePath()
+        }
         .navigationTitle("课程")
         .searchable(text: $searchText, prompt: "搜索课程或合集")
+        .refreshable {
+            await model.refreshAll()
+        }
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 Button {
@@ -76,12 +127,7 @@ struct CourseSidebar: View {
                 } label: {
                     Label("刷新", systemImage: "arrow.clockwise")
                 }
-                Button {
-                    showingImport = true
-                } label: {
-                    Label("导入", systemImage: "plus")
-                }
-                .disabled(!model.isBackendOnline)
+                .disabled(model.connectionStatus == .checking)
             }
         }
         .overlay {
@@ -90,6 +136,106 @@ struct CourseSidebar: View {
                     .padding()
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
             }
+        }
+    }
+
+    private func courseRowBackground(for item: CourseItem) -> Color {
+        item.id == selectedCourseID ? Color.accentColor.opacity(0.12) : Color.clear
+    }
+
+    private func categoryExpansionBinding(for title: String) -> Binding<Bool> {
+        Binding {
+            isSearching || expandedCategories.contains(title)
+        } set: { isExpanded in
+            if isExpanded {
+                expandedCategories.insert(title)
+            } else {
+                expandedCategories.remove(title)
+            }
+        }
+    }
+
+    private func albumExpansionBinding(for album: CourseAlbumGroup) -> Binding<Bool> {
+        let key = album.expansionKey
+        return Binding {
+            isSearching || expandedAlbums.contains(key)
+        } set: { isExpanded in
+            if isExpanded {
+                expandedAlbums.insert(key)
+            } else {
+                expandedAlbums.remove(key)
+            }
+        }
+    }
+
+    private func expandSelectedCoursePath() {
+        guard let selectedCourseID, let item = model.courses.first(where: { $0.id == selectedCourseID }) else { return }
+        let category = Self.categoryTitle(for: item)
+        expandedCategories.insert(category)
+        expandedAlbums.insert(Self.albumExpansionKey(categoryTitle: category, albumTitle: item.collectionDisplayName))
+    }
+
+    private func sortedCourses(_ courses: [CourseItem]) -> [CourseItem] {
+        courses.sorted { left, right in
+            let leftOrder = left.sortOrder ?? left.courseIndex
+            let rightOrder = right.sortOrder ?? right.courseIndex
+            if let leftOrder, let rightOrder, leftOrder != rightOrder {
+                return leftOrder < rightOrder
+            }
+            if leftOrder != nil, rightOrder == nil { return true }
+            if leftOrder == nil, rightOrder != nil { return false }
+            return left.displayTitle.localizedStandardCompare(right.displayTitle) == .orderedAscending
+        }
+    }
+
+    private static func categoryTitle(for item: CourseItem) -> String {
+        let value = item.collectionGroupTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value! : "未分类"
+    }
+
+    private static func albumExpansionKey(categoryTitle: String, albumTitle: String) -> String {
+        "\(categoryTitle)|\(albumTitle)"
+    }
+
+    private static func localizedAscending(_ left: String, _ right: String) -> Bool {
+        left.localizedStandardCompare(right) == .orderedAscending
+    }
+}
+
+private struct CourseCategoryGroup: Identifiable {
+    var title: String
+    var albums: [CourseAlbumGroup]
+
+    var id: String { title }
+    var courseCount: Int {
+        albums.reduce(0) { $0 + $1.courses.count }
+    }
+}
+
+private struct CourseAlbumGroup: Identifiable {
+    var categoryTitle: String
+    var title: String
+    var courses: [CourseItem]
+
+    var id: String { expansionKey }
+    var expansionKey: String {
+        "\(categoryTitle)|\(title)"
+    }
+}
+
+private struct CourseGroupLabel: View {
+    var title: String
+    var count: Int
+    var systemImage: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(title, systemImage: systemImage)
+                .font(.body.weight(.medium))
+            Spacer()
+            Text("\(count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
         }
     }
 }

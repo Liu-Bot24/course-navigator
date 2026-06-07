@@ -19,8 +19,11 @@ struct BackendSettingsView: View {
                     } else {
                         Picker("连接设备", selection: activeEndpointBinding) {
                             ForEach(model.endpoints) { endpoint in
-                                Text(endpoint.name).tag(Optional(endpoint.id))
+                                Text(endpointPickerTitle(for: endpoint)).tag(Optional(endpoint.id))
                             }
+                        }
+                        if let activeEndpoint = model.activeEndpoint {
+                            EndpointAddressText(activeEndpoint.baseURL)
                         }
                     }
                     Button {
@@ -30,12 +33,6 @@ struct BackendSettingsView: View {
                     }
                     .disabled(model.activeEndpoint == nil || model.connectionStatus == .checking)
                 }
-
-                BackendCapabilitySection(
-                    modelSettings: model.modelSettings,
-                    onlineASRSettings: model.onlineASRSettings,
-                    errorMessage: model.backendCapabilityError
-                )
 
                 Section("局域网发现") {
                     if discovery.backends.isEmpty {
@@ -59,9 +56,7 @@ struct BackendSettingsView: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(backend.name)
                                         .font(.headline)
-                                    Text(backend.baseURL)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    EndpointAddressText(backend.baseURL)
                                 }
                             }
                         }
@@ -72,6 +67,7 @@ struct BackendSettingsView: View {
                     } label: {
                         Label("重新扫描", systemImage: "arrow.clockwise")
                     }
+                    .disabled(discovery.isScanning)
 
                     if let errorMessage = discovery.errorMessage {
                         Text(errorMessage)
@@ -110,9 +106,7 @@ struct BackendSettingsView: View {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(endpoint.name)
                                             .font(.headline)
-                                        Text(endpoint.baseURL)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                                        EndpointAddressText(endpoint.baseURL)
                                     }
                                     Spacer()
                                     if model.activeEndpointID == endpoint.id {
@@ -151,6 +145,10 @@ struct BackendSettingsView: View {
             }
             .onDisappear {
                 discovery.stop()
+            }
+            .refreshable {
+                discovery.start()
+                await model.refreshAll()
             }
         }
     }
@@ -225,6 +223,23 @@ struct BackendSettingsView: View {
         return host
     }
 
+    private func endpointPickerTitle(for endpoint: BackendEndpoint) -> String {
+        let address = endpointShortAddress(endpoint)
+        let name = endpoint.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return address }
+        return name == address ? name : "\(name) · \(address)"
+    }
+
+    private func endpointShortAddress(_ endpoint: BackendEndpoint) -> String {
+        guard let url = endpoint.normalizedBaseURL, let host = url.host else {
+            return endpoint.baseURL
+        }
+        if let port = url.port {
+            return "\(host):\(port)"
+        }
+        return host
+    }
+
     private func connectEndpoint(_ endpointID: UUID) {
         Task {
             await model.selectEndpoint(endpointID)
@@ -235,69 +250,19 @@ struct BackendSettingsView: View {
     }
 }
 
-struct BackendCapabilitySection: View {
-    var modelSettings: ModelSettings?
-    var onlineASRSettings: OnlineASRSettings?
-    var errorMessage: String?
+private struct EndpointAddressText: View {
+    var address: String
 
-    var body: some View {
-        Section("后端能力") {
-            if let errorMessage {
-                Label(errorMessage, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.secondary)
-            } else if let modelSettings {
-                CapabilityRow(
-                    title: "学习地图",
-                    subtitle: modelSettings.profile(for: modelSettings.learningModelID)?.model ?? modelSettings.learningModelID,
-                    isReady: modelSettings.profile(for: modelSettings.learningModelID)?.hasAPIKey == true
-                )
-                CapabilityRow(
-                    title: "字幕翻译",
-                    subtitle: modelSettings.profile(for: modelSettings.translationModelID)?.model ?? modelSettings.translationModelID,
-                    isReady: modelSettings.profile(for: modelSettings.translationModelID)?.hasAPIKey == true
-                )
-                CapabilityRow(
-                    title: "ASR 校正",
-                    subtitle: modelSettings.profile(for: modelSettings.asrModelID)?.model ?? modelSettings.asrModelID,
-                    isReady: modelSettings.profile(for: modelSettings.asrModelID)?.hasAPIKey == true
-                )
-                CapabilityRow(
-                    title: "在线 ASR",
-                    subtitle: onlineASRSettings?.providerLabel ?? "未读取",
-                    isReady: onlineASRSettings?.isReady == true
-                )
-                HStack {
-                    Text("可用模型档案")
-                    Spacer()
-                    Text("\(modelSettings.configuredProfileCount)/\(modelSettings.profiles.count)")
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Label("连接后读取模型和字幕能力", systemImage: "cpu")
-                    .foregroundStyle(.secondary)
-            }
-        }
+    init(_ address: String) {
+        self.address = address
     }
-}
-
-struct CapabilityRow: View {
-    var title: String
-    var subtitle: String
-    var isReady: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: isReady ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(isReady ? .green : .orange)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                Text(subtitle.isEmpty ? "未配置" : subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
-            StatusBadge(text: isReady ? "可用" : "需配置", color: isReady ? .green : .orange)
-        }
+        Text(address)
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .textSelection(.enabled)
     }
 }

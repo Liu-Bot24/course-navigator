@@ -14,6 +14,14 @@ struct CourseAPI {
         try await get("/items")
     }
 
+    func listItemSummaries() async throws -> [CourseItem] {
+        try await get("/items", queryItems: [URLQueryItem(name: "summary", value: "true")])
+    }
+
+    func item(itemID: String) async throws -> CourseItem {
+        try await get("/items/\(itemID.urlPathEncoded)")
+    }
+
     func modelSettings() async throws -> ModelSettings {
         try await get("/settings/model")
     }
@@ -115,9 +123,10 @@ struct CourseAPI {
 
     private func get<T: Decodable>(
         _ path: String,
-        timeout: TimeInterval = Self.defaultTimeout
+        timeout: TimeInterval = Self.defaultTimeout,
+        queryItems: [URLQueryItem] = []
     ) async throws -> T {
-        guard let url = apiURL(path) else { throw CourseAPIError.invalidURL }
+        guard let url = apiURL(path, queryItems: queryItems) else { throw CourseAPIError.invalidURL }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         return try await perform(request, timeout: timeout)
@@ -183,13 +192,16 @@ struct CourseAPI {
         }
     }
 
-    private func apiURL(_ path: String) -> URL? {
+    private func apiURL(_ path: String, queryItems: [URLQueryItem] = []) -> URL? {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         let basePath = components?.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
         let apiPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         components?.path = "/" + [basePath, "api", apiPath]
             .filter { !$0.isEmpty }
             .joined(separator: "/")
+        if !queryItems.isEmpty {
+            components?.queryItems = queryItems
+        }
         return components?.url
     }
 

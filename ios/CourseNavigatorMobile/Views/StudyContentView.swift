@@ -2,7 +2,6 @@ import SwiftUI
 
 struct StudyContentView: View {
     var item: CourseItem
-    var outputLanguage: OutputLanguage
     var currentTime: Double?
     var seekTo: ((Double) -> Void)?
     @State private var tab: StudyTab = .guide
@@ -35,11 +34,10 @@ struct StudyContentView: View {
             case .outline:
                 OutlineRootView(study: item.study, currentTime: currentTime, seekTo: seekTo)
             case .notes:
-                NotesView(study: item.study)
+                NotesView(itemID: item.id, study: item.study)
             case .transcript:
                 TranscriptView(
                     item: item,
-                    outputLanguage: outputLanguage,
                     displayMode: $transcriptDisplayMode,
                     currentTime: currentTime,
                     focusAroundPlayback: activeFocusAroundPlayback,
@@ -55,7 +53,7 @@ struct StudyContentView: View {
                 Text(tab.title).tag(tab)
             }
         }
-        .pickerStyle(.segmented)
+        .adaptiveSegmentedPickerStyle()
     }
 
     private var focusPlaybackButton: some View {
@@ -242,49 +240,143 @@ struct OutlineNodeView: View {
 }
 
 struct NotesView: View {
+    var itemID: String
     var study: StudyMaterial?
+    @State private var expandedSections = Set<NotesSection>()
 
     var body: some View {
         if let study {
-            VStack(alignment: .leading, spacing: 16) {
-                StudySectionBlock(title: "详细解释", text: study.detailedNotes)
-                StudySectionBlock(title: "高保真文本", text: study.highFidelityText)
+            LazyVStack(alignment: .leading, spacing: 12) {
+                NoteDisclosureSection(
+                    section: .interpretation,
+                    text: study.detailedNotes,
+                    isExpanded: expansionBinding(for: .interpretation)
+                )
+                NoteDisclosureSection(
+                    section: .detailed,
+                    text: study.highFidelityText,
+                    isExpanded: expansionBinding(for: .detailed)
+                )
+            }
+            .onChange(of: itemID) { _, _ in
+                expandedSections = []
             }
         } else {
             EmptyStudyView()
         }
     }
+
+    private func expansionBinding(for section: NotesSection) -> Binding<Bool> {
+        Binding {
+            expandedSections.contains(section)
+        } set: { isExpanded in
+            if isExpanded {
+                expandedSections.insert(section)
+            } else {
+                expandedSections.remove(section)
+            }
+        }
+    }
+}
+
+private enum NotesSection: Hashable {
+    case interpretation
+    case detailed
+
+    var title: String {
+        switch self {
+        case .interpretation: "解读"
+        case .detailed: "详解"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .interpretation: "text.bubble"
+        case .detailed: "doc.text"
+        }
+    }
+}
+
+private struct NoteDisclosureSection: View {
+    var section: NotesSection
+    var text: String
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            if isExpanded {
+                ProgressiveStudyText(text: text)
+                    .padding(.top, 8)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Label(section.title, systemImage: section.systemImage)
+                    .font(.headline)
+                Spacer()
+                if text.isEmpty {
+                    StatusBadge(text: "暂无", color: .secondary)
+                }
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct ProgressiveStudyText: View {
+    var text: String
+    @State private var visibleCharacterLimit = 12000
+    private static let characterIncrement = 12000
+
+    var body: some View {
+        let visible = visibleText
+        VStack(alignment: .leading, spacing: 10) {
+            Text(visible.content.isEmpty ? "暂无内容" : visible.content)
+                .font(.body)
+                .textSelection(.enabled)
+
+            if visible.hasMore {
+                Button {
+                    visibleCharacterLimit += Self.characterIncrement
+                } label: {
+                    Label("继续加载", systemImage: "chevron.down")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private var visibleText: (content: String, hasMore: Bool) {
+        guard !text.isEmpty else { return ("", false) }
+        guard let end = text.index(text.startIndex, offsetBy: visibleCharacterLimit, limitedBy: text.endIndex) else {
+            return (text, false)
+        }
+        return (String(text[..<end]), end < text.endIndex)
+    }
 }
 
 struct TranscriptView: View {
     var item: CourseItem
-    var outputLanguage: OutputLanguage
     @Binding var displayMode: TranscriptDisplayMode
     var currentTime: Double?
     var focusAroundPlayback: Bool
     var seekTo: ((Double) -> Void)?
-    @State private var correctionSuggestions: [ASRCorrectionSuggestion] = []
-    @State private var correctionMessage: String?
 
     var body: some View {
         if transcriptLines.isEmpty {
             ContentUnavailableView("没有字幕", systemImage: "captions.bubble")
         } else {
             VStack(alignment: .leading, spacing: 12) {
-                ASRCorrectionPanel(
-                    item: item,
-                    outputLanguage: outputLanguage,
-                    suggestions: $correctionSuggestions,
-                    message: $correctionMessage
-                )
-
                 if hasTranslatedTranscript {
                     Picker("字幕显示", selection: $displayMode) {
                         ForEach(TranscriptDisplayMode.allCases) { mode in
                             Text(mode.title).tag(mode)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .adaptiveSegmentedPickerStyle()
                 }
 
                 LazyVStack(alignment: .leading, spacing: 10) {
@@ -312,10 +404,6 @@ struct TranscriptView: View {
                         }
                     }
                 }
-            }
-            .onChange(of: item.id) {
-                correctionSuggestions = []
-                correctionMessage = nil
             }
         }
     }
@@ -360,128 +448,6 @@ struct TranscriptView: View {
                 )
             }
         }
-    }
-}
-
-struct ASRCorrectionPanel: View {
-    @Environment(AppModel.self) private var model
-    var item: CourseItem
-    var outputLanguage: OutputLanguage
-    @Binding var suggestions: [ASRCorrectionSuggestion]
-    @Binding var message: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ViewThatFits(in: .horizontal) {
-                HStack {
-                    runButton
-                    Spacer()
-                    if !suggestions.isEmpty {
-                        StatusBadge(text: "\(suggestions.count) 条建议", color: .orange)
-                    }
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    runButton
-                    if !suggestions.isEmpty {
-                        StatusBadge(text: "\(suggestions.count) 条建议", color: .orange)
-                    }
-                }
-            }
-
-            if let message {
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if !suggestions.isEmpty {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(suggestions) { suggestion in
-                        ASRCorrectionSuggestionRow(
-                            suggestion: suggestion,
-                            accept: {
-                                await accept(suggestion)
-                            }
-                        )
-                    }
-                }
-            }
-        }
-        .padding()
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var runButton: some View {
-        Button {
-            Task { await runCorrection() }
-        } label: {
-            Label("生成 ASR 校正建议", systemImage: "wand.and.stars")
-        }
-        .buttonStyle(.bordered)
-        .disabled(model.isLoading || item.transcript.isEmpty)
-    }
-
-    private func runCorrection() async {
-        message = nil
-        suggestions = []
-        let result = await model.generateASRCorrectionSuggestions(
-            for: item,
-            outputLanguage: outputLanguage
-        )
-        suggestions = result
-        if result.isEmpty, model.errorMessage == nil {
-            message = "没有发现需要校正的字幕"
-        }
-    }
-
-    private func accept(_ suggestion: ASRCorrectionSuggestion) async {
-        await model.acceptASRCorrection(suggestion, itemID: item.id)
-        if model.errorMessage == nil {
-            suggestions.removeAll { $0.id == suggestion.id }
-            message = "已保存字幕"
-        }
-    }
-}
-
-struct ASRCorrectionSuggestionRow: View {
-    var suggestion: ASRCorrectionSuggestion
-    var accept: () async -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(formatTime(suggestion.start))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                StatusBadge(text: confidenceLabel, color: .orange)
-                Spacer()
-                Button {
-                    Task { await accept() }
-                } label: {
-                    Label("接受", systemImage: "checkmark")
-                }
-                .buttonStyle(.borderedProminent)
-            }
-
-            VStack(alignment: .leading, spacing: 5) {
-                TranscriptTextLine(label: "原文", text: suggestion.originalText)
-                TranscriptTextLine(label: "建议", text: suggestion.correctedText)
-            }
-
-            if !suggestion.reason.isEmpty {
-                Text(suggestion.reason)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding()
-        .background {
-            StudyRowBackground(isActive: false, cornerRadius: 8)
-        }
-    }
-
-    private var confidenceLabel: String {
-        "\(Int((suggestion.confidence * 100).rounded()))%"
     }
 }
 
@@ -614,7 +580,7 @@ struct EmptyStudyView: View {
         ContentUnavailableView(
             "还没有学习地图",
             systemImage: "map",
-            description: Text("先完成字幕提取，然后在上方生成学习地图。")
+            description: Text("请在电脑或 Web 端生成学习地图后刷新。")
         )
         .frame(minHeight: 180)
     }

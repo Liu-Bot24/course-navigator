@@ -20,7 +20,7 @@ struct VideoSourceSheet: View {
                             Text(kind.label).tag(kind)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .adaptiveSegmentedPickerStyle()
                     TextField(sourceKind.placeholder, text: $sourceText, axis: .vertical)
                         .videoSourceInputHints(isRemote: sourceKind == .remote)
                         .lineLimit(2...5)

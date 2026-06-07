@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 struct ImportCourseSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var url = ""
     @State private var mode: ExtractMode = .browser
     @State private var subtitleSource: TranscriptSource = .subtitles
@@ -57,6 +58,7 @@ struct ImportCourseSheet: View {
                             Text(mode.label).tag(mode)
                         }
                     }
+                    .adaptiveSegmentedPickerStyle()
                     if mode == .cookies {
                         TextField("电脑后端 cookies.txt 路径", text: $cookiesPath, axis: .vertical)
                             .lineLimit(1...3)
@@ -80,6 +82,7 @@ struct ImportCourseSheet: View {
                             Text(source.label).tag(source)
                         }
                     }
+                    .adaptiveSegmentedPickerStyle()
                     if let onlineASRReadinessMessage {
                         Label(onlineASRReadinessMessage, systemImage: "exclamationmark.triangle")
                             .font(.caption)
@@ -101,31 +104,32 @@ struct ImportCourseSheet: View {
                     Button("关闭") { dismiss() }
                 }
                 ToolbarItemGroup(placement: .confirmationAction) {
-                    Button("预览") {
-                        Task {
-                            guard let requestURL = normalizedVideoURL else { return }
-                            await model.previewCourse(
-                                url: requestURL,
-                                mode: mode,
-                                subtitleSource: subtitleSource,
-                                cookiesPath: activeCookiesPath
-                            )
+                    if usesCompactToolbarActions {
+                        Menu {
+                            Button {
+                                previewCourse()
+                            } label: {
+                                Label("预览", systemImage: "eye")
+                            }
+                            Button {
+                                extractCourse()
+                            } label: {
+                                Label("提取", systemImage: "tray.and.arrow.down")
+                            }
+                        } label: {
+                            Label("操作", systemImage: "ellipsis.circle")
                         }
-                    }
-                    .disabled(!canSubmit)
-                    Button("提取") {
-                        Task {
-                            guard let requestURL = normalizedVideoURL else { return }
-                            await model.extractCourse(
-                                url: requestURL,
-                                mode: mode,
-                                subtitleSource: subtitleSource,
-                                cookiesPath: activeCookiesPath
-                            )
-                            if model.errorMessage == nil { dismiss() }
+                        .disabled(!canSubmit)
+                    } else {
+                        Button("预览") {
+                            previewCourse()
                         }
+                        .disabled(!canSubmit)
+                        Button("提取") {
+                            extractCourse()
+                        }
+                        .disabled(!canSubmit)
                     }
-                    .disabled(!canSubmit)
                 }
             }
         }
@@ -146,6 +150,10 @@ struct ImportCourseSheet: View {
             && normalizedVideoURL != nil
             && (mode != .cookies || activeCookiesPath != nil)
             && isSubtitleSourceReady
+    }
+
+    private var usesCompactToolbarActions: Bool {
+        horizontalSizeClass == .compact
     }
 
     private var activeCookiesPath: String? {
@@ -169,6 +177,31 @@ struct ImportCourseSheet: View {
     private var onlineASRReadinessMessage: String? {
         guard subtitleSource == .onlineASR, !isOnlineASRReady else { return nil }
         return "在线 ASR 还未配置，请在后端设备中查看。"
+    }
+
+    private func previewCourse() {
+        Task {
+            guard let requestURL = normalizedVideoURL else { return }
+            await model.previewCourse(
+                url: requestURL,
+                mode: mode,
+                subtitleSource: subtitleSource,
+                cookiesPath: activeCookiesPath
+            )
+        }
+    }
+
+    private func extractCourse() {
+        Task {
+            guard let requestURL = normalizedVideoURL else { return }
+            await model.extractCourse(
+                url: requestURL,
+                mode: mode,
+                subtitleSource: subtitleSource,
+                cookiesPath: activeCookiesPath
+            )
+            if model.errorMessage == nil { dismiss() }
+        }
     }
 
     private func handlePackageImport(_ result: Result<[URL], Error>) {

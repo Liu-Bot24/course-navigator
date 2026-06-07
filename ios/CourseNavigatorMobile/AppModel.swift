@@ -175,13 +175,29 @@ final class AppModel {
         isLoading = true
         defer { isLoading = false }
         do {
-            courses = try await api.listItems().sorted(by: courseSort)
+            let previousSelectedCourse = selectedCourse
+            courses = try await api.listItemSummaries().sorted(by: courseSort)
             if selectedCourseID == nil {
                 selectedCourseID = courses.first?.id
             }
             if let selectedCourseID, !courses.contains(where: { $0.id == selectedCourseID }) {
                 self.selectedCourseID = courses.first?.id
             }
+            if let selectedCourseID, let previousSelectedCourse, previousSelectedCourse.id == selectedCourseID {
+                upsertCourse(previousSelectedCourse)
+            }
+            await refreshSelectedCourse()
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func refreshSelectedCourse() async {
+        guard let api, isBackendOnline, let selectedCourseID else { return }
+        do {
+            let item = try await api.item(itemID: selectedCourseID)
+            upsertCourse(item)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription

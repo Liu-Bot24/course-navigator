@@ -141,6 +141,41 @@ def test_extract_route_saves_course_item(tmp_path):
     assert list_response.json()[0]["id"] == "abc123"
 
 
+def test_list_items_summary_omits_heavy_mobile_fields(tmp_path):
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    item = CourseLibrary(tmp_path).get("abc123")
+    assert item is not None
+    item.study = StudyMaterial(
+        one_line="Short takeaway",
+        translated_title="示例课程",
+        context_summary="Context shown in compact metadata.",
+        time_map=[],
+        outline=[],
+        detailed_notes="Long notes should stay off the list response.",
+        high_fidelity_text="Long high-fidelity text should stay off the list response.",
+        translated_transcript=[TranscriptSegment(start=0, end=4, text="译文")],
+    )
+    CourseLibrary(tmp_path).save(item)
+
+    full_payload = client.get("/api/items").json()[0]
+    summary_payload = client.get("/api/items?summary=true").json()[0]
+
+    assert full_payload["transcript"][1]["text"] == "Important detail."
+    assert full_payload["study"]["detailed_notes"] == "Long notes should stay off the list response."
+    assert summary_payload["transcript"] == []
+    assert summary_payload["study"]["translated_title"] == "示例课程"
+    assert summary_payload["study"]["context_summary"] == "Context shown in compact metadata."
+    assert summary_payload["study"]["time_map"] == []
+    assert summary_payload["study"]["outline"] == []
+    assert summary_payload["study"]["detailed_notes"] == ""
+    assert summary_payload["study"]["high_fidelity_text"] == ""
+    assert summary_payload["study"]["translated_transcript"] == []
+
+
 def test_deeplearning_lesson_url_uses_lesson_slug_as_display_title(tmp_path):
     class DeepLearningRunner(FakeRunner):
         def fetch_metadata(self, request):

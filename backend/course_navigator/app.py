@@ -165,8 +165,11 @@ def create_app(
         return CookieTextResponse(path=str(cookie_path))
 
     @app.get("/api/items")
-    def list_items() -> list[CourseItem]:
-        return [_normalize_item_for_response(item, active_workspace_dir) for item in library.list_items()]
+    def list_items(summary: bool = False) -> list[CourseItem]:
+        items = [_normalize_item_for_response(item, active_workspace_dir) for item in library.list_items()]
+        if summary:
+            return [_summary_item_for_response(item) for item in items]
+        return items
 
     @app.get("/api/items/{item_id}")
     def get_item(item_id: str) -> CourseItem:
@@ -2247,6 +2250,35 @@ def _deduped_strings(values: list[str]) -> list[str]:
         result.append(normalized)
         seen.add(normalized)
     return result
+
+
+def _summary_item_for_response(item: CourseItem) -> CourseItem:
+    return item.model_copy(
+        update={
+            "transcript": [],
+            "study": _summary_study_for_response(item.study),
+        }
+    )
+
+
+def _summary_study_for_response(study: StudyMaterial | None) -> StudyMaterial | None:
+    if study is None:
+        return None
+    return StudyMaterial(
+        one_line=study.one_line,
+        translated_title=study.translated_title,
+        context_summary=study.context_summary,
+        time_map=[],
+        outline=[],
+        detailed_notes="",
+        high_fidelity_text="",
+        translated_transcript=[],
+        prerequisites=[],
+        thought_prompts=[],
+        review_suggestions=[],
+        beginner_focus=[],
+        experienced_guidance=[],
+    )
 
 
 def _with_available_video_source_for_response(item: CourseItem, workspace_dir: Path | None) -> CourseItem:

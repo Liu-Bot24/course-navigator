@@ -12,9 +12,6 @@ struct CourseDetail: View {
     @State private var showingCoursePackageExporter = false
     @State private var coursePackageDocument = CoursePackageDocument()
     @State private var coursePackageFilename = "course-navigator.course-nav.json"
-    @State private var outputLanguage: OutputLanguage = .zhCN
-    @State private var studySection: StudySection = .all
-    @State private var detailLevel: StudyDetailLevel = .faithful
     @State private var player: AVPlayer?
     @State private var currentPlaybackTime: Double = 0
     @State private var playbackPositionStore = PlaybackPositionStore()
@@ -33,8 +30,8 @@ struct CourseDetail: View {
                             canCacheVideo: item.canCacheToComputer,
                             isLoading: model.isLoading,
                             cacheVideo: { cacheVideo(item) },
-                            onPlaybackTimeChange: { seconds, force in
-                                savePlaybackTime(seconds, for: item.id, force: force)
+                            onPlaybackTimeChange: { itemID, seconds, force in
+                                savePlaybackTime(seconds, for: itemID, force: force)
                             }
                         )
                         CourseHeader(
@@ -52,15 +49,8 @@ struct CourseDetail: View {
                             JobProgressView(job: job)
                         }
 
-                        StudyActionPanel(
-                            outputLanguage: $outputLanguage,
-                            studySection: $studySection,
-                            detailLevel: $detailLevel
-                        )
-
                         StudyContentView(
                             item: item,
-                            outputLanguage: outputLanguage,
                             currentTime: activePlaybackTime,
                             seekTo: activeSeekAction
                         )
@@ -215,6 +205,7 @@ struct CoursePackageDocument: FileDocument {
 }
 
 struct CourseVideoPanel: View {
+    @Environment(\.scenePhase) private var scenePhase
     var item: CourseItem
     var playbackURL: URL?
     var resumeTime: Double?
@@ -223,8 +214,9 @@ struct CourseVideoPanel: View {
     var canCacheVideo: Bool
     var isLoading: Bool
     var cacheVideo: () -> Void
-    var onPlaybackTimeChange: (Double, Bool) -> Void
+    var onPlaybackTimeChange: (String, Double, Bool) -> Void
     @State private var timeObserver = PlayerTimeObserver()
+    @State private var observedItemID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -262,9 +254,12 @@ struct CourseVideoPanel: View {
             }
         }
         .task(id: playbackIdentity) {
+            saveCurrentPlaybackPosition(force: true)
+            player?.pause()
             timeObserver.invalidate()
             let initialTime = sanitizedResumeTime
             currentTime = initialTime
+            observedItemID = item.id
             if let playbackURL {
                 let nextPlayer = AVPlayer(url: playbackURL)
                 player = nextPlayer
@@ -274,7 +269,7 @@ struct CourseVideoPanel: View {
                 }
                 timeObserver.observe(nextPlayer) { seconds in
                     currentTime = seconds
-                    onPlaybackTimeChange(seconds, false)
+                    onPlaybackTimeChange(item.id, seconds, false)
                 }
             } else {
                 player = nil
@@ -282,11 +277,13 @@ struct CourseVideoPanel: View {
             }
         }
         .onDisappear {
-            if player != nil {
-                onPlaybackTimeChange(currentTime, true)
-            }
+            saveCurrentPlaybackPosition(force: true)
             player?.pause()
             timeObserver.invalidate()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase != .active else { return }
+            saveCurrentPlaybackPosition(force: true)
         }
     }
 
@@ -317,9 +314,14 @@ struct CourseVideoPanel: View {
         guard let player else { return }
         let clamped = clampedPlaybackTime(seconds)
         currentTime = clamped
-        onPlaybackTimeChange(clamped, true)
+        onPlaybackTimeChange(item.id, clamped, true)
         let time = CMTime(seconds: clamped, preferredTimescale: 600)
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    private func saveCurrentPlaybackPosition(force: Bool) {
+        guard player != nil, let observedItemID else { return }
+        onPlaybackTimeChange(observedItemID, currentTime, force)
     }
 
     private func clampedPlaybackTime(_ seconds: Double) -> Double {
@@ -487,15 +489,12 @@ struct CourseHeader: View {
                 .font(.title2.weight(.semibold))
                 .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 8) {
-                StatusBadge(text: item.videoSourceType?.label ?? "在线视频", color: .blue)
-                if item.transcript.isEmpty {
-                    StatusBadge(text: "无字幕", color: .orange)
-                } else {
-                    StatusBadge(text: "\(item.transcript.count) 条字幕", color: .green)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    statusBadges
                 }
-                if item.study != nil {
-                    StatusBadge(text: "已生成学习地图", color: .purple)
+                VStack(alignment: .leading, spacing: 6) {
+                    statusBadges
                 }
             }
 
@@ -505,63 +504,95 @@ struct CourseHeader: View {
                     .foregroundStyle(.secondary)
             }
 
-            HStack {
-                Button {
-                    showingVideoSource = true
-                } label: {
-                    Label("视频源", systemImage: "link")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    primaryActions(expands: false)
+                    Spacer()
+                    moreActions(expands: false)
                 }
-                .buttonStyle(.bordered)
-
-                Button {
-                    cacheVideo(item)
-                } label: {
-                    Label("缓存", systemImage: "arrow.down.circle")
+                VStack(spacing: 10) {
+                    primaryActions(expands: true)
+                    moreActions(expands: true)
                 }
-                .buttonStyle(.bordered)
-                .disabled(!item.canCacheToComputer)
-
-                Spacer()
-
-                Menu {
-                    Button {
-                        exportCourse(item)
-                    } label: {
-                        Label("导出课程包", systemImage: "square.and.arrow.up")
-                    }
-                    .disabled(item.transcript.isEmpty)
-
-                    Button {
-                        showingRename = true
-                    } label: {
-                        Label("编辑信息", systemImage: "pencil")
-                    }
-
-                    Button {
-                        openSource(item)
-                    } label: {
-                        Label("打开源链接", systemImage: "safari")
-                    }
-                    .disabled(MobileURLNormalizer.normalizedHTTPURLString(item.sourceURL) == nil)
-
-                    Button(role: .destructive) {
-                        showingRemoveCacheConfirmation = true
-                    } label: {
-                        Label("移除电脑缓存", systemImage: "xmark.bin")
-                    }
-                    .disabled(!item.canRemoveComputerCache)
-
-                    Button(role: .destructive) {
-                        showingDeleteConfirmation = true
-                    } label: {
-                        Label("删除课程", systemImage: "trash")
-                    }
-                } label: {
-                    Label("更多", systemImage: "ellipsis.circle")
-                }
-                .buttonStyle(.bordered)
             }
         }
+    }
+
+    @ViewBuilder
+    private var statusBadges: some View {
+        StatusBadge(text: item.videoSourceType?.label ?? "在线视频", color: .blue)
+        if item.transcript.isEmpty {
+            StatusBadge(text: "无字幕", color: .orange)
+        } else {
+            StatusBadge(text: "\(item.transcript.count) 条字幕", color: .green)
+        }
+        if item.study != nil {
+            StatusBadge(text: "已生成学习地图", color: .purple)
+        }
+    }
+
+    private func primaryActions(expands: Bool) -> some View {
+        let maxWidth: CGFloat? = expands ? .infinity : nil
+        return HStack(spacing: 10) {
+            Button {
+                showingVideoSource = true
+            } label: {
+                Label("视频源", systemImage: "link")
+                    .frame(maxWidth: maxWidth)
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                cacheVideo(item)
+            } label: {
+                Label("缓存", systemImage: "arrow.down.circle")
+                    .frame(maxWidth: maxWidth)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!item.canCacheToComputer)
+        }
+    }
+
+    private func moreActions(expands: Bool) -> some View {
+        let maxWidth: CGFloat? = expands ? .infinity : nil
+        return Menu {
+            Button {
+                exportCourse(item)
+            } label: {
+                Label("导出课程包", systemImage: "square.and.arrow.up")
+            }
+            .disabled(item.transcript.isEmpty)
+
+            Button {
+                showingRename = true
+            } label: {
+                Label("编辑信息", systemImage: "pencil")
+            }
+
+            Button {
+                openSource(item)
+            } label: {
+                Label("打开源链接", systemImage: "safari")
+            }
+            .disabled(MobileURLNormalizer.normalizedHTTPURLString(item.sourceURL) == nil)
+
+            Button(role: .destructive) {
+                showingRemoveCacheConfirmation = true
+            } label: {
+                Label("移除电脑缓存", systemImage: "xmark.bin")
+            }
+            .disabled(!item.canRemoveComputerCache)
+
+            Button(role: .destructive) {
+                showingDeleteConfirmation = true
+            } label: {
+                Label("删除课程", systemImage: "trash")
+            }
+        } label: {
+            Label("更多", systemImage: "ellipsis.circle")
+                .frame(maxWidth: maxWidth)
+        }
+        .buttonStyle(.bordered)
     }
 }
 
@@ -635,299 +666,6 @@ struct RenameCourseSheet: View {
             return String(Int(value))
         }
         return String(value)
-    }
-}
-
-struct StudyActionPanel: View {
-    @Environment(AppModel.self) private var model
-    @Binding var outputLanguage: OutputLanguage
-    @Binding var studySection: StudySection
-    @Binding var detailLevel: StudyDetailLevel
-    @State private var extractMode: ExtractMode = .browser
-    @State private var subtitleSource: TranscriptSource = .subtitles
-    @State private var showingExtractConfirmation = false
-    @State private var showingSubtitleImporter = false
-    @State private var showingSubtitleImportConfirmation = false
-    @State private var showingCookieTextSheet = false
-    @State private var cookiesPath = ""
-    @State private var cookieSaveMessage: String?
-    private static let maxSubtitleFileBytes = 5 * 1024 * 1024
-
-    private static var subtitleFileTypes: [UTType] {
-        [.plainText, .text] + ["srt", "vtt", "ass", "ssa", "txt"].compactMap { UTType(filenameExtension: $0) }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("字幕")
-                .font(.headline)
-            Picker("登录", selection: $extractMode) {
-                ForEach(ExtractMode.mobileChoices) { mode in
-                    Text(mode.label).tag(mode)
-                }
-            }
-            if extractMode == .cookies {
-                TextField("电脑后端 cookies.txt 路径", text: $cookiesPath, axis: .vertical)
-                    .lineLimit(1...3)
-                Button {
-                    cookieSaveMessage = nil
-                    showingCookieTextSheet = true
-                } label: {
-                    Label("填写 Cookie", systemImage: "key")
-                }
-                Text("用于当前课程重新提取字幕；Cookie 文本会保存到电脑后端。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if let cookieSaveMessage {
-                    Text(cookieSaveMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            Picker("来源", selection: $subtitleSource) {
-                ForEach([TranscriptSource.subtitles, .onlineASR, .asr]) { source in
-                    Text(source.label).tag(source)
-                }
-            }
-            if let onlineASRReadinessMessage {
-                Label(onlineASRReadinessMessage, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 10) {
-                    extractButton
-                    importSubtitleButton
-                }
-                VStack(spacing: 10) {
-                    extractButton
-                    importSubtitleButton
-                }
-            }
-
-            Divider()
-
-            Text("学习地图")
-                .font(.headline)
-            Picker("输出语言", selection: $outputLanguage) {
-                ForEach(OutputLanguage.allCases) { language in
-                    Text(language.label).tag(language)
-                }
-            }
-            Picker("内容", selection: $studySection) {
-                ForEach(StudySection.allCases) { section in
-                    Text(section.label).tag(section)
-                }
-            }
-            .pickerStyle(.segmented)
-            Picker("详细程度", selection: $detailLevel) {
-                ForEach(StudyDetailLevel.allCases) { level in
-                    Text(level.label).tag(level)
-                }
-            }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 10) {
-                    translateButton
-                    generateStudyButton
-                }
-                VStack(spacing: 10) {
-                    translateButton
-                    generateStudyButton
-                }
-            }
-            if let modelReadinessMessage {
-                Label(modelReadinessMessage, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding()
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .confirmationDialog("重新提取字幕？", isPresented: $showingExtractConfirmation, titleVisibility: .visible) {
-            Button("重新提取字幕", role: .destructive) {
-                startExtract()
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("会刷新当前字幕；如果新字幕不同，已有学习地图也可能需要重新生成。")
-        }
-        .confirmationDialog("导入字幕文件？", isPresented: $showingSubtitleImportConfirmation, titleVisibility: .visible) {
-            Button("导入并覆盖字幕", role: .destructive) {
-                showingSubtitleImporter = true
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("会用选择的字幕文件替换当前字幕；已有译文会清空，学习地图可能需要重新生成。")
-        }
-        .fileImporter(
-            isPresented: $showingSubtitleImporter,
-            allowedContentTypes: Self.subtitleFileTypes,
-            allowsMultipleSelection: false
-        ) { result in
-            handleSubtitleImport(result)
-        }
-        .sheet(isPresented: $showingCookieTextSheet) {
-            CookieTextSheet(cookiesPath: $cookiesPath, message: $cookieSaveMessage)
-        }
-    }
-
-    private var extractButton: some View {
-        Button {
-            guard let item = model.selectedCourse else { return }
-            if item.transcript.isEmpty {
-                startExtract()
-            } else {
-                showingExtractConfirmation = true
-            }
-        } label: {
-            Label(model.selectedCourse?.transcript.isEmpty == false ? "重新提取字幕" : "提取字幕", systemImage: "captions.bubble")
-                .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.bordered)
-        .disabled(!canExtractSubtitles)
-    }
-
-    private var importSubtitleButton: some View {
-        Button {
-            guard let item = model.selectedCourse else { return }
-            if item.transcript.isEmpty {
-                showingSubtitleImporter = true
-            } else {
-                showingSubtitleImportConfirmation = true
-            }
-        } label: {
-            Label("导入字幕文件", systemImage: "doc.badge.plus")
-                .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.bordered)
-        .disabled(model.selectedCourse == nil || model.isLoading)
-    }
-
-    private var canExtractSubtitles: Bool {
-        guard let item = model.selectedCourse else { return false }
-        return !model.isLoading
-            && !item.sourceURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && (extractMode != .cookies || activeCookiesPath != nil)
-            && isSubtitleSourceReady
-    }
-
-    private var activeCookiesPath: String? {
-        let trimmed = cookiesPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        return extractMode == .cookies && !trimmed.isEmpty ? trimmed : nil
-    }
-
-    private var isSubtitleSourceReady: Bool {
-        subtitleSource != .onlineASR || isOnlineASRReady
-    }
-
-    private var isOnlineASRReady: Bool {
-        guard let onlineASRSettings = model.onlineASRSettings else { return true }
-        return onlineASRSettings.isReady
-    }
-
-    private var onlineASRReadinessMessage: String? {
-        guard subtitleSource == .onlineASR, !isOnlineASRReady else { return nil }
-        return "在线 ASR 还未配置，请在后端设备中查看。"
-    }
-
-    private func startExtract() {
-        guard let item = model.selectedCourse else { return }
-        Task {
-            await model.extractSubtitles(
-                for: item,
-                mode: extractMode,
-                subtitleSource: subtitleSource,
-                cookiesPath: activeCookiesPath
-            )
-        }
-    }
-
-    private func handleSubtitleImport(_ result: Result<[URL], Error>) {
-        do {
-            guard let item = model.selectedCourse, let url = try result.get().first else { return }
-            let shouldStopAccessing = url.startAccessingSecurityScopedResource()
-            defer {
-                if shouldStopAccessing {
-                    url.stopAccessingSecurityScopedResource()
-                }
-            }
-            let values = try url.resourceValues(forKeys: [.fileSizeKey])
-            if let fileSize = values.fileSize, fileSize > Self.maxSubtitleFileBytes {
-                model.errorMessage = "字幕文件超过 5MB，请先在电脑端处理。"
-                return
-            }
-            guard let data = try readBoundedSubtitleData(from: url) else { return }
-            Task {
-                await model.importSubtitleFile(for: item, data: data, filename: url.lastPathComponent)
-            }
-        } catch {
-            model.errorMessage = error.localizedDescription
-        }
-    }
-
-    private func readBoundedSubtitleData(from url: URL) throws -> Data? {
-        let file = try FileHandle(forReadingFrom: url)
-        defer { try? file.close() }
-        let data = try file.read(upToCount: Self.maxSubtitleFileBytes + 1) ?? Data()
-        guard data.count <= Self.maxSubtitleFileBytes else {
-            model.errorMessage = "字幕文件超过 5MB，请先在电脑端处理。"
-            return nil
-        }
-        return data
-    }
-
-    private var translateButton: some View {
-        Button {
-            Task {
-                await model.translateTranscript(outputLanguage: outputLanguage)
-            }
-        } label: {
-            Label(model.selectedCourse?.study?.translatedTranscript.isEmpty == false ? "重新翻译字幕" : "翻译字幕", systemImage: "languages")
-                .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.bordered)
-        .disabled(model.selectedCourse?.transcript.isEmpty != false || model.isLoading || !isTranslationModelReady)
-    }
-
-    private var generateStudyButton: some View {
-        Button {
-            Task {
-                await model.generateStudy(
-                    section: studySection,
-                    outputLanguage: outputLanguage,
-                    detailLevel: detailLevel
-                )
-            }
-        } label: {
-            Label(model.selectedCourse?.study == nil ? "生成学习地图" : "重新生成", systemImage: "sparkles")
-                .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.borderedProminent)
-        .disabled(model.selectedCourse?.transcript.isEmpty != false || model.isLoading || !isLearningModelReady)
-    }
-
-    private var isTranslationModelReady: Bool {
-        guard let modelSettings = model.modelSettings else { return true }
-        return modelSettings.profile(for: modelSettings.translationModelID)?.hasAPIKey == true
-    }
-
-    private var isLearningModelReady: Bool {
-        guard let modelSettings = model.modelSettings else { return true }
-        return modelSettings.profile(for: modelSettings.learningModelID)?.hasAPIKey == true
-    }
-
-    private var modelReadinessMessage: String? {
-        guard model.selectedCourse?.transcript.isEmpty == false else { return nil }
-        if !isTranslationModelReady && !isLearningModelReady {
-            return "字幕翻译和学习地图模型还未配置，请在后端设备中查看。"
-        }
-        if !isTranslationModelReady {
-            return "字幕翻译模型还未配置，请在后端设备中查看。"
-        }
-        if !isLearningModelReady {
-            return "学习地图模型还未配置，请在后端设备中查看。"
-        }
-        return nil
     }
 }
 
