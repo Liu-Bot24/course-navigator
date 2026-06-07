@@ -30,6 +30,9 @@ struct CourseDetail: View {
                             resumeTime: playbackPositionStore.position(for: item.id),
                             player: $player,
                             currentTime: $currentPlaybackTime,
+                            canCacheVideo: item.canCacheToComputer,
+                            isLoading: model.isLoading,
+                            cacheVideo: { cacheVideo(item) },
                             onPlaybackTimeChange: { seconds, force in
                                 savePlaybackTime(seconds, for: item.id, force: force)
                             }
@@ -217,6 +220,9 @@ struct CourseVideoPanel: View {
     var resumeTime: Double?
     @Binding var player: AVPlayer?
     @Binding var currentTime: Double
+    var canCacheVideo: Bool
+    var isLoading: Bool
+    var cacheVideo: () -> Void
     var onPlaybackTimeChange: (Double, Bool) -> Void
     @State private var timeObserver = PlayerTimeObserver()
 
@@ -234,12 +240,25 @@ struct CourseVideoPanel: View {
                     seekForward: { seek(by: 15) }
                 )
             } else {
-                ContentUnavailableView(
-                    "当前没有可直接播放的视频",
-                    systemImage: "video.slash",
-                    description: Text("可以在电脑后端缓存视频，或为课程绑定电脑/NAS 上的视频文件。")
-                )
+                VStack(spacing: 12) {
+                    ContentUnavailableView(
+                        "当前没有可直接播放的视频",
+                        systemImage: "video.slash",
+                        description: Text(emptyVideoDescription)
+                    )
+                    if canCacheVideo {
+                        Button {
+                            cacheVideo()
+                        } label: {
+                            Label("缓存到电脑", systemImage: "arrow.down.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isLoading)
+                    }
+                }
                 .frame(minHeight: 220)
+                .frame(maxWidth: .infinity)
             }
         }
         .task(id: playbackIdentity) {
@@ -282,6 +301,12 @@ struct CourseVideoPanel: View {
             return min(positiveTime, max(0, duration - 1))
         }
         return positiveTime
+    }
+
+    private var emptyVideoDescription: String {
+        canCacheVideo
+            ? "这门课还没有电脑缓存。先让电脑后端缓存视频，再在手机上播放。"
+            : "可以为课程绑定电脑/NAS 上的视频文件，或在电脑端准备可播放的视频源。"
     }
 
     private func seek(by delta: Double) {
@@ -626,6 +651,7 @@ struct StudyActionPanel: View {
     @State private var showingCookieTextSheet = false
     @State private var cookiesPath = ""
     @State private var cookieSaveMessage: String?
+    private static let maxSubtitleFileBytes = 5 * 1024 * 1024
 
     private static var subtitleFileTypes: [UTType] {
         [.plainText, .text] + ["srt", "vtt", "ass", "ssa", "txt"].compactMap { UTType(filenameExtension: $0) }
@@ -662,6 +688,11 @@ struct StudyActionPanel: View {
                 ForEach([TranscriptSource.subtitles, .onlineASR, .asr]) { source in
                     Text(source.label).tag(source)
                 }
+            }
+            if let onlineASRReadinessMessage {
+                Label(onlineASRReadinessMessage, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) {
@@ -703,6 +734,11 @@ struct StudyActionPanel: View {
                     translateButton
                     generateStudyButton
                 }
+            }
+            if let modelReadinessMessage {
+                Label(modelReadinessMessage, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding()
@@ -772,11 +808,26 @@ struct StudyActionPanel: View {
         return !model.isLoading
             && !item.sourceURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && (extractMode != .cookies || activeCookiesPath != nil)
+            && isSubtitleSourceReady
     }
 
     private var activeCookiesPath: String? {
         let trimmed = cookiesPath.trimmingCharacters(in: .whitespacesAndNewlines)
         return extractMode == .cookies && !trimmed.isEmpty ? trimmed : nil
+    }
+
+    private var isSubtitleSourceReady: Bool {
+        subtitleSource != .onlineASR || isOnlineASRReady
+    }
+
+    private var isOnlineASRReady: Bool {
+        guard let onlineASRSettings = model.onlineASRSettings else { return true }
+        return onlineASRSettings.isReady
+    }
+
+    private var onlineASRReadinessMessage: String? {
+        guard subtitleSource == .onlineASR, !isOnlineASRReady else { return nil }
+        return "在线 ASR 还未配置，请在后端设备中查看。"
     }
 
     private func startExtract() {
@@ -801,17 +852,28 @@ struct StudyActionPanel: View {
                 }
             }
             let values = try url.resourceValues(forKeys: [.fileSizeKey])
-            if let fileSize = values.fileSize, fileSize > 5 * 1024 * 1024 {
+            if let fileSize = values.fileSize, fileSize > Self.maxSubtitleFileBytes {
                 model.errorMessage = "字幕文件超过 5MB，请先在电脑端处理。"
                 return
             }
-            let data = try Data(contentsOf: url)
+            guard let data = try readBoundedSubtitleData(from: url) else { return }
             Task {
                 await model.importSubtitleFile(for: item, data: data, filename: url.lastPathComponent)
             }
         } catch {
             model.errorMessage = error.localizedDescription
         }
+    }
+
+    private func readBoundedSubtitleData(from url: URL) throws -> Data? {
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        let data = try file.read(upToCount: Self.maxSubtitleFileBytes + 1) ?? Data()
+        guard data.count <= Self.maxSubtitleFileBytes else {
+            model.errorMessage = "字幕文件超过 5MB，请先在电脑端处理。"
+            return nil
+        }
+        return data
     }
 
     private var translateButton: some View {
@@ -824,7 +886,7 @@ struct StudyActionPanel: View {
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.bordered)
-        .disabled(model.selectedCourse?.transcript.isEmpty != false || model.isLoading)
+        .disabled(model.selectedCourse?.transcript.isEmpty != false || model.isLoading || !isTranslationModelReady)
     }
 
     private var generateStudyButton: some View {
@@ -841,7 +903,31 @@ struct StudyActionPanel: View {
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
-        .disabled(model.selectedCourse?.transcript.isEmpty != false || model.isLoading)
+        .disabled(model.selectedCourse?.transcript.isEmpty != false || model.isLoading || !isLearningModelReady)
+    }
+
+    private var isTranslationModelReady: Bool {
+        guard let modelSettings = model.modelSettings else { return true }
+        return modelSettings.profile(for: modelSettings.translationModelID)?.hasAPIKey == true
+    }
+
+    private var isLearningModelReady: Bool {
+        guard let modelSettings = model.modelSettings else { return true }
+        return modelSettings.profile(for: modelSettings.learningModelID)?.hasAPIKey == true
+    }
+
+    private var modelReadinessMessage: String? {
+        guard model.selectedCourse?.transcript.isEmpty == false else { return nil }
+        if !isTranslationModelReady && !isLearningModelReady {
+            return "字幕翻译和学习地图模型还未配置，请在后端设备中查看。"
+        }
+        if !isTranslationModelReady {
+            return "字幕翻译模型还未配置，请在后端设备中查看。"
+        }
+        if !isLearningModelReady {
+            return "学习地图模型还未配置，请在后端设备中查看。"
+        }
+        return nil
     }
 }
 

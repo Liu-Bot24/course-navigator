@@ -54,7 +54,7 @@ struct BackendSettingsView: View {
                             Button {
                                 let endpoint = BackendEndpoint(name: backend.name, baseURL: backend.baseURL)
                                 let endpointID = model.saveEndpoint(endpoint, mergeByBaseURL: true)
-                                Task { await model.selectEndpoint(endpointID) }
+                                connectEndpoint(endpointID)
                             } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(backend.name)
@@ -81,7 +81,7 @@ struct BackendSettingsView: View {
                 }
 
                 Section("添加或更新") {
-                    TextField("名称", text: $draft.name)
+                    TextField("名称（可选）", text: $draft.name)
                     TextField("后端地址，例如 http://电脑局域网IP:18000", text: $draft.baseURL)
                         .urlInputHints()
                     if let draftAddressWarning {
@@ -104,7 +104,7 @@ struct BackendSettingsView: View {
                     } else {
                         ForEach(model.endpoints) { endpoint in
                             Button {
-                                Task { await model.selectEndpoint(endpoint.id) }
+                                connectEndpoint(endpoint.id)
                             } label: {
                                 HStack(spacing: 10) {
                                     VStack(alignment: .leading, spacing: 4) {
@@ -159,21 +159,33 @@ struct BackendSettingsView: View {
         Binding {
             model.activeEndpointID
         } set: { id in
-            Task { await model.selectEndpoint(id) }
+            guard let id else {
+                Task { await model.selectEndpoint(nil) }
+                return
+            }
+            connectEndpoint(id)
         }
     }
 
     private var canSaveDraft: Bool {
-        !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && draft.normalizedBaseURL != nil
+        draft.normalizedBaseURL != nil
             && draft.isUsableOnCurrentDevice
     }
 
     private var draftAddressWarning: String? {
         let trimmedBaseURL = draft.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedBaseURL.isEmpty else { return nil }
+        if draft.hasUnsupportedBackendPath {
+            return "后端地址只需要电脑根地址；可以粘贴 /api 开头的地址，但不要填写其它路径。"
+        }
         guard draft.normalizedBaseURL != nil else {
             return "后端地址需要是 http/https 地址，例如 http://电脑局域网IP:18000。"
+        }
+        if draft.isWildcardBaseURL {
+            return "不要填写 0.0.0.0；这是电脑后端的监听地址。请填写脚本打印的局域网 IP。"
+        }
+        if draft.isLinkLocalBaseURL {
+            return "不要填写 169.254 或 fe80 开头的地址；请确认电脑和手机在同一 Wi-Fi 后使用局域网地址。"
         }
         #if targetEnvironment(simulator)
         return nil
@@ -191,12 +203,35 @@ struct BackendSettingsView: View {
         }
         let endpoint = BackendEndpoint(
             id: draft.id,
-            name: draft.name.trimmingCharacters(in: .whitespacesAndNewlines),
+            name: normalizedDraftName,
             baseURL: draft.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         )
         let endpointID = model.saveEndpoint(endpoint, mergeByBaseURL: true)
         draft = BackendEndpoint(name: "", baseURL: "")
-        Task { await model.selectEndpoint(endpointID) }
+        connectEndpoint(endpointID)
+    }
+
+    private var normalizedDraftName: String {
+        let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty {
+            return name
+        }
+        guard let url = draft.normalizedBaseURL, let host = url.host else {
+            return "电脑后端"
+        }
+        if let port = url.port {
+            return "\(host):\(port)"
+        }
+        return host
+    }
+
+    private func connectEndpoint(_ endpointID: UUID) {
+        Task {
+            await model.selectEndpoint(endpointID)
+            if model.isBackendOnline {
+                dismiss()
+            }
+        }
     }
 }
 

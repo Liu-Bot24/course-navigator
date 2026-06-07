@@ -2,11 +2,12 @@ import Foundation
 
 struct CourseAPI {
     var baseURL: URL
+    private static let healthTimeout: TimeInterval = 5
     private static let defaultTimeout: TimeInterval = 20
     private static let computerPickerTimeout: TimeInterval = 300
 
     func health() async throws -> HealthResponse {
-        try await get("/health")
+        try await get("/health", timeout: Self.healthTimeout)
     }
 
     func listItems() async throws -> [CourseItem] {
@@ -162,7 +163,13 @@ struct CourseAPI {
     ) async throws -> T {
         var request = request
         request.timeoutInterval = timeout
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError {
+            throw CourseAPIError.transport(Self.transportMessage(for: error))
+        }
         guard let http = response as? HTTPURLResponse else {
             throw CourseAPIError.invalidResponse
         }
@@ -202,6 +209,27 @@ struct CourseAPI {
         }
         return nil
     }
+
+    private static func transportMessage(for error: URLError) -> String {
+        switch error.code {
+        case .timedOut:
+            "连接电脑后端超时，请确认电脑后端已启动，并且 iPhone/iPad 和电脑在同一局域网。"
+        case .cannotFindHost:
+            "找不到这个电脑后端地址，请检查局域网 IP 或 .local 地址是否填对。"
+        case .cannotConnectToHost:
+            "无法连接电脑后端，请确认脚本已启动，且没有被防火墙或网络隔离拦住。"
+        case .networkConnectionLost:
+            "连接电脑后端时网络中断，请确认 Wi-Fi 稳定后重试。"
+        case .notConnectedToInternet:
+            "当前设备没有可用网络，请连接到和电脑相同的 Wi-Fi 后重试。"
+        case .appTransportSecurityRequiresSecureConnection:
+            "iOS 阻止了这个后端地址，请改用脚本打印的局域网 HTTP 地址。"
+        case .cancelled:
+            "请求已取消"
+        default:
+            "无法连接电脑后端：\(error.localizedDescription)"
+        }
+    }
 }
 
 enum CourseAPIError: LocalizedError {
@@ -209,6 +237,7 @@ enum CourseAPIError: LocalizedError {
     case invalidResponse
     case server(message: String)
     case decode(String)
+    case transport(String)
 
     var errorDescription: String? {
         switch self {
@@ -220,6 +249,8 @@ enum CourseAPIError: LocalizedError {
             message
         case .decode(let message):
             "无法解析后端数据：\(message)"
+        case .transport(let message):
+            message
         }
     }
 }

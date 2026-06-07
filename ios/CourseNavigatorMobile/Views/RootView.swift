@@ -4,6 +4,7 @@ struct RootView: View {
     @Environment(AppModel.self) private var model
     @State private var showingImport = false
     @State private var showingDevices = false
+    @State private var didOfferInitialBackendSetup = false
 
     var body: some View {
         @Bindable var model = model
@@ -26,6 +27,12 @@ struct RootView: View {
         .sheet(isPresented: $showingDevices) {
             BackendSettingsView()
         }
+        .onAppear {
+            offerInitialBackendSetupIfNeeded()
+        }
+        .onChange(of: model.connectionStatus) { _, _ in
+            offerInitialBackendSetupIfNeeded()
+        }
         .alert("需要处理", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
@@ -33,6 +40,36 @@ struct RootView: View {
             Button("好", role: .cancel) { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
+        }
+    }
+
+    private func offerInitialBackendSetupIfNeeded() {
+        guard Self.shouldOfferInitialBackendSetup(
+            didOffer: didOfferInitialBackendSetup,
+            isShowingDevices: showingDevices,
+            isShowingImport: showingImport,
+            endpointCount: model.endpoints.count,
+            connectionStatus: model.connectionStatus
+        ) else { return }
+        didOfferInitialBackendSetup = true
+        showingDevices = true
+    }
+
+    static func shouldOfferInitialBackendSetup(
+        didOffer: Bool,
+        isShowingDevices: Bool,
+        isShowingImport: Bool,
+        endpointCount: Int,
+        connectionStatus: ConnectionStatus
+    ) -> Bool {
+        guard !didOffer, !isShowingDevices, !isShowingImport else { return false }
+        switch connectionStatus {
+        case .online, .checking:
+            return false
+        case .unknown:
+            return endpointCount == 0
+        case .offline:
+            return true
         }
     }
 }

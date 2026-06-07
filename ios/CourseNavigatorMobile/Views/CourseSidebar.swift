@@ -51,7 +51,9 @@ struct CourseSidebar: View {
                 ForEach(groupedCourses, id: \.0) { collection, courses in
                     Section(collection) {
                         ForEach(courses) { item in
-                            CourseRow(item: item)
+                            NavigationLink(value: item.id) {
+                                CourseRow(item: item)
+                            }
                                 .tag(item.id)
                         }
                     }

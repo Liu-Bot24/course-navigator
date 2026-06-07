@@ -10,6 +10,8 @@
 - 在设备上打开 Developer Mode。通常路径是：设置 -> 隐私与安全性 -> Developer Mode，然后按提示重启。
 - 本机硬盘空间紧张时，在 Xcode 的 Settings -> Locations 里把 Derived Data 设到外置 SSD，例如 `/Volumes/Acer SSD N5000/CodexBuilds/XcodeDerivedData`。
 - 如果只是检查准备状态，先运行 `bash scripts/ios-device-preflight.sh`。它会打印当前磁盘、Xcode、局域网地址和真机连接状态；没有检测到设备时不会开始构建。
+  预检脚本也会默认拒绝把推荐 DerivedData 路径设成本机磁盘，避免检查阶段误创建本机缓存目录。
+  预检会显示 Xcode first launch status；如果不是 ready，先打开 Xcode 并处理许可、登录或组件安装提示。
 
 ## 电脑端后端
 
@@ -27,10 +29,11 @@ http://<脚本打印的局域网 IP>:18000
 
 如果环境变量把 `COURSE_NAVIGATOR_API_HOST` 设成 `127.0.0.1` 或 `localhost`，移动端启动脚本会直接退出；iPhone/iPad 只能连接 `0.0.0.0` 或局域网地址监听的电脑后端。
 
-如果手滑粘贴成 `http://<局域网 IP>:18000/api` 或 `http://<局域网 IP>:18000/api/health`，App 会自动按后端根地址处理。
+如果手滑粘贴成 `http://<局域网 IP>:18000/api`、`http://<局域网 IP>:18000/api/health` 或其它 `/api/...` 接口地址，App 会自动按后端根地址处理。非 `/api` 开头的路径会被拒绝，请改填脚本打印的电脑根地址。
 
 局域网 IP 可能会随 Wi-Fi、路由器或重启变化。iOS App 里的“后端设备”应以 `scripts/start-mobile-backend.sh` 或 `scripts/ios-device-preflight.sh` 当次打印的 URL 为准。
 如果脚本打印多个地址，优先选和 iPhone/iPad 在同一 Wi-Fi 或同一局域网网段的地址；括号里的 `en0`、`en5` 等是 Mac 网络接口名。
+不要把 `0.0.0.0:18000` 填进 iOS App；它只是电脑后端的监听地址，不是手机能访问的目标地址。也不要使用 `169.254.*` 或 `fe80:*` 这类链路本地地址，通常说明当前网络没有拿到可用局域网地址。
 
 脚本也会用 macOS 自带 Bonjour 广播 `_coursenav._tcp`。iOS App 的“后端设备”会自动扫描同一局域网里的 Course Navigator 后端；如果扫描到了，直接点设备即可保存并连接。扫描不到时再手动填写脚本打印的 URL。
 
@@ -54,6 +57,10 @@ bash scripts/ios-device-preflight.sh
 bash scripts/ios-install-device.sh
 ```
 
+脚本使用 Xcode 里的 Apple Account 做自动签名，并允许 Xcode 在需要时注册当前连接的调试设备；如果 Xcode 还没有登录账号或还没选 Personal Team，脚本会在签名阶段失败，此时打开工程在 Signing & Capabilities 里选择你的 Personal Team 后再运行。
+如果 Xcode 还没完成首次启动任务，安装脚本会在构建前退出；先打开 Xcode，完成许可、登录或组件安装提示后再重试。
+如果签名或 provisioning 失败，脚本会在 `xcodebuild` 原始错误后打印排查提示。优先检查 Apple Account、Personal Team、Bundle Identifier 是否冲突，以及设备是否已解锁、信任此 Mac 并开启 Developer Mode。
+
 如果只连接了一台设备，脚本会自动选择它。如果 iPhone 16 Pro 和 iPad mini 同时连接，脚本会先列出设备并退出，避免装错目标。此时可以指定其中一台：
 
 ```bash
@@ -70,6 +77,14 @@ COURSE_NAVIGATOR_IOS_INSTALL_ALL=1 bash scripts/ios-install-device.sh
 
 ```text
 /Volumes/Acer SSD N5000/CodexBuilds/course-navigator-ios-device-install
+```
+
+安装脚本会在构建前检查这个目录所在磁盘的剩余空间，默认要求至少 8GiB 可用。如果 `COURSE_NAVIGATOR_IOS_DERIVED_DATA` 被误设成本机路径，脚本会直接退出，避免把大构建缓存写进本机硬盘。只有在你明确接受这个风险时，才用：
+
+```bash
+COURSE_NAVIGATOR_ALLOW_LOCAL_DERIVED_DATA=1 \
+COURSE_NAVIGATOR_IOS_DERIVED_DATA=/你确认有足够空间的路径 \
+bash scripts/ios-install-device.sh
 ```
 
 如果 Xcode 的个人账号需要指定 Team ID 或 Bundle ID，可以这样传入：

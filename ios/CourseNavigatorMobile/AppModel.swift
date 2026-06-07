@@ -20,7 +20,7 @@ final class AppModel {
 
     init() {
         let stored = store.load()
-        let usableStoredEndpoints = stored.filter(\.isUsableOnCurrentDevice)
+        let usableStoredEndpoints = Self.normalizedUsableStoredEndpoints(from: stored)
         endpoints = usableStoredEndpoints.isEmpty ? EndpointStore.defaultEndpoints : usableStoredEndpoints
         activeEndpointID = store.loadActiveEndpointID() ?? endpoints.first?.id
         let loadedActiveEndpointID = activeEndpointID
@@ -69,10 +69,13 @@ final class AppModel {
     @discardableResult
     func saveEndpoint(_ endpoint: BackendEndpoint, mergeByBaseURL: Bool = false) -> UUID {
         var endpoint = endpoint
+        guard let normalizedBaseURL = endpoint.normalizedBaseURL?.absoluteString else {
+            return endpoint.id
+        }
+        endpoint.baseURL = normalizedBaseURL
         let originalEndpointID = endpoint.id
         if
             mergeByBaseURL,
-            let normalizedBaseURL = endpoint.normalizedBaseURL?.absoluteString,
             let index = endpoints.firstIndex(where: { $0.normalizedBaseURL?.absoluteString == normalizedBaseURL })
         {
             endpoint.id = endpoints[index].id
@@ -120,6 +123,13 @@ final class AppModel {
             return
         }
         await refreshCourses()
+    }
+
+    func refreshAfterForegroundActivation() async {
+        guard activeJob == nil, !isLoading else { return }
+        if case .checking = connectionStatus { return }
+
+        await refreshAll()
     }
 
     func checkHealth() async {
@@ -609,6 +619,28 @@ final class AppModel {
     private func normalizedOptional(_ value: String) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func normalizedUsableStoredEndpoints(from endpoints: [BackendEndpoint]) -> [BackendEndpoint] {
+        var seenBaseURLs = Set<String>()
+        var normalizedEndpoints: [BackendEndpoint] = []
+
+        for storedEndpoint in endpoints {
+            guard
+                storedEndpoint.isUsableOnCurrentDevice,
+                let normalizedBaseURL = storedEndpoint.normalizedBaseURL?.absoluteString,
+                !seenBaseURLs.contains(normalizedBaseURL)
+            else {
+                continue
+            }
+
+            var endpoint = storedEndpoint
+            endpoint.baseURL = normalizedBaseURL
+            normalizedEndpoints.append(endpoint)
+            seenBaseURLs.insert(normalizedBaseURL)
+        }
+
+        return normalizedEndpoints
     }
 }
 

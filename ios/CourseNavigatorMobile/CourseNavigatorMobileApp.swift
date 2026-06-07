@@ -14,7 +14,7 @@ struct CourseNavigatorMobileApp: App {
                 }
                 .onChange(of: scenePhase) { _, phase in
                     guard phase == .active else { return }
-                    Task { await model.refreshAll() }
+                    Task { await model.refreshAfterForegroundActivation() }
                 }
         }
     }

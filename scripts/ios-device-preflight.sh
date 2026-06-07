@@ -4,7 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-DERIVED_DATA_DIR="${COURSE_NAVIGATOR_IOS_DERIVED_DATA:-/Volumes/Acer SSD N5000/CodexBuilds/XcodeDerivedData}"
+EXTERNAL_SSD="/Volumes/Acer SSD N5000"
+DEFAULT_DERIVED_DATA_DIR="$EXTERNAL_SSD/CodexBuilds/XcodeDerivedData"
+DERIVED_DATA_DIR="${COURSE_NAVIGATOR_IOS_DERIVED_DATA:-$DEFAULT_DERIVED_DATA_DIR}"
+ALLOW_LOCAL_DERIVED_DATA="${COURSE_NAVIGATOR_ALLOW_LOCAL_DERIVED_DATA:-0}"
+MIN_DERIVED_DATA_FREE_GIB="${COURSE_NAVIGATOR_IOS_MIN_DERIVED_DATA_FREE_GIB:-8}"
 PROJECT_PATH="ios/CourseNavigatorMobile.xcodeproj"
 API_HOST="${COURSE_NAVIGATOR_API_HOST:-0.0.0.0}"
 API_PORT="${COURSE_NAVIGATOR_API_PORT:-18000}"
@@ -65,14 +69,37 @@ print_lan_urls() {
   [[ -n "$printed_addresses" ]]
 }
 
+check_derived_data_path() {
+  local min_free_gib="$MIN_DERIVED_DATA_FREE_GIB"
+  if [[ -z "$min_free_gib" || "$min_free_gib" == *[!0-9]* ]]; then
+    min_free_gib=8
+  fi
+
+  if [[ "$DERIVED_DATA_DIR" != /Volumes/* && "$ALLOW_LOCAL_DERIVED_DATA" != "1" ]]; then
+    printf 'Recommended Xcode Derived Data is not on an external volume: %s\n' "$DERIVED_DATA_DIR"
+    printf 'Set COURSE_NAVIGATOR_IOS_DERIVED_DATA to the external SSD path, or set COURSE_NAVIGATOR_ALLOW_LOCAL_DERIVED_DATA=1 intentionally.\n'
+    return
+  fi
+
+  mkdir -p "$DERIVED_DATA_DIR"
+
+  local available_gib
+  available_gib="$(df -g "$DERIVED_DATA_DIR" | awk 'NR == 2 {print $4}')"
+  if [[ -n "$available_gib" && "$available_gib" -lt "$min_free_gib" ]]; then
+    printf 'Recommended Xcode Derived Data volume has only %s GiB free: %s\n' "$available_gib" "$DERIVED_DATA_DIR"
+    return
+  fi
+
+  printf 'Recommended Xcode Derived Data: %s\n' "$DERIVED_DATA_DIR"
+}
+
 section "Disk"
 df -h / || true
-if [[ -d /Volumes/Acer\ SSD\ N5000 ]]; then
-  df -h /Volumes/Acer\ SSD\ N5000 || true
-  mkdir -p "$DERIVED_DATA_DIR"
-  printf 'Recommended Xcode Derived Data: %s\n' "$DERIVED_DATA_DIR"
+if [[ -d "$EXTERNAL_SSD" ]]; then
+  df -h "$EXTERNAL_SSD" || true
+  check_derived_data_path
 else
-  printf 'External SSD /Volumes/Acer SSD N5000 is not mounted.\n'
+  printf 'External SSD %s is not mounted.\n' "$EXTERNAL_SSD"
 fi
 
 section "Xcode"
@@ -81,6 +108,11 @@ if [[ -d /Applications/Xcode.app ]]; then
 fi
 if command -v xcodebuild >/dev/null 2>&1; then
   xcodebuild -version
+  if xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
+    printf 'Xcode first launch status: ready\n'
+  else
+    printf 'Xcode first launch status: not complete. Open Xcode once and accept any prompts before installing on device.\n'
+  fi
   xcodebuild -showsdks | grep -E 'iphoneos|iphonesimulator' || true
 else
   printf 'xcodebuild was not found. Open Xcode once after installation.\n'

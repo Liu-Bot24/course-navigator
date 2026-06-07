@@ -33,10 +33,34 @@ struct BackendEndpoint: Codable, Identifiable, Equatable, Hashable {
         let path = components.path
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             .lowercased()
-        if path == "api" || path == "api/health" {
+        if path.isEmpty {
             components.path = ""
+        } else if path == "api" || path.hasPrefix("api/") {
+            components.path = ""
+        } else {
+            return nil
         }
         return components.url
+    }
+
+    var hasUnsupportedBackendPath: Bool {
+        var raw = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty || raw.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
+            return false
+        }
+        if !raw.contains("://") {
+            raw = "http://\(raw)"
+        }
+        guard
+            let components = URLComponents(string: raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))),
+            ["http", "https"].contains(components.scheme?.lowercased() ?? "")
+        else {
+            return false
+        }
+        let path = components.path
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .lowercased()
+        return !path.isEmpty && path != "api" && !path.hasPrefix("api/")
     }
 
     var isLoopbackBaseURL: Bool {
@@ -47,8 +71,22 @@ struct BackendEndpoint: Codable, Identifiable, Equatable, Hashable {
             || host.hasPrefix("127.")
     }
 
+    var isWildcardBaseURL: Bool {
+        guard let host = normalizedBaseURL?.host?.lowercased() else { return false }
+        return host == "0.0.0.0"
+            || host == "::"
+            || host == "0:0:0:0:0:0:0:0"
+    }
+
+    var isLinkLocalBaseURL: Bool {
+        guard let host = normalizedBaseURL?.host?.lowercased() else { return false }
+        return host.hasPrefix("169.254.")
+            || host.hasPrefix("fe80:")
+    }
+
     var isUsableOnCurrentDevice: Bool {
         guard normalizedBaseURL != nil else { return false }
+        guard !isWildcardBaseURL, !isLinkLocalBaseURL else { return false }
         #if targetEnvironment(simulator)
         return true
         #else

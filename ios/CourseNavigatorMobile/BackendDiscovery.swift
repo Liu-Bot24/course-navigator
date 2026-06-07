@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct DiscoveredBackend: Identifiable, Hashable {
@@ -13,11 +14,19 @@ struct DiscoveredBackend: Identifiable, Hashable {
     }
 
     var baseURL: String {
-        "http://\(hostName):\(port)"
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = urlComponentsHost
+        components.port = port
+        return components.url?.absoluteString ?? "http://\(hostName):\(port)"
     }
 
     static func serviceID(name: String, type: String, domain: String) -> String {
         "\(name)|\(type)|\(domain)"
+    }
+
+    private var urlComponentsHost: String {
+        hostName.contains(":") && !hostName.hasPrefix("[") ? "[\(hostName)]" : hostName
     }
 }
 
@@ -56,9 +65,10 @@ final class BackendDiscovery: NSObject, ObservableObject {
 
     private func addResolved(_ service: NetService) {
         guard service.port > 0 else { return }
-        let rawHost = service.hostName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !rawHost.isEmpty else { return }
-        let hostName = rawHost.hasSuffix(".") ? String(rawHost.dropLast()) : rawHost
+        guard let hostName = Self.preferredHostName(
+            hostName: service.hostName,
+            addressHosts: service.addresses?.compactMap(Self.hostName(fromAddressData:)) ?? []
+        ) else { return }
         let displayName = service.name.isEmpty ? "Course Navigator" : service.name
         let backend = DiscoveredBackend(
             serviceName: service.name,
@@ -95,6 +105,97 @@ final class BackendDiscovery: NSObject, ObservableObject {
         resolvingServices.removeAll {
             DiscoveredBackend.serviceID(name: $0.name, type: $0.type, domain: $0.domain) == serviceID
         }
+    }
+
+    static func preferredHostName(hostName: String?, addressHosts: [String]) -> String? {
+        let usableAddressHosts = addressHosts
+            .compactMap(normalizedHostName)
+            .filter(isUsableDeviceHost)
+
+        if let ipv4Host = usableAddressHosts.first(where: isIPv4Host) {
+            return ipv4Host
+        }
+        if let addressHost = usableAddressHosts.first {
+            return addressHost
+        }
+        guard
+            let fallbackHost = normalizedHostName(hostName ?? ""),
+            isUsableDeviceHost(fallbackHost)
+        else {
+            return nil
+        }
+        return fallbackHost
+    }
+
+    static func normalizedHostName(_ rawHost: String) -> String? {
+        var host = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if host.hasSuffix(".") {
+            host.removeLast()
+        }
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host.removeFirst()
+            host.removeLast()
+        }
+        return host.isEmpty ? nil : host
+    }
+
+    static func isUsableDeviceHost(_ host: String) -> Bool {
+        let lowercasedHost = host.lowercased()
+        if lowercasedHost == "localhost"
+            || lowercasedHost == "::1"
+            || lowercasedHost == "0:0:0:0:0:0:0:1"
+            || lowercasedHost == "0.0.0.0"
+            || lowercasedHost == "::"
+            || lowercasedHost == "0:0:0:0:0:0:0:0"
+        {
+            return false
+        }
+        if lowercasedHost.hasPrefix("127.")
+            || lowercasedHost.hasPrefix("169.254.")
+            || lowercasedHost.hasPrefix("fe80:")
+        {
+            return false
+        }
+        return true
+    }
+
+    static func isIPv4Host(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { part in
+            guard let value = Int(part), value >= 0, value <= 255 else { return false }
+            return String(value) == String(part)
+        }
+    }
+
+    private static func hostName(fromAddressData data: Data) -> String? {
+        data.withUnsafeBytes { rawBuffer -> String? in
+            guard let baseAddress = rawBuffer.baseAddress else { return nil }
+            let family = baseAddress.assumingMemoryBound(to: sockaddr.self).pointee.sa_family
+            switch Int32(family) {
+            case AF_INET:
+                var address = baseAddress.assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
+                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                guard inet_ntop(AF_INET, &address, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
+                    return nil
+                }
+                return string(fromNullTerminatedBuffer: buffer)
+            case AF_INET6:
+                var address = baseAddress.assumingMemoryBound(to: sockaddr_in6.self).pointee.sin6_addr
+                var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                guard inet_ntop(AF_INET6, &address, &buffer, socklen_t(INET6_ADDRSTRLEN)) != nil else {
+                    return nil
+                }
+                return string(fromNullTerminatedBuffer: buffer)
+            default:
+                return nil
+            }
+        }
+    }
+
+    private static func string(fromNullTerminatedBuffer buffer: [CChar]) -> String {
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 

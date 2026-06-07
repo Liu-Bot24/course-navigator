@@ -11,6 +11,7 @@ struct ImportCourseSheet: View {
     @State private var showingCookieTextSheet = false
     @State private var cookiesPath = ""
     @State private var cookieSaveMessage: String?
+    private static let maxCoursePackageBytes = 20 * 1024 * 1024
 
     var body: some View {
         NavigationStack {
@@ -79,6 +80,11 @@ struct ImportCourseSheet: View {
                             Text(source.label).tag(source)
                         }
                     }
+                    if let onlineASRReadinessMessage {
+                        Label(onlineASRReadinessMessage, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 if let job = model.activeJob {
@@ -136,7 +142,10 @@ struct ImportCourseSheet: View {
     }
 
     private var canSubmit: Bool {
-        !model.isLoading && normalizedVideoURL != nil && (mode != .cookies || activeCookiesPath != nil)
+        !model.isLoading
+            && normalizedVideoURL != nil
+            && (mode != .cookies || activeCookiesPath != nil)
+            && isSubtitleSourceReady
     }
 
     private var activeCookiesPath: String? {
@@ -148,6 +157,20 @@ struct ImportCourseSheet: View {
         MobileURLNormalizer.normalizedHTTPURLString(url)
     }
 
+    private var isSubtitleSourceReady: Bool {
+        subtitleSource != .onlineASR || isOnlineASRReady
+    }
+
+    private var isOnlineASRReady: Bool {
+        guard let onlineASRSettings = model.onlineASRSettings else { return true }
+        return onlineASRSettings.isReady
+    }
+
+    private var onlineASRReadinessMessage: String? {
+        guard subtitleSource == .onlineASR, !isOnlineASRReady else { return nil }
+        return "在线 ASR 还未配置，请在后端设备中查看。"
+    }
+
     private func handlePackageImport(_ result: Result<[URL], Error>) {
         do {
             guard let url = try result.get().first else { return }
@@ -157,7 +180,12 @@ struct ImportCourseSheet: View {
                     url.stopAccessingSecurityScopedResource()
                 }
             }
-            let data = try Data(contentsOf: url)
+            let values = try url.resourceValues(forKeys: [.fileSizeKey])
+            if let fileSize = values.fileSize, fileSize > Self.maxCoursePackageBytes {
+                model.errorMessage = "课程包超过 20MB，请先在电脑端导入。"
+                return
+            }
+            guard let data = try readBoundedPackageData(from: url) else { return }
             Task {
                 let importedCount = await model.importCoursePackage(data: data)
                 if importedCount > 0 { dismiss() }
@@ -165,6 +193,17 @@ struct ImportCourseSheet: View {
         } catch {
             model.errorMessage = error.localizedDescription
         }
+    }
+
+    private func readBoundedPackageData(from url: URL) throws -> Data? {
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        let data = try file.read(upToCount: Self.maxCoursePackageBytes + 1) ?? Data()
+        guard data.count <= Self.maxCoursePackageBytes else {
+            model.errorMessage = "课程包超过 20MB，请先在电脑端导入。"
+            return nil
+        }
+        return data
     }
 }
 

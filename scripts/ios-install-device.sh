@@ -7,6 +7,8 @@ cd "$ROOT_DIR"
 EXTERNAL_SSD="/Volumes/Acer SSD N5000"
 DEFAULT_DERIVED_DATA_DIR="$EXTERNAL_SSD/CodexBuilds/course-navigator-ios-device-install"
 DERIVED_DATA_DIR="${COURSE_NAVIGATOR_IOS_DERIVED_DATA:-$DEFAULT_DERIVED_DATA_DIR}"
+ALLOW_LOCAL_DERIVED_DATA="${COURSE_NAVIGATOR_ALLOW_LOCAL_DERIVED_DATA:-0}"
+MIN_DERIVED_DATA_FREE_GIB="${COURSE_NAVIGATOR_IOS_MIN_DERIVED_DATA_FREE_GIB:-8}"
 PROJECT_PATH="ios/CourseNavigatorMobile.xcodeproj"
 SCHEME="CourseNavigatorMobile"
 CONFIGURATION="${COURSE_NAVIGATOR_IOS_CONFIGURATION:-Debug}"
@@ -32,6 +34,29 @@ require_external_derived_data() {
   fi
 }
 
+check_derived_data_disk() {
+  local min_free_gib="$MIN_DERIVED_DATA_FREE_GIB"
+  if [[ -z "$min_free_gib" || "$min_free_gib" == *[!0-9]* ]]; then
+    min_free_gib=8
+  fi
+
+  if [[ "$DERIVED_DATA_DIR" != /Volumes/* && "$ALLOW_LOCAL_DERIVED_DATA" != "1" ]]; then
+    printf 'DerivedData is not on an external volume: %s\n' "$DERIVED_DATA_DIR" >&2
+    printf 'No build was started. Use the external SSD, or set COURSE_NAVIGATOR_ALLOW_LOCAL_DERIVED_DATA=1 intentionally.\n' >&2
+    exit 1
+  fi
+
+  mkdir -p "$DERIVED_DATA_DIR"
+
+  local available_gib
+  available_gib="$(df -g "$DERIVED_DATA_DIR" | awk 'NR == 2 {print $4}')"
+  if [[ -n "$available_gib" && "$available_gib" -lt "$min_free_gib" ]]; then
+    printf 'DerivedData volume has only %s GiB free: %s\n' "$available_gib" "$DERIVED_DATA_DIR" >&2
+    printf 'No build was started. Free space on that volume or choose a larger external SSD path.\n' >&2
+    exit 1
+  fi
+}
+
 check_local_disk() {
   local available_gib
   available_gib="$(df -g / | awk 'NR == 2 {print $4}')"
@@ -48,6 +73,11 @@ prepare_xcode() {
   fi
   if ! command -v xcodebuild >/dev/null 2>&1 || ! command -v xcrun >/dev/null 2>&1; then
     printf 'Xcode command line tools were not found. Open Xcode once after installation.\n' >&2
+    exit 1
+  fi
+  if ! xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
+    printf 'Xcode first launch tasks are not complete. No build was started.\n' >&2
+    printf 'Open Xcode once, sign in if needed, accept the license, then run this script again.\n' >&2
     exit 1
   fi
   if [[ ! -d "$PROJECT_PATH" ]]; then
@@ -148,6 +178,7 @@ build_for_device() {
     -destination "platform=iOS,id=$device_id"
     -derivedDataPath "$DERIVED_DATA_DIR"
     -allowProvisioningUpdates
+    -allowProvisioningDeviceRegistration
     CODE_SIGN_STYLE=Automatic
   )
 
@@ -158,7 +189,22 @@ build_for_device() {
     build_args+=(PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID")
   fi
 
-  xcodebuild "${build_args[@]}" build
+  if ! xcodebuild "${build_args[@]}" build; then
+    print_build_failure_help
+    exit 1
+  fi
+}
+
+print_build_failure_help() {
+  section "Build failed"
+  cat >&2 <<'EOF'
+If this failed during signing or provisioning, check these first:
+  1. Open Xcode once and sign in with your Apple Account.
+  2. Open ios/CourseNavigatorMobile.xcodeproj and select your Personal Team in Signing & Capabilities.
+  3. If the bundle identifier is already taken, rerun with COURSE_NAVIGATOR_IOS_BUNDLE_ID=com.yourname.coursenavigator.mobile.
+  4. If Xcode shows a Team ID, rerun with COURSE_NAVIGATOR_IOS_TEAM_ID=<TeamID>.
+  5. Keep the iPhone/iPad unlocked, trusted, and in Developer Mode before retrying.
+EOF
 }
 
 install_app() {
@@ -187,6 +233,7 @@ fi
 
 require_external_derived_data
 check_local_disk
+check_derived_data_disk
 prepare_xcode
 
 section "Xcode"
