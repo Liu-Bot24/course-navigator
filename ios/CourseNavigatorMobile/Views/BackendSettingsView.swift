@@ -10,9 +10,17 @@ struct BackendSettingsView: View {
         NavigationStack {
             Form {
                 Section("当前后端") {
-                    Picker("连接设备", selection: activeEndpointBinding) {
-                        ForEach(model.endpoints) { endpoint in
-                            Text(endpoint.name).tag(Optional(endpoint.id))
+                    if model.endpoints.isEmpty {
+                        Label("还没有保存后端设备", systemImage: "server.rack")
+                            .foregroundStyle(.secondary)
+                        Text("启动电脑后端后等待局域网发现，或手动填写脚本打印的地址。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("连接设备", selection: activeEndpointBinding) {
+                            ForEach(model.endpoints) { endpoint in
+                                Text(endpoint.name).tag(Optional(endpoint.id))
+                            }
                         }
                     }
                     Button {
@@ -20,6 +28,7 @@ struct BackendSettingsView: View {
                     } label: {
                         Label("测试连接", systemImage: "wifi")
                     }
+                    .disabled(model.activeEndpoint == nil || model.connectionStatus == .checking)
                 }
 
                 BackendCapabilitySection(
@@ -73,45 +82,55 @@ struct BackendSettingsView: View {
 
                 Section("添加或更新") {
                     TextField("名称", text: $draft.name)
-                    TextField("后端地址，例如 http://192.168.6.160:18000", text: $draft.baseURL)
+                    TextField("后端地址，例如 http://电脑局域网IP:18000", text: $draft.baseURL)
                         .urlInputHints()
+                    if let draftAddressWarning {
+                        Text(draftAddressWarning)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                     Button {
                         saveDraft()
                     } label: {
                         Label("保存并连接", systemImage: "checkmark")
                     }
-                    .disabled(draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.normalizedBaseURL == nil)
+                    .disabled(!canSaveDraft)
                 }
 
                 Section("已保存设备") {
-                    ForEach(model.endpoints) { endpoint in
-                        Button {
-                            Task { await model.selectEndpoint(endpoint.id) }
-                        } label: {
-                            HStack(spacing: 10) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(endpoint.name)
-                                        .font(.headline)
-                                    Text(endpoint.baseURL)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                    if model.endpoints.isEmpty {
+                        Label("暂无已保存设备", systemImage: "tray")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.endpoints) { endpoint in
+                            Button {
+                                Task { await model.selectEndpoint(endpoint.id) }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(endpoint.name)
+                                            .font(.headline)
+                                        Text(endpoint.baseURL)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if model.activeEndpointID == endpoint.id {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.green)
+                                    }
                                 }
-                                Spacer()
-                                if model.activeEndpointID == endpoint.id {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(.green)
+                            }
+                            .buttonStyle(.plain)
+                            .swipeActions {
+                                Button("删除", role: .destructive) {
+                                    Task { await model.deleteEndpoint(endpoint) }
                                 }
+                                Button("编辑") {
+                                    draft = endpoint
+                                }
+                                .tint(.blue)
                             }
-                        }
-                        .buttonStyle(.plain)
-                        .swipeActions {
-                            Button("删除", role: .destructive) {
-                                model.deleteEndpoint(endpoint)
-                            }
-                            Button("编辑") {
-                                draft = endpoint
-                            }
-                            .tint(.blue)
                         }
                     }
                 }
@@ -144,7 +163,32 @@ struct BackendSettingsView: View {
         }
     }
 
+    private var canSaveDraft: Bool {
+        !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && draft.normalizedBaseURL != nil
+            && draft.isUsableOnCurrentDevice
+    }
+
+    private var draftAddressWarning: String? {
+        let trimmedBaseURL = draft.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBaseURL.isEmpty else { return nil }
+        guard draft.normalizedBaseURL != nil else {
+            return "后端地址需要是 http/https 地址，例如 http://电脑局域网IP:18000。"
+        }
+        #if targetEnvironment(simulator)
+        return nil
+        #else
+        return draft.isLoopbackBaseURL
+            ? "iPhone/iPad 上不能使用 127.0.0.1 或 localhost；请填写电脑脚本打印的局域网地址。"
+            : nil
+        #endif
+    }
+
     private func saveDraft() {
+        guard canSaveDraft else {
+            model.errorMessage = draftAddressWarning ?? "请填写有效的电脑后端地址"
+            return
+        }
         let endpoint = BackendEndpoint(
             id: draft.id,
             name: draft.name.trimmingCharacters(in: .whitespacesAndNewlines),

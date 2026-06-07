@@ -14,10 +14,64 @@ struct BackendEndpoint: Codable, Identifiable, Equatable, Hashable {
     var normalizedBaseURL: URL? {
         var raw = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if raw.isEmpty { return nil }
+        if raw.rangeOfCharacter(from: .whitespacesAndNewlines) != nil { return nil }
         if !raw.contains("://") {
             raw = "http://\(raw)"
         }
-        return URL(string: raw.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+        guard var components = URLComponents(string: raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))) else {
+            return nil
+        }
+        guard let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
+            return nil
+        }
+        guard components.host?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            return nil
+        }
+        components.scheme = scheme
+        components.query = nil
+        components.fragment = nil
+        let path = components.path
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            .lowercased()
+        if path == "api" || path == "api/health" {
+            components.path = ""
+        }
+        return components.url
+    }
+
+    var isLoopbackBaseURL: Bool {
+        guard let host = normalizedBaseURL?.host?.lowercased() else { return false }
+        return host == "localhost"
+            || host == "::1"
+            || host == "0:0:0:0:0:0:0:1"
+            || host.hasPrefix("127.")
+    }
+
+    var isUsableOnCurrentDevice: Bool {
+        guard normalizedBaseURL != nil else { return false }
+        #if targetEnvironment(simulator)
+        return true
+        #else
+        return !isLoopbackBaseURL
+        #endif
+    }
+}
+
+enum MobileURLNormalizer {
+    static func normalizedHTTPURLString(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return nil }
+        let raw = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        guard var components = URLComponents(string: raw) else { return nil }
+        guard let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
+            return nil
+        }
+        guard components.host?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            return nil
+        }
+        components.scheme = scheme
+        return components.url?.absoluteString
     }
 }
 

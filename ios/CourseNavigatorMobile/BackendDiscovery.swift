@@ -1,16 +1,23 @@
 import Foundation
 
 struct DiscoveredBackend: Identifiable, Hashable {
+    var serviceName: String
+    var serviceType: String
+    var serviceDomain: String
     var name: String
     var hostName: String
     var port: Int
 
     var id: String {
-        "\(name)-\(hostName)-\(port)"
+        Self.serviceID(name: serviceName, type: serviceType, domain: serviceDomain)
     }
 
     var baseURL: String {
         "http://\(hostName):\(port)"
+    }
+
+    static func serviceID(name: String, type: String, domain: String) -> String {
+        "\(name)|\(type)|\(domain)"
     }
 }
 
@@ -39,6 +46,10 @@ final class BackendDiscovery: NSObject, ObservableObject {
 
     func stop() {
         browser.stop()
+        resolvingServices.forEach {
+            $0.stop()
+            $0.delegate = nil
+        }
         resolvingServices = []
         isScanning = false
     }
@@ -49,7 +60,14 @@ final class BackendDiscovery: NSObject, ObservableObject {
         guard !rawHost.isEmpty else { return }
         let hostName = rawHost.hasSuffix(".") ? String(rawHost.dropLast()) : rawHost
         let displayName = service.name.isEmpty ? "Course Navigator" : service.name
-        let backend = DiscoveredBackend(name: displayName, hostName: hostName, port: service.port)
+        let backend = DiscoveredBackend(
+            serviceName: service.name,
+            serviceType: service.type,
+            serviceDomain: service.domain,
+            name: displayName,
+            hostName: hostName,
+            port: service.port
+        )
 
         if let index = backends.firstIndex(where: { $0.id == backend.id }) {
             backends[index] = backend
@@ -58,6 +76,24 @@ final class BackendDiscovery: NSObject, ObservableObject {
             backends.sort {
                 $0.name.localizedStandardCompare($1.name) == .orderedAscending
             }
+        }
+    }
+
+    private func removeService(_ service: NetService) {
+        let serviceID = DiscoveredBackend.serviceID(
+            name: service.name,
+            type: service.type,
+            domain: service.domain
+        )
+        backends.removeAll { $0.id == serviceID }
+        resolvingServices
+            .filter { DiscoveredBackend.serviceID(name: $0.name, type: $0.type, domain: $0.domain) == serviceID }
+            .forEach {
+                $0.stop()
+                $0.delegate = nil
+            }
+        resolvingServices.removeAll {
+            DiscoveredBackend.serviceID(name: $0.name, type: $0.type, domain: $0.domain) == serviceID
         }
     }
 }
@@ -80,6 +116,10 @@ extension BackendDiscovery: NetServiceBrowserDelegate {
         service.delegate = self
         resolvingServices.append(service)
         service.resolve(withTimeout: 5)
+    }
+
+    func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {
+        removeService(service)
     }
 }
 

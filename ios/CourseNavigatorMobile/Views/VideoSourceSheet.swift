@@ -22,7 +22,7 @@ struct VideoSourceSheet: View {
                     }
                     .pickerStyle(.segmented)
                     TextField(sourceKind.placeholder, text: $sourceText, axis: .vertical)
-                        .urlInputHints()
+                        .videoSourceInputHints(isRemote: sourceKind == .remote)
                         .lineLimit(2...5)
                 }
 
@@ -70,17 +70,27 @@ struct VideoSourceSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") {
                         Task {
-                            await model.bindVideoSource(input: sourceText, asPath: sourceKind == .path)
+                            guard let input = activeSourceInput else { return }
+                            await model.bindVideoSource(input: input, asPath: sourceKind == .path)
                             if model.errorMessage == nil { dismiss() }
                         }
                     }
-                    .disabled(sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isLoading)
+                    .disabled(activeSourceInput == nil || model.isLoading)
                 }
             }
         }
         .onAppear {
             sourceKind = item.videoSourceType == .external ? .path : .remote
             sourceText = item.videoSourceType == .external ? (item.localVideoPath ?? "") : item.sourceURL
+        }
+    }
+
+    private var activeSourceInput: String? {
+        switch sourceKind {
+        case .remote:
+            MobileURLNormalizer.normalizedHTTPURLString(sourceText)
+        case .path:
+            sourceText.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         }
     }
 }
@@ -112,5 +122,11 @@ enum SourceKind: String, CaseIterable, Identifiable {
         case .path:
             "这里填写的是电脑后端能访问的路径，不是 iPhone/iPad 本机文件路径。"
         }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }

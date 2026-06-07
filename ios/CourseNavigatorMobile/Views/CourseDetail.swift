@@ -147,7 +147,10 @@ struct CourseDetail: View {
     }
 
     private func openSource(_ item: CourseItem) {
-        guard let url = URL(string: item.sourceURL) else { return }
+        guard
+            let urlString = MobileURLNormalizer.normalizedHTTPURLString(item.sourceURL),
+            let url = URL(string: urlString)
+        else { return }
         openURL(url)
     }
 
@@ -514,7 +517,7 @@ struct CourseHeader: View {
                     } label: {
                         Label("打开源链接", systemImage: "safari")
                     }
-                    .disabled(URL(string: item.sourceURL) == nil)
+                    .disabled(MobileURLNormalizer.normalizedHTTPURLString(item.sourceURL) == nil)
 
                     Button(role: .destructive) {
                         showingRemoveCacheConfirmation = true

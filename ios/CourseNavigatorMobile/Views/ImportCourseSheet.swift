@@ -97,8 +97,9 @@ struct ImportCourseSheet: View {
                 ToolbarItemGroup(placement: .confirmationAction) {
                     Button("预览") {
                         Task {
+                            guard let requestURL = normalizedVideoURL else { return }
                             await model.previewCourse(
-                                url: url,
+                                url: requestURL,
                                 mode: mode,
                                 subtitleSource: subtitleSource,
                                 cookiesPath: activeCookiesPath
@@ -108,8 +109,9 @@ struct ImportCourseSheet: View {
                     .disabled(!canSubmit)
                     Button("提取") {
                         Task {
+                            guard let requestURL = normalizedVideoURL else { return }
                             await model.extractCourse(
-                                url: url,
+                                url: requestURL,
                                 mode: mode,
                                 subtitleSource: subtitleSource,
                                 cookiesPath: activeCookiesPath
@@ -134,7 +136,7 @@ struct ImportCourseSheet: View {
     }
 
     private var canSubmit: Bool {
-        !model.isLoading && URL(string: normalizedURL) != nil && (mode != .cookies || activeCookiesPath != nil)
+        !model.isLoading && normalizedVideoURL != nil && (mode != .cookies || activeCookiesPath != nil)
     }
 
     private var activeCookiesPath: String? {
@@ -142,10 +144,8 @@ struct ImportCourseSheet: View {
         return mode == .cookies && !trimmed.isEmpty ? trimmed : nil
     }
 
-    private var normalizedURL: String {
-        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.contains("://") { return trimmed }
-        return "https://\(trimmed)"
+    private var normalizedVideoURL: String? {
+        MobileURLNormalizer.normalizedHTTPURLString(url)
     }
 
     private func handlePackageImport(_ result: Result<[URL], Error>) {

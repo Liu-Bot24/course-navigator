@@ -48,6 +48,15 @@ extension View {
     }
 
     @ViewBuilder
+    func videoSourceInputHints(isRemote: Bool) -> some View {
+        if isRemote {
+            self.urlInputHints()
+        } else {
+            self.plainTextInputHints()
+        }
+    }
+
+    @ViewBuilder
     func inlineNavigationTitle() -> some View {
         #if os(iOS)
         self.navigationBarTitleDisplayMode(.inline)

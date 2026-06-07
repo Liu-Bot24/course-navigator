@@ -20,8 +20,17 @@ final class AppModel {
 
     init() {
         let stored = store.load()
-        endpoints = stored.isEmpty ? EndpointStore.defaultEndpoints : stored
+        let usableStoredEndpoints = stored.filter(\.isUsableOnCurrentDevice)
+        endpoints = usableStoredEndpoints.isEmpty ? EndpointStore.defaultEndpoints : usableStoredEndpoints
         activeEndpointID = store.loadActiveEndpointID() ?? endpoints.first?.id
+        let loadedActiveEndpointID = activeEndpointID
+        reconcileActiveEndpointSelection()
+        if stored != usableStoredEndpoints {
+            store.save(usableStoredEndpoints)
+        }
+        if activeEndpointID != loadedActiveEndpointID {
+            store.saveActiveEndpointID(activeEndpointID)
+        }
     }
 
     var activeEndpoint: BackendEndpoint? {
@@ -51,15 +60,16 @@ final class AppModel {
 
     func selectEndpoint(_ id: UUID?) async {
         activeEndpointID = id
-        store.saveActiveEndpointID(id)
-        selectedCourseID = nil
-        courses = []
+        reconcileActiveEndpointSelection()
+        store.saveActiveEndpointID(activeEndpointID)
+        clearBackendContent()
         await refreshAll()
     }
 
     @discardableResult
     func saveEndpoint(_ endpoint: BackendEndpoint, mergeByBaseURL: Bool = false) -> UUID {
         var endpoint = endpoint
+        let originalEndpointID = endpoint.id
         if
             mergeByBaseURL,
             let normalizedBaseURL = endpoint.normalizedBaseURL?.absoluteString,
@@ -67,6 +77,12 @@ final class AppModel {
         {
             endpoint.id = endpoints[index].id
             endpoints[index] = endpoint
+            if originalEndpointID != endpoint.id {
+                endpoints.removeAll { $0.id == originalEndpointID }
+                if activeEndpointID == originalEndpointID {
+                    activeEndpointID = endpoint.id
+                }
+            }
         } else if let index = endpoints.firstIndex(where: { $0.id == endpoint.id }) {
             endpoints[index] = endpoint
         } else {
@@ -75,16 +91,23 @@ final class AppModel {
         if activeEndpointID == nil {
             activeEndpointID = endpoint.id
         }
+        reconcileActiveEndpointSelection()
         persistEndpoints()
         return endpoint.id
     }
 
-    func deleteEndpoint(_ endpoint: BackendEndpoint) {
+    func deleteEndpoint(_ endpoint: BackendEndpoint) async {
+        let wasActiveEndpoint = activeEndpoint?.id == endpoint.id
         endpoints.removeAll { $0.id == endpoint.id }
-        if activeEndpointID == endpoint.id {
+        if wasActiveEndpoint {
             activeEndpointID = endpoints.first?.id
+            clearBackendContent()
         }
+        reconcileActiveEndpointSelection()
         persistEndpoints()
+        if wasActiveEndpoint {
+            await refreshAll()
+        }
     }
 
     func refreshAll() async {
@@ -396,11 +419,26 @@ final class AppModel {
 
     func bindVideoSource(input: String, asPath: Bool) async {
         guard let api, let item = selectedCourse else { return }
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedInput: String
+        if asPath {
+            guard !trimmed.isEmpty else {
+                errorMessage = "电脑路径不能为空"
+                return
+            }
+            normalizedInput = trimmed
+        } else {
+            guard let normalizedURL = MobileURLNormalizer.normalizedHTTPURLString(trimmed) else {
+                errorMessage = "在线视频链接无效"
+                return
+            }
+            normalizedInput = normalizedURL
+        }
         await runCourseMutation {
             let request = VideoSourceBindingRequest(
                 sourceType: asPath ? "external" : "remote",
-                url: asPath ? nil : input,
-                path: asPath ? input : nil
+                url: asPath ? nil : normalizedInput,
+                path: asPath ? normalizedInput : nil
             )
             let updated = try await api.bindVideoSource(itemID: item.id, request: request)
             upsertCourse(updated)
@@ -546,6 +584,23 @@ final class AppModel {
         courses.sort(by: courseSort)
     }
 
+    private func clearBackendContent() {
+        courses = []
+        selectedCourseID = nil
+        activeJob = nil
+        modelSettings = nil
+        onlineASRSettings = nil
+        backendCapabilityError = nil
+        isLoading = false
+    }
+
+    private func reconcileActiveEndpointSelection() {
+        if let activeEndpointID, endpoints.contains(where: { $0.id == activeEndpointID }) {
+            return
+        }
+        activeEndpointID = endpoints.first?.id
+    }
+
     private func persistEndpoints() {
         store.save(endpoints)
         store.saveActiveEndpointID(activeEndpointID)
@@ -588,10 +643,13 @@ struct EndpointStore {
     private let endpointsKey = "course-navigator-mobile-endpoints"
     private let activeEndpointKey = "course-navigator-mobile-active-endpoint"
 
-    static let defaultEndpoints = [
-        BackendEndpoint(name: "这台 Mac（局域网）", baseURL: "http://192.168.6.160:18000"),
-        BackendEndpoint(name: "模拟器本机", baseURL: "http://127.0.0.1:18000")
-    ]
+    static var defaultEndpoints: [BackendEndpoint] {
+        #if targetEnvironment(simulator)
+        [BackendEndpoint(name: "模拟器本机", baseURL: "http://127.0.0.1:18000")]
+        #else
+        []
+        #endif
+    }
 
     func load() -> [BackendEndpoint] {
         guard let data = UserDefaults.standard.data(forKey: endpointsKey) else { return [] }

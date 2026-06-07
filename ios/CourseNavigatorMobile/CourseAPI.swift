@@ -2,6 +2,8 @@ import Foundation
 
 struct CourseAPI {
     var baseURL: URL
+    private static let defaultTimeout: TimeInterval = 20
+    private static let computerPickerTimeout: TimeInterval = 300
 
     func health() async throws -> HealthResponse {
         try await get("/health")
@@ -20,7 +22,12 @@ struct CourseAPI {
     }
 
     func importLocalVideosFromPicker(request: LocalVideoFilePickerRequest) async throws -> [CourseItem] {
-        try await send("/local-video-file-picker", method: "POST", body: request)
+        try await send(
+            "/local-video-file-picker",
+            method: "POST",
+            body: request,
+            timeout: Self.computerPickerTimeout
+        )
     }
 
     func importCoursePackage(_ package: CourseSharePackage) async throws -> CourseImportResponse {
@@ -68,11 +75,17 @@ struct CourseAPI {
     }
 
     func bindVideoSourceFromPicker(itemID: String) async throws -> CourseItem {
-        try await post("/items/\(itemID.urlPathEncoded)/video-source-picker")
+        try await post(
+            "/items/\(itemID.urlPathEncoded)/video-source-picker",
+            timeout: Self.computerPickerTimeout
+        )
     }
 
     func importWorkspaceVideoFromPicker(itemID: String) async throws -> CourseItem {
-        try await post("/items/\(itemID.urlPathEncoded)/workspace-video-picker")
+        try await post(
+            "/items/\(itemID.urlPathEncoded)/workspace-video-picker",
+            timeout: Self.computerPickerTimeout
+        )
     }
 
     func updateItem(itemID: String, request: CourseItemUpdate) async throws -> CourseItem {
@@ -99,43 +112,56 @@ struct CourseAPI {
         apiURL("/items/\(itemID.urlPathEncoded)/video")
     }
 
-    private func get<T: Decodable>(_ path: String) async throws -> T {
+    private func get<T: Decodable>(
+        _ path: String,
+        timeout: TimeInterval = Self.defaultTimeout
+    ) async throws -> T {
         guard let url = apiURL(path) else { throw CourseAPIError.invalidURL }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        return try await perform(request)
+        return try await perform(request, timeout: timeout)
     }
 
-    private func delete<T: Decodable>(_ path: String) async throws -> T {
+    private func delete<T: Decodable>(
+        _ path: String,
+        timeout: TimeInterval = Self.defaultTimeout
+    ) async throws -> T {
         guard let url = apiURL(path) else { throw CourseAPIError.invalidURL }
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
-        return try await perform(request)
+        return try await perform(request, timeout: timeout)
     }
 
-    private func post<T: Decodable>(_ path: String) async throws -> T {
+    private func post<T: Decodable>(
+        _ path: String,
+        timeout: TimeInterval = Self.defaultTimeout
+    ) async throws -> T {
         guard let url = apiURL(path) else { throw CourseAPIError.invalidURL }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        return try await perform(request)
+        return try await perform(request, timeout: timeout)
     }
 
     private func send<T: Decodable, Body: Encodable>(
         _ path: String,
         method: String,
-        body: Body
+        body: Body,
+        timeout: TimeInterval = Self.defaultTimeout
     ) async throws -> T {
         guard let url = apiURL(path) else { throw CourseAPIError.invalidURL }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder.courseNavigator.encode(body)
-        return try await perform(request)
+        return try await perform(request, timeout: timeout)
     }
 
-    private func perform<T: Decodable>(_ request: URLRequest) async throws -> T {
+    private func perform<T: Decodable>(
+        _ request: URLRequest,
+        timeout: TimeInterval
+    ) async throws -> T {
         var request = request
-        request.timeoutInterval = 20
+        request.timeoutInterval = timeout
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw CourseAPIError.invalidResponse

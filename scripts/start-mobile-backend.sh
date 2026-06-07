@@ -10,6 +10,58 @@ SERVICE_NAME="${COURSE_NAVIGATOR_SERVICE_NAME:-Course Navigator on $(scutil --ge
 ADVERTISE_PID=""
 API_PID=""
 
+is_loopback_host() {
+  case "$1" in
+    127.*|localhost|::1|\[::1\])
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_unusable_device_url_address() {
+  case "$1" in
+    169.254.*)
+      return 0
+      ;;
+    *)
+      is_loopback_host "$1"
+      ;;
+  esac
+}
+
+print_lan_urls() {
+  local printed_addresses=""
+  local device address
+
+  if ! command -v ipconfig >/dev/null 2>&1 || ! command -v ifconfig >/dev/null 2>&1; then
+    return
+  fi
+
+  for device in $(ifconfig -l); do
+    case "$device" in
+      lo*|utun*|awdl*|llw*|bridge*|anpi*|ap*)
+        continue
+        ;;
+    esac
+
+    address="$(ipconfig getifaddr "$device" 2>/dev/null || true)"
+    if [[ -z "$address" ]] || is_unusable_device_url_address "$address"; then
+      continue
+    fi
+    if [[ " $printed_addresses " == *" $address "* ]]; then
+      continue
+    fi
+
+    printf '  http://%s:%s (%s)\n' "$address" "$API_PORT" "$device"
+    printed_addresses="$printed_addresses $address"
+  done
+
+  [[ -n "$printed_addresses" ]]
+}
+
 cleanup() {
   if [[ -n "$ADVERTISE_PID" ]]; then
     kill "$ADVERTISE_PID" >/dev/null 2>&1 || true
@@ -29,6 +81,12 @@ need_command() {
   fi
 }
 
+if is_loopback_host "$API_HOST"; then
+  printf 'COURSE_NAVIGATOR_API_HOST=%s only listens on this Mac.\n' "$API_HOST" >&2
+  printf 'Use COURSE_NAVIGATOR_API_HOST=0.0.0.0 for iPhone/iPad access, then run this script again.\n' >&2
+  exit 1
+fi
+
 need_command uv
 
 if [[ ! -f .env && -f .env.example ]]; then
@@ -39,14 +97,7 @@ fi
 echo "Starting Course Navigator API for iPhone/iPad on http://${API_HOST}:${API_PORT}"
 echo
 echo "Try these device URLs from the iOS app:"
-if command -v ipconfig >/dev/null 2>&1; then
-  for device in en0 en1; do
-    address="$(ipconfig getifaddr "$device" 2>/dev/null || true)"
-    if [[ -n "$address" ]]; then
-      echo "  http://${address}:${API_PORT}"
-    fi
-  done
-fi
+print_lan_urls || printf '  No LAN IPv4 address was detected. Check Wi-Fi/Ethernet, then run scripts/ios-device-preflight.sh.\n'
 if command -v dns-sd >/dev/null 2>&1; then
   dns-sd -R "$SERVICE_NAME" _coursenav._tcp local "$API_PORT" path=/api >/dev/null 2>&1 &
   ADVERTISE_PID="$!"

@@ -16,6 +16,9 @@ APP_NAME="${COURSE_NAVIGATOR_IOS_APP_NAME:-Course Navigator}"
 DEVICE_ID="${COURSE_NAVIGATOR_IOS_DEVICE_ID:-}"
 TEAM_ID="${COURSE_NAVIGATOR_IOS_TEAM_ID:-}"
 LAUNCH_AFTER_INSTALL="${COURSE_NAVIGATOR_IOS_LAUNCH_AFTER_INSTALL:-1}"
+INSTALL_ALL="${COURSE_NAVIGATOR_IOS_INSTALL_ALL:-0}"
+DEVICE_IDS=()
+DEVICE_NAMES=()
 
 section() {
   printf '\n== %s ==\n' "$1"
@@ -53,23 +56,54 @@ prepare_xcode() {
   fi
 }
 
-detect_device() {
+device_identifier_at() {
+  local devices_json="$1"
+  local index="$2"
+  local id
+  id="$(plutil -extract "result.devices.$index.identifier" raw -o - "$devices_json" 2>/dev/null || true)"
+  if [[ -z "$id" ]]; then
+    id="$(plutil -extract "result.devices.$index.hardwareProperties.udid" raw -o - "$devices_json" 2>/dev/null || true)"
+  fi
+  printf '%s' "$id"
+}
+
+device_name_at() {
+  local devices_json="$1"
+  local index="$2"
+  plutil -extract "result.devices.$index.name" raw -o - "$devices_json" 2>/dev/null || true
+}
+
+detect_devices() {
+  if [[ "$DEVICE_ID" == "all" ]]; then
+    INSTALL_ALL=1
+    DEVICE_ID=""
+  fi
+
   if [[ -n "$DEVICE_ID" ]]; then
     printf 'Using device from COURSE_NAVIGATOR_IOS_DEVICE_ID: %s\n' "$DEVICE_ID"
+    DEVICE_IDS=("$DEVICE_ID")
+    DEVICE_NAMES=("explicit device")
     return
   fi
 
-  local devices_json
-  devices_json="$(mktemp "${TMPDIR:-/tmp}/coursenav-ios-devices.XXXXXX.json")"
+  local devices_json index current_id current_name
+  devices_json="$(mktemp "${TMPDIR:-/tmp}/coursenav-ios-devices.XXXXXX")"
 
-  xcrun devicectl list devices --timeout 10 --json-output "$devices_json" >/dev/null
-  DEVICE_ID="$(
-    plutil -extract result.devices.0.identifier raw -o - "$devices_json" 2>/dev/null \
-      || plutil -extract result.devices.0.hardwareProperties.udid raw -o - "$devices_json" 2>/dev/null \
-      || true
-  )"
+  if ! xcrun devicectl list devices --timeout 10 --json-output "$devices_json" >/dev/null; then
+    rm -f "$devices_json"
+    exit 1
+  fi
+  for index in $(seq 0 99); do
+    current_id="$(device_identifier_at "$devices_json" "$index")"
+    if [[ -z "$current_id" ]]; then
+      break
+    fi
+    current_name="$(device_name_at "$devices_json" "$index")"
+    DEVICE_IDS+=("$current_id")
+    DEVICE_NAMES+=("${current_name:-$current_id}")
+  done
 
-  if [[ -z "$DEVICE_ID" ]]; then
+  if [[ "${#DEVICE_IDS[@]}" -eq 0 ]]; then
     printf 'No connected iPhone/iPad was detected. No build was started.\n' >&2
     printf 'Connect the device, unlock it, trust this Mac, then run this script again.\n' >&2
     printf '\nCurrent devicectl device list:\n' >&2
@@ -78,26 +112,40 @@ detect_device() {
     exit 1
   fi
 
-  local device_name
-  device_name="$(plutil -extract result.devices.0.name raw -o - "$devices_json" 2>/dev/null || true)"
+  if [[ "${#DEVICE_IDS[@]}" -gt 1 && "$INSTALL_ALL" != "1" ]]; then
+    printf 'Multiple iPhone/iPad devices were detected. No build was started.\n' >&2
+    printf 'Set COURSE_NAVIGATOR_IOS_DEVICE_ID to one device ID, or set COURSE_NAVIGATOR_IOS_INSTALL_ALL=1 to install on all listed devices.\n' >&2
+    printf '\nDetected devices:\n' >&2
+    for index in "${!DEVICE_IDS[@]}"; do
+      printf '  %s  %s\n' "${DEVICE_IDS[$index]}" "${DEVICE_NAMES[$index]}" >&2
+    done
+    rm -f "$devices_json"
+    exit 1
+  fi
+
   rm -f "$devices_json"
-  if [[ -n "$device_name" ]]; then
-    printf 'Selected device: %s (%s)\n' "$device_name" "$DEVICE_ID"
+  if [[ "$INSTALL_ALL" == "1" && "${#DEVICE_IDS[@]}" -gt 1 ]]; then
+    printf 'Selected all connected devices:\n'
+    for index in "${!DEVICE_IDS[@]}"; do
+      printf '  %s (%s)\n' "${DEVICE_NAMES[$index]}" "${DEVICE_IDS[$index]}"
+    done
   else
-    printf 'Selected device: %s\n' "$DEVICE_ID"
+    printf 'Selected device: %s (%s)\n' "${DEVICE_NAMES[0]}" "${DEVICE_IDS[0]}"
   fi
 }
 
 build_for_device() {
+  local device_id="$1"
+  local device_name="$2"
   mkdir -p "$DERIVED_DATA_DIR"
-  section "Build"
+  section "Build: $device_name"
   printf 'DerivedData: %s\n' "$DERIVED_DATA_DIR"
 
   local build_args=(
     -project "$PROJECT_PATH"
     -scheme "$SCHEME"
     -configuration "$CONFIGURATION"
-    -destination "platform=iOS,id=$DEVICE_ID"
+    -destination "platform=iOS,id=$device_id"
     -derivedDataPath "$DERIVED_DATA_DIR"
     -allowProvisioningUpdates
     CODE_SIGN_STYLE=Automatic
@@ -114,18 +162,20 @@ build_for_device() {
 }
 
 install_app() {
+  local device_id="$1"
+  local device_name="$2"
   local app_path="$DERIVED_DATA_DIR/Build/Products/$CONFIGURATION-iphoneos/$APP_NAME.app"
   if [[ ! -d "$app_path" ]]; then
     printf 'Built app was not found: %s\n' "$app_path" >&2
     exit 1
   fi
 
-  section "Install"
-  xcrun devicectl device install app --device "$DEVICE_ID" "$app_path"
+  section "Install: $device_name"
+  xcrun devicectl device install app --device "$device_id" "$app_path"
 
   if [[ "$LAUNCH_AFTER_INSTALL" == "1" ]]; then
-    section "Launch"
-    xcrun devicectl device process launch --terminate-existing --device "$DEVICE_ID" "$BUNDLE_ID" || true
+    section "Launch: $device_name"
+    xcrun devicectl device process launch --terminate-existing --device "$device_id" "$BUNDLE_ID" || true
   fi
 }
 
@@ -143,10 +193,16 @@ section "Xcode"
 xcodebuild -version
 
 section "Device"
-detect_device
+detect_devices
 
-build_for_device
-install_app
+for index in "${!DEVICE_IDS[@]}"; do
+  build_for_device "${DEVICE_IDS[$index]}" "${DEVICE_NAMES[$index]}"
+  install_app "${DEVICE_IDS[$index]}" "${DEVICE_NAMES[$index]}"
+done
 
 section "Done"
-printf 'Course Navigator was built and installed on the selected device.\n'
+if [[ "${#DEVICE_IDS[@]}" -gt 1 ]]; then
+  printf 'Course Navigator was built and installed on %s devices.\n' "${#DEVICE_IDS[@]}"
+else
+  printf 'Course Navigator was built and installed on the selected device.\n'
+fi
