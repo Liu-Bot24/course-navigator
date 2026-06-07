@@ -30,6 +30,7 @@ from .config import (
     OnlineAsrServiceConfig,
     OnlineAsrSettings,
     Settings,
+    default_env_path,
     load_settings,
 )
 from .cookies import normalize_cookie_text
@@ -93,6 +94,7 @@ LOCAL_VIDEO_EXTENSIONS = {
 }
 ASR_CACHE_AUTO_CLEANUP_THRESHOLD_BYTES = 500 * 1024 * 1024
 ASR_CACHE_AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".opus", ".wav", ".webm"}
+_DEFAULT_ENV_PATH = object()
 
 
 def create_app(
@@ -100,11 +102,18 @@ def create_app(
     workspace_dir: Path | None = None,
     runner: YtDlpRunner | None = None,
     settings: Settings | None = None,
-    env_path: Path | None = Path(".env"),
+    env_path: Path | None | object = _DEFAULT_ENV_PATH,
 ) -> FastAPI:
     active_settings = settings or load_settings()
     settings_state = {"value": active_settings}
     active_data_dir = data_dir or active_settings.data_dir
+    active_env_path: Path | None
+    if env_path is _DEFAULT_ENV_PATH:
+        active_env_path = default_env_path()
+    elif isinstance(env_path, Path):
+        active_env_path = env_path
+    else:
+        active_env_path = None
     active_workspace_dir = workspace_dir or active_settings.workspace_dir or active_data_dir
     _prepare_workspace(active_workspace_dir, active_data_dir)
     _maybe_auto_cleanup_asr_cache(active_data_dir, active_settings)
@@ -837,8 +846,8 @@ def create_app(
         next_search = _updated_asr_search_settings(current.asr_search, request)
         next_settings = current.model_copy(update={"asr_search": next_search})
         settings_state["value"] = next_settings
-        if env_path:
-            _write_model_env(env_path, next_settings)
+        if active_env_path:
+            _write_model_env(active_env_path, next_settings)
         return _asr_search_settings_response(next_settings)
 
     @app.get("/api/settings/online-asr")
@@ -851,8 +860,8 @@ def create_app(
         next_online_asr = _updated_online_asr_settings(current.online_asr, request)
         next_settings = current.model_copy(update={"online_asr": next_online_asr})
         settings_state["value"] = next_settings
-        if env_path:
-            _write_model_env(env_path, next_settings)
+        if active_env_path:
+            _write_model_env(active_env_path, next_settings)
         return _online_asr_settings_response(next_settings)
 
     @app.get("/api/settings/asr-cache")
@@ -866,8 +875,8 @@ def create_app(
             update={"asr_cache_auto_cleanup_enabled": request.auto_cleanup_enabled}
         )
         settings_state["value"] = next_settings
-        if env_path:
-            _write_model_env(env_path, next_settings)
+        if active_env_path:
+            _write_model_env(active_env_path, next_settings)
         if next_settings.asr_cache_auto_cleanup_enabled:
             _maybe_auto_cleanup_asr_cache(active_data_dir, next_settings)
         return _asr_cache_settings_response(active_data_dir, next_settings)
@@ -936,8 +945,8 @@ def create_app(
             }
         )
         settings_state["value"] = next_settings
-        if env_path:
-            _write_model_env(env_path, next_settings)
+        if active_env_path:
+            _write_model_env(active_env_path, next_settings)
         return _model_settings_response(next_settings)
 
     @app.post("/api/settings/models")
@@ -2467,6 +2476,12 @@ def _default_sort_order(metadata: VideoMetadata | None) -> float | None:
     if metadata and metadata.playlist_index:
         return float(metadata.playlist_index)
     return None
+
+
+def _metadata_playback_url(item: CourseItem) -> str | None:
+    if not item.metadata:
+        return None
+    return item.metadata.hls_manifest_url or item.metadata.stream_url
 
 
 def _title_from_supported_lesson_url(source_url: str) -> str | None:

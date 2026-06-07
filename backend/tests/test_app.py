@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from threading import Event
 from time import sleep
@@ -2178,6 +2179,56 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
     assert "COURSE_NAVIGATOR_ASR_MODEL_ID" in written
     assert "COURSE_NAVIGATOR_STUDY_DETAIL_LEVEL" in written
     assert "COURSE_NAVIGATOR_TASK_PARAMETERS" in written
+
+
+def test_model_settings_default_env_path_does_not_follow_process_cwd(tmp_path, monkeypatch):
+    default_env = app_module.default_env_path()
+    original = default_env.read_text(encoding="utf-8") if default_env.exists() else None
+    monkeypatch.chdir(tmp_path)
+    try:
+        client = TestClient(
+            create_app(
+                data_dir=tmp_path / "data",
+                workspace_dir=tmp_path / "workspace",
+                runner=FakeRunner(),
+                settings=Settings(data_dir=tmp_path / "data", workspace_dir=tmp_path / "workspace"),
+            )
+        )
+
+        response = client.put(
+            "/api/settings/model",
+            json={
+                "profiles": [
+                    {
+                        "id": "portable",
+                        "name": "Portable Model",
+                        "provider_type": "openai",
+                        "base_url": "https://api.example.com/v1",
+                        "model": "portable-chat",
+                        "api_key": "sk-portable-secret",
+                    },
+                ],
+                "translation_model_id": "portable",
+                "learning_model_id": "portable",
+                "global_model_id": "portable",
+                "asr_model_id": "portable",
+                "study_detail_level": "faithful",
+                "task_parameters": {},
+            },
+        )
+
+        assert response.status_code == 200
+        assert not (tmp_path / ".env").exists()
+        assert default_env.exists()
+        written = default_env.read_text(encoding="utf-8")
+        assert "Portable Model" in written
+        assert "COURSE_NAVIGATOR_MODEL_PROFILES" in written
+    finally:
+        if original is None:
+            default_env.unlink(missing_ok=True)
+        else:
+            default_env.write_text(original, encoding="utf-8")
+            os.chmod(default_env, 0o600)
 
 
 def test_create_app_allows_configured_web_origin(tmp_path):

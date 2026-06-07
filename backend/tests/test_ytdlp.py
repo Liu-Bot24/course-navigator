@@ -262,6 +262,7 @@ def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(mo
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/whisper" if name == "whisper" else None)
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", lambda path: {"streams": [{"codec_type": "video"}]})
     monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
     runner = YtDlpRunner(binary="yt-dlp")
     extract_request = ExtractRequest(
