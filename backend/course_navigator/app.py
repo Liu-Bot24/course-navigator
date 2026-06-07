@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 import httpx
@@ -94,6 +94,7 @@ LOCAL_VIDEO_EXTENSIONS = {
 }
 ASR_CACHE_AUTO_CLEANUP_THRESHOLD_BYTES = 500 * 1024 * 1024
 ASR_CACHE_AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".opus", ".wav", ".webm"}
+PLAYBACK_URL_REFRESH_MARGIN_SECONDS = 15 * 60
 _DEFAULT_ENV_PATH = object()
 
 
@@ -1013,7 +1014,8 @@ def create_app(
         item = library.get(item_id)
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
-        if item.local_video_path or _metadata_playback_url(item):
+        playback_url = _metadata_playback_url(item)
+        if item.local_video_path or (playback_url and not _playback_url_needs_refresh(playback_url)):
             return _with_item_updated_at(
                 _normalize_item_for_response(item, active_workspace_dir),
                 library.item_updated_at(item.id),
@@ -2386,6 +2388,26 @@ def _metadata_playback_url(item: CourseItem) -> str | None:
     return item.metadata.hls_manifest_url or item.metadata.stream_url
 
 
+def _playback_url_needs_refresh(url: str) -> bool:
+    parsed = urlparse(url)
+    expire_values = parse_qs(parsed.query).get("expire")
+    expire_value = expire_values[0] if expire_values else None
+    if not expire_value:
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if "expire" in path_parts:
+            expire_index = path_parts.index("expire")
+            if len(path_parts) > expire_index + 1:
+                expire_value = path_parts[expire_index + 1]
+    if not expire_value:
+        return False
+    try:
+        expires_at = int(float(expire_value))
+    except (TypeError, ValueError):
+        return False
+    now = int(datetime.now(timezone.utc).timestamp())
+    return expires_at <= now + PLAYBACK_URL_REFRESH_MARGIN_SECONDS
+
+
 def _with_duration_fallback(item: CourseItem) -> CourseItem:
     duration = _best_duration(item.duration, item.metadata.duration if item.metadata else None, _duration_from_transcript(item.transcript))
     if duration == item.duration:
@@ -2476,12 +2498,6 @@ def _default_sort_order(metadata: VideoMetadata | None) -> float | None:
     if metadata and metadata.playlist_index:
         return float(metadata.playlist_index)
     return None
-
-
-def _metadata_playback_url(item: CourseItem) -> str | None:
-    if not item.metadata:
-        return None
-    return item.metadata.hls_manifest_url or item.metadata.stream_url
 
 
 def _title_from_supported_lesson_url(source_url: str) -> str | None:

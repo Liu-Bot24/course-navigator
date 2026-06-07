@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from threading import Event
 from time import sleep
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -3272,6 +3273,103 @@ def test_playback_source_resolves_missing_remote_stream_url(tmp_path):
     assert runner.fetch_count == 1
     persisted = client.get("/api/items/remote-lesson").json()
     assert persisted["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+
+
+def test_playback_source_refreshes_expired_remote_stream_url(tmp_path):
+    runner = CountingMetadataRunner()
+    workspace = tmp_path / "workspace"
+    client = make_client(tmp_path, runner=runner, workspace_dir=workspace)
+    library = CourseLibrary(workspace)
+    library.save(
+        CourseItem(
+            id="expired-remote-lesson",
+            source_url="https://www.youtube.com/watch?v=expired",
+            title="Expired Remote Lesson",
+            created_at="2026-06-07T00:00:00+00:00",
+            duration=10,
+            metadata=VideoMetadata(
+                id="expired",
+                title="Expired Remote Lesson",
+                webpage_url="https://www.youtube.com/watch?v=expired",
+                extractor="youtube",
+                stream_url="https://rr.example.googlevideo.com/videoplayback?expire=1&sig=old",
+                hls_manifest_url=None,
+            ),
+        )
+    )
+
+    response = client.post("/api/items/expired-remote-lesson/playback-source")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+    assert payload["duration"] == 10
+    assert runner.fetch_count == 1
+
+
+def test_playback_source_refreshes_expired_hls_manifest_url(tmp_path):
+    runner = CountingMetadataRunner()
+    workspace = tmp_path / "workspace"
+    client = make_client(tmp_path, runner=runner, workspace_dir=workspace)
+    library = CourseLibrary(workspace)
+    library.save(
+        CourseItem(
+            id="expired-hls-lesson",
+            source_url="https://www.youtube.com/watch?v=expired-hls",
+            title="Expired HLS Lesson",
+            created_at="2026-06-07T00:00:00+00:00",
+            duration=10,
+            metadata=VideoMetadata(
+                id="expired-hls",
+                title="Expired HLS Lesson",
+                webpage_url="https://www.youtube.com/watch?v=expired-hls",
+                extractor="youtube",
+                stream_url=None,
+                hls_manifest_url="https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1/id/expired-hls",
+            ),
+        )
+    )
+
+    response = client.post("/api/items/expired-hls-lesson/playback-source")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+    assert runner.fetch_count == 1
+
+
+def test_playback_source_keeps_fresh_remote_stream_url(tmp_path):
+    runner = CountingMetadataRunner()
+    workspace = tmp_path / "workspace"
+    client = make_client(tmp_path, runner=runner, workspace_dir=workspace)
+    library = CourseLibrary(workspace)
+    expires_at = int(datetime.now(timezone.utc).timestamp()) + 3600
+    stream_url = f"https://rr.example.googlevideo.com/videoplayback?expire={expires_at}&sig=fresh"
+    library.save(
+        CourseItem(
+            id="fresh-remote-lesson",
+            source_url="https://www.youtube.com/watch?v=fresh",
+            title="Fresh Remote Lesson",
+            created_at="2026-06-07T00:00:00+00:00",
+            duration=10,
+            metadata=VideoMetadata(
+                id="fresh",
+                title="Fresh Remote Lesson",
+                webpage_url="https://www.youtube.com/watch?v=fresh",
+                extractor="youtube",
+                stream_url=stream_url,
+                hls_manifest_url=None,
+            ),
+        )
+    )
+
+    response = client.post("/api/items/fresh-remote-lesson/playback-source")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["metadata"]["stream_url"] == stream_url
+    assert payload["duration"] == 10
+    assert runner.fetch_count == 0
 
 
 def test_playback_source_does_not_refresh_local_workspace_video(tmp_path):

@@ -226,6 +226,8 @@ struct CourseVideoPanel: View {
     @State private var observedItemID: String?
     @State private var floatingSubtitleMode: FloatingSubtitleMode = .hidden
     @State private var showingFullScreenVideo = false
+    @State private var qualityOptions: [VideoQualityOption] = [.automatic]
+    @State private var selectedQualityID = VideoQualityOption.automaticID
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -245,6 +247,8 @@ struct CourseVideoPanel: View {
                 VideoViewingControls(
                     subtitleMode: $floatingSubtitleMode,
                     hasSubtitles: hasFloatingSubtitles,
+                    qualityOptions: qualityOptions,
+                    selectedQualityID: $selectedQualityID,
                     showFullScreen: { showingFullScreenVideo = true }
                 )
             } else {
@@ -275,19 +279,24 @@ struct CourseVideoPanel: View {
                     item: item,
                     player: player,
                     currentTime: $currentTime,
-                    subtitleMode: $floatingSubtitleMode
+                    subtitleMode: $floatingSubtitleMode,
+                    qualityOptions: qualityOptions,
+                    selectedQualityID: $selectedQualityID
                 )
             }
+        }
+        .task(id: qualityLoadingIdentity) {
+            await refreshQualityOptions()
         }
         .task(id: playbackIdentity) {
             saveCurrentPlaybackPosition(force: true)
             player?.pause()
             timeObserver.invalidate()
-            let initialTime = sanitizedResumeTime
+            let initialTime = observedItemID == item.id ? clampedPlaybackTime(currentTime) : sanitizedResumeTime
             currentTime = initialTime
             observedItemID = item.id
-            if let playbackURL {
-                let nextPlayer = AVPlayer(url: playbackURL)
+            if let effectivePlaybackURL {
+                let nextPlayer = AVPlayer(url: effectivePlaybackURL)
                 player = nextPlayer
                 if initialTime > 1 {
                     let time = CMTime(seconds: initialTime, preferredTimescale: 600)
@@ -314,7 +323,17 @@ struct CourseVideoPanel: View {
     }
 
     private var playbackIdentity: String {
+        "\(item.id)|\(effectivePlaybackURL?.absoluteString ?? "none")"
+    }
+
+    private var qualityLoadingIdentity: String {
         "\(item.id)|\(playbackURL?.absoluteString ?? "none")"
+    }
+
+    private var effectivePlaybackURL: URL? {
+        guard let playbackURL else { return nil }
+        guard selectedQualityID != VideoQualityOption.automaticID else { return playbackURL }
+        return qualityOptions.first { $0.id == selectedQualityID }?.url ?? playbackURL
     }
 
     private var sanitizedResumeTime: Double {
@@ -341,6 +360,19 @@ struct CourseVideoPanel: View {
 
     private var activeSubtitleCue: FloatingSubtitleCue? {
         FloatingSubtitleCue.make(for: item, at: currentTime)
+    }
+
+    private func refreshQualityOptions() async {
+        guard let playbackURL else {
+            qualityOptions = [.automatic]
+            selectedQualityID = VideoQualityOption.automaticID
+            return
+        }
+        let options = await HLSQualityManifestParser.options(from: playbackURL)
+        qualityOptions = options
+        if !options.contains(where: { $0.id == selectedQualityID }) {
+            selectedQualityID = VideoQualityOption.automaticID
+        }
     }
 
     private func seek(by delta: Double) {
@@ -386,6 +418,259 @@ enum FloatingSubtitleMode: String, CaseIterable, Identifiable {
         case .translated: "译文"
         case .bilingual: "双语"
         }
+    }
+}
+
+struct VideoQualityOption: Identifiable, Hashable {
+    static let automaticID = "auto"
+    static let automatic = VideoQualityOption(
+        id: automaticID,
+        label: "自动",
+        url: nil,
+        width: nil,
+        height: nil,
+        bandwidth: nil,
+        qualityKey: "auto",
+        qualityLabel: "自动",
+        languageKey: nil,
+        languageLabel: nil
+    )
+
+    var id: String
+    var label: String
+    var url: URL?
+    var width: Int?
+    var height: Int?
+    var bandwidth: Int?
+    var qualityKey: String
+    var qualityLabel: String
+    var languageKey: String?
+    var languageLabel: String?
+}
+
+enum HLSQualityManifestParser {
+    static func options(from url: URL) async -> [VideoQualityOption] {
+        guard url.isLikelyHLSManifest else { return [.automatic] }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 8
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                return [.automatic]
+            }
+            guard let manifest = String(data: data, encoding: .utf8) else { return [.automatic] }
+            return parse(manifest, baseURL: url)
+        } catch {
+            return [.automatic]
+        }
+    }
+
+    static func parse(_ manifest: String, baseURL: URL) -> [VideoQualityOption] {
+        var variants: [ParsedVariant] = []
+        var pendingAttributes: [String: String]?
+
+        for rawLine in manifest.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("#EXT-X-STREAM-INF:") {
+                let attributes = String(line.dropFirst("#EXT-X-STREAM-INF:".count))
+                pendingAttributes = parseAttributes(attributes)
+                continue
+            }
+            guard let attributes = pendingAttributes, !line.hasPrefix("#") else { continue }
+            pendingAttributes = nil
+            guard let variantURL = URL(string: line, relativeTo: baseURL)?.absoluteURL else { continue }
+            let resolution = parseResolution(attributes["RESOLUTION"])
+            let bandwidth = attributes["BANDWIDTH"].flatMap(Int.init)
+            let languageCode = languageCode(from: attributes, variantURL: variantURL)
+            let languageLabel = languageLabel(for: languageCode)
+            guard shouldShowLanguage(code: languageCode, label: languageLabel) else { continue }
+            variants.append(
+                ParsedVariant(
+                    url: variantURL,
+                    width: resolution?.width,
+                    height: resolution?.height,
+                    bandwidth: bandwidth,
+                    languageKey: languageCode?.lowercased(),
+                    languageLabel: languageLabel
+                )
+            )
+        }
+
+        let qualitiesWithLanguageLabels = Set(
+            Dictionary(grouping: variants, by: \.qualityKey)
+                .filter { _, variants in
+                    variants.contains { $0.languageLabel != nil }
+                }
+                .keys
+        )
+        let visibleVariants = variants.filter { variant in
+            variant.languageLabel != nil || !qualitiesWithLanguageLabels.contains(variant.qualityKey)
+        }
+
+        let bestVariants = Dictionary(grouping: visibleVariants, by: \.selectionKey)
+            .compactMap { _, variants in
+                variants.max(by: { left, right in
+                    right.isBetterQualityChoice(than: left)
+                })
+            }
+        let sortedVariants = bestVariants.sorted { left, right in
+            let leftHeight = left.height ?? 0
+            let rightHeight = right.height ?? 0
+            if leftHeight != rightHeight { return leftHeight > rightHeight }
+            return (left.bandwidth ?? 0) > (right.bandwidth ?? 0)
+        }
+        let qualityOptions = sortedVariants.enumerated().map { index, variant in
+            VideoQualityOption(
+                id: variant.id(index: index),
+                label: variant.label,
+                url: variant.url,
+                width: variant.width,
+                height: variant.height,
+                bandwidth: variant.bandwidth,
+                qualityKey: variant.qualityKey,
+                qualityLabel: variant.qualityLabel,
+                languageKey: variant.languageKey,
+                languageLabel: variant.languageLabel
+            )
+        }
+        return qualityOptions.isEmpty ? [.automatic] : [VideoQualityOption.automatic] + qualityOptions
+    }
+
+    private static func languageCode(from attributes: [String: String], variantURL: URL) -> String? {
+        if let value = attributes["LANGUAGE"] ?? attributes["YT-EXT-AUDIO-CONTENT-ID"] {
+            return normalizedLanguageCode(value)
+        }
+        let decodedURL = variantURL.absoluteString.removingPercentEncoding ?? variantURL.absoluteString
+        if let range = decodedURL.range(of: #"lang=([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)"#, options: .regularExpression) {
+            let token = String(decodedURL[range])
+            return normalizedLanguageCode(String(token.dropFirst("lang=".count)))
+        }
+        return nil
+    }
+
+    private static func normalizedLanguageCode(_ rawValue: String) -> String? {
+        let trimmed = rawValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        guard !trimmed.isEmpty else { return nil }
+        let beforeDot = trimmed.split(separator: ".", maxSplits: 1).first.map(String.init) ?? trimmed
+        let beforeColon = beforeDot.split(separator: ":", maxSplits: 1).last.map(String.init) ?? beforeDot
+        let normalized = beforeColon.replacingOccurrences(of: "_", with: "-").lowercased()
+        return normalized == "iw" ? "he" : normalized
+    }
+
+    private static func shouldShowLanguage(code: String?, label: String?) -> Bool {
+        code == nil || label != nil
+    }
+
+    private static func languageLabel(for code: String?) -> String? {
+        guard let code else { return nil }
+        if code == "zh" || code.hasPrefix("zh-hans") || code.hasPrefix("zh-cn") {
+            return "中文"
+        }
+        if code.hasPrefix("zh-hant") || code.hasPrefix("zh-tw") || code.hasPrefix("zh-hk") {
+            return "繁体中文"
+        }
+        if code.hasPrefix("en") { return "英语" }
+        if code.hasPrefix("ja") { return "日语" }
+        if code.hasPrefix("ko") { return "韩语" }
+        if code.hasPrefix("fr") { return "法语" }
+        if code.hasPrefix("de") { return "德语" }
+        if code.hasPrefix("es") { return "西班牙语" }
+        if code.hasPrefix("pt") { return "葡萄牙语" }
+        if code.hasPrefix("it") { return "意大利语" }
+        if code.hasPrefix("ru") { return "俄语" }
+        return nil
+    }
+
+    private static func parseAttributes(_ text: String) -> [String: String] {
+        splitAttributeText(text).reduce(into: [:]) { result, token in
+            guard let separator = token.firstIndex(of: "=") else { return }
+            let key = token[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+            var value = token[token.index(after: separator)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+                value.removeFirst()
+                value.removeLast()
+            }
+            result[String(key)] = String(value)
+        }
+    }
+
+    private static func splitAttributeText(_ text: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var isInsideQuotes = false
+        for character in text {
+            if character == "\"" {
+                isInsideQuotes.toggle()
+                current.append(character)
+            } else if character == "," && !isInsideQuotes {
+                tokens.append(current)
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        if !current.isEmpty {
+            tokens.append(current)
+        }
+        return tokens
+    }
+
+    private static func parseResolution(_ value: String?) -> (width: Int, height: Int)? {
+        guard let value else { return nil }
+        let parts = value.lowercased().split(separator: "x")
+        guard parts.count == 2, let width = Int(parts[0]), let height = Int(parts[1]) else {
+            return nil
+        }
+        return (width, height)
+    }
+
+    private struct ParsedVariant {
+        var url: URL
+        var width: Int?
+        var height: Int?
+        var bandwidth: Int?
+        var languageKey: String?
+        var languageLabel: String?
+
+        var qualityKey: String {
+            if let height { return "h\(height)" }
+            if let width { return "w\(width)" }
+            return "unknown"
+        }
+
+        var qualityLabel: String {
+            if let height { return "\(height)p" }
+            if let width { return "\(width)w" }
+            return "线路"
+        }
+
+        var selectionKey: String {
+            "\(qualityKey)|\(languageKey ?? "default")"
+        }
+
+        func id(index: Int) -> String {
+            "hls-\(selectionKey)-\(index)"
+        }
+
+        var label: String {
+            if let languageLabel {
+                return languageLabel
+            }
+            return qualityLabel
+        }
+
+        func isBetterQualityChoice(than other: ParsedVariant) -> Bool {
+            return (bandwidth ?? 0) > (other.bandwidth ?? 0)
+        }
+    }
+}
+
+private extension URL {
+    var isLikelyHLSManifest: Bool {
+        pathExtension.lowercased() == "m3u8"
     }
 }
 
@@ -505,6 +790,8 @@ enum VideoSubtitleOverlayPlacement {
 struct VideoViewingControls: View {
     @Binding var subtitleMode: FloatingSubtitleMode
     var hasSubtitles: Bool
+    var qualityOptions: [VideoQualityOption]
+    @Binding var selectedQualityID: String
     var showFullScreen: () -> Void
 
     var body: some View {
@@ -528,8 +815,110 @@ struct VideoViewingControls: View {
         }
         .buttonStyle(.bordered)
 
+        VideoQualityMenu(
+            qualityOptions: qualityOptions,
+            selectedQualityID: $selectedQualityID
+        )
+
         FloatingSubtitleMenu(subtitleMode: $subtitleMode, hasSubtitles: hasSubtitles)
     }
+}
+
+struct VideoQualityMenu: View {
+    var qualityOptions: [VideoQualityOption]
+    @Binding var selectedQualityID: String
+
+    var body: some View {
+        Menu {
+            qualityButton(VideoQualityOption.automatic)
+
+            ForEach(qualityGroups) { group in
+                if group.options.count == 1, let option = group.options.first {
+                    qualityButton(option, label: group.title)
+                } else {
+                    Menu(group.title) {
+                        ForEach(group.options) { option in
+                            qualityButton(option, label: option.languageLabel ?? "默认")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Label("清晰度：\(selectedQualityLabel)", systemImage: "slider.horizontal.3")
+                .lineLimit(1)
+                .minimumScaleFactor(0.9)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(qualityOptions.count <= 1)
+    }
+
+    private var selectedQualityLabel: String {
+        qualityOptions.first { $0.id == selectedQualityID }?.qualityLabel
+            ?? VideoQualityOption.automatic.qualityLabel
+    }
+
+    private var qualityGroups: [VideoQualityGroup] {
+        let options = qualityOptions.filter { $0.id != VideoQualityOption.automaticID }
+        let grouped = Dictionary(grouping: options, by: \.qualityKey)
+        return grouped.values
+            .compactMap { options -> VideoQualityGroup? in
+                guard let first = options.first else { return nil }
+                return VideoQualityGroup(
+                    id: first.qualityKey,
+                    title: first.qualityLabel,
+                    options: options.sorted(by: languageSort)
+                )
+            }
+            .sorted { left, right in
+                let leftHeight = left.options.first?.height ?? 0
+                let rightHeight = right.options.first?.height ?? 0
+                if leftHeight != rightHeight { return leftHeight > rightHeight }
+                return left.title.localizedStandardCompare(right.title) == .orderedAscending
+            }
+    }
+
+    @ViewBuilder
+    private func qualityButton(_ option: VideoQualityOption, label: String? = nil) -> some View {
+        Button {
+            selectedQualityID = option.id
+        } label: {
+            let title = label ?? option.label
+            if selectedQualityID == option.id {
+                Label(title, systemImage: "checkmark")
+            } else {
+                Text(title)
+            }
+        }
+    }
+
+    private func languageSort(_ left: VideoQualityOption, _ right: VideoQualityOption) -> Bool {
+        let leftRank = languageRank(left)
+        let rightRank = languageRank(right)
+        if leftRank != rightRank { return leftRank < rightRank }
+        return left.label.localizedStandardCompare(right.label) == .orderedAscending
+    }
+
+    private func languageRank(_ option: VideoQualityOption) -> Int {
+        guard let languageKey = option.languageKey else { return 0 }
+        if languageKey.hasPrefix("zh") { return 1 }
+        if languageKey.hasPrefix("en") { return 2 }
+        if languageKey.hasPrefix("ja") { return 3 }
+        if languageKey.hasPrefix("ko") { return 4 }
+        if languageKey.hasPrefix("fr") { return 5 }
+        if languageKey.hasPrefix("de") { return 6 }
+        if languageKey.hasPrefix("es") { return 7 }
+        if languageKey.hasPrefix("pt") { return 8 }
+        if languageKey.hasPrefix("it") { return 9 }
+        if languageKey.hasPrefix("ru") { return 10 }
+        return 100
+    }
+}
+
+private struct VideoQualityGroup: Identifiable {
+    var id: String
+    var title: String
+    var options: [VideoQualityOption]
 }
 
 struct FloatingSubtitleMenu: View {
@@ -564,6 +953,8 @@ struct FullScreenVideoView: View {
     var player: AVPlayer
     @Binding var currentTime: Double
     @Binding var subtitleMode: FloatingSubtitleMode
+    var qualityOptions: [VideoQualityOption]
+    @Binding var selectedQualityID: String
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -578,6 +969,11 @@ struct FullScreenVideoView: View {
             .ignoresSafeArea()
 
             HStack(spacing: 10) {
+                VideoQualityMenu(
+                    qualityOptions: qualityOptions,
+                    selectedQualityID: $selectedQualityID
+                )
+                .fixedSize(horizontal: true, vertical: false)
                 FloatingSubtitleMenu(subtitleMode: $subtitleMode, hasSubtitles: hasSubtitles)
                     .fixedSize(horizontal: true, vertical: false)
                 Button {

@@ -2,6 +2,8 @@ import Foundation
 import Network
 import Observation
 
+private let playbackURLRefreshMargin: TimeInterval = 15 * 60
+
 @MainActor
 @Observable
 final class AppModel {
@@ -14,7 +16,11 @@ final class AppModel {
     var activeEndpointID: UUID?
     var connectionStatus: ConnectionStatus = .unknown
     var courses: [CourseItem] = []
-    var selectedCourseID: String?
+    var selectedCourseID: String? {
+        didSet {
+            rememberSelectedCourseID(selectedCourseID)
+        }
+    }
     var activeJob: StudyJobStatus?
     var modelSettings: ModelSettings?
     var onlineASRSettings: OnlineASRSettings?
@@ -375,12 +381,7 @@ final class AppModel {
             courses = applyLibraryState(to: summaries)
                 .sorted(by: courseSort)
             saveCachedCoursesForActiveEndpoint()
-            if selectedCourseID == nil {
-                selectedCourseID = courses.first?.id
-            }
-            if let selectedCourseID, !courses.contains(where: { $0.id == selectedCourseID }) {
-                self.selectedCourseID = courses.first?.id
-            }
+            selectAvailableCourse()
             if let selectedCourseID, let previousSelectedCourse, previousSelectedCourse.id == selectedCourseID {
                 upsertCourse(previousSelectedCourse)
             }
@@ -770,13 +771,7 @@ final class AppModel {
         if item.hasPlayableLocalVideo, let api {
             return api.videoURL(itemID: item.id)
         }
-        if let hls = item.metadata?.hlsManifestURL, let url = URL(string: hls) {
-            return url
-        }
-        if let stream = item.metadata?.streamURL, let url = URL(string: stream) {
-            return url
-        }
-        return nil
+        return metadataRemoteVideoURL(for: item)
     }
 
     func ensureOnlinePlaybackSource(for item: CourseItem) async {
@@ -941,9 +936,7 @@ final class AppModel {
             }
 
             courses = Array(mergedByID.values).sorted(by: courseSort)
-            if selectedCourseID == nil || !courses.contains(where: { $0.id == selectedCourseID }) {
-                selectedCourseID = courses.first?.id
-            }
+            selectAvailableCourse()
             saveCachedCoursesForActiveEndpoint(replacingExisting: true)
             errorMessage = failedCount == 0 ? nil : "\(failedCount) 门课程资料暂时没有同步成功"
             if failedCount > 0, let descriptor {
@@ -1030,11 +1023,11 @@ final class AppModel {
     }
 
     private func metadataRemoteVideoURL(for item: CourseItem) -> URL? {
-        if let stream = item.metadata?.streamURL, let url = URL(string: stream), url.isHTTPOrHTTPS {
-            return url
-        }
         if let hls = item.metadata?.hlsManifestURL, let url = URL(string: hls), url.isHTTPOrHTTPS {
-            return url
+            return url.needsPlaybackRefresh ? nil : url
+        }
+        if let stream = item.metadata?.streamURL, let url = URL(string: stream), url.isHTTPOrHTTPS {
+            return url.needsPlaybackRefresh ? nil : url
         }
         return nil
     }
@@ -1156,11 +1149,33 @@ final class AppModel {
         guard let snapshot = try? courseCacheStore.load(endpoint: descriptor), !snapshot.courses.isEmpty else { return false }
         libraryState = snapshot.libraryState
         courses = snapshot.courses.sorted(by: courseSort)
-        if selectedCourseID == nil || !courses.contains(where: { $0.id == selectedCourseID }) {
-            selectedCourseID = courses.first?.id
-        }
+        selectAvailableCourse()
         refreshLocalCourseLibraryIndex()
         return true
+    }
+
+    private func selectAvailableCourse(preferredID: String? = nil) {
+        let validCourseIDs = Set(courses.map(\.id))
+        let candidates = [
+            preferredID,
+            selectedCourseID,
+            rememberedSelectedCourseID()
+        ]
+        for candidate in candidates.compactMap({ $0 }) where validCourseIDs.contains(candidate) {
+            selectedCourseID = candidate
+            return
+        }
+        selectedCourseID = courses.first?.id
+    }
+
+    private func rememberedSelectedCourseID() -> String? {
+        guard let descriptor = activeEndpointDescriptor else { return nil }
+        return store.loadSelectedCourseID(endpoint: descriptor)
+    }
+
+    private func rememberSelectedCourseID(_ courseID: String?) {
+        guard let courseID, let descriptor = activeEndpointDescriptor else { return }
+        store.saveSelectedCourseID(courseID, endpoint: descriptor)
     }
 
     private func saveCachedCoursesForActiveEndpoint(replacingExisting: Bool = false) {
@@ -1330,6 +1345,25 @@ private extension URL {
     var isHLSManifest: Bool {
         pathExtension.lowercased() == "m3u8"
     }
+
+    var needsPlaybackRefresh: Bool {
+        let queryExpireValue = URLComponents(url: self, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "expire" })?
+            .value
+        let pathParts = path.split(separator: "/").map(String.init)
+        let pathExpireValue: String?
+        if let expireIndex = pathParts.firstIndex(of: "expire"), pathParts.indices.contains(expireIndex + 1) {
+            pathExpireValue = pathParts[expireIndex + 1]
+        } else {
+            pathExpireValue = nil
+        }
+        guard let expireValue = queryExpireValue ?? pathExpireValue,
+              let expiresAt = TimeInterval(expireValue) else {
+            return false
+        }
+        return expiresAt <= Date().timeIntervalSince1970 + playbackURLRefreshMargin
+    }
 }
 
 private extension Array where Element == TranscriptSegment {
@@ -1363,6 +1397,7 @@ struct EndpointStore {
     private let endpointsKey = "course-navigator-mobile-endpoints"
     private let activeEndpointKey = "course-navigator-mobile-active-endpoint"
     private let explicitLocalModeEndpointKey = "course-navigator-mobile-explicit-local-mode-endpoint"
+    private let selectedCourseKeyPrefix = "course-navigator-mobile-selected-course."
 
     static var defaultEndpoints: [BackendEndpoint] {
         #if targetEnvironment(simulator)
@@ -1399,6 +1434,18 @@ struct EndpointStore {
 
     func saveExplicitLocalModeEndpointID(_ id: UUID?) {
         UserDefaults.standard.set(id?.uuidString, forKey: explicitLocalModeEndpointKey)
+    }
+
+    func loadSelectedCourseID(endpoint: EndpointCacheDescriptor) -> String? {
+        UserDefaults.standard.string(forKey: selectedCourseKey(for: endpoint))
+    }
+
+    func saveSelectedCourseID(_ id: String, endpoint: EndpointCacheDescriptor) {
+        UserDefaults.standard.set(id, forKey: selectedCourseKey(for: endpoint))
+    }
+
+    private func selectedCourseKey(for endpoint: EndpointCacheDescriptor) -> String {
+        selectedCourseKeyPrefix + endpoint.key
     }
 }
 
