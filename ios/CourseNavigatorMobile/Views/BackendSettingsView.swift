@@ -9,6 +9,40 @@ struct BackendSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("本地模式") {
+                    if model.localCourseLibraries.isEmpty {
+                        Label("当前设备还没有可离线使用的课程资料", systemImage: "internaldrive")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.localCourseLibraries) { library in
+                            Button {
+                                model.useLocalLibrary(library.id)
+                                dismiss()
+                            } label: {
+                                HStack(spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(library.endpointName)
+                                            .font(.headline)
+                                        Text("\(library.courseCountLabel) · 上次同步 \(library.savedAt, style: .relative)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        EndpointAddressText(library.endpointBaseURL)
+                                    }
+                                    Spacer()
+                                    if model.activeEndpointID == library.id && model.isLocalMode {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.blue)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    Text("本地模式只读取当前设备已同步的课程资料和视频缓存，不会尝试连接电脑后端。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("当前后端") {
                     if model.endpoints.isEmpty {
                         Label("还没有保存后端设备", systemImage: "server.rack")
@@ -27,11 +61,43 @@ struct BackendSettingsView: View {
                         }
                     }
                     Button {
-                        Task { await model.refreshAll() }
+                        Task {
+                            await model.refreshAll(
+                                allowExplicitLocalMode: false,
+                                allowOfflineFallback: false
+                            )
+                        }
                     } label: {
                         Label("测试连接", systemImage: "wifi")
+                            .imageScale(.small)
                     }
                     .disabled(model.activeEndpoint == nil || model.connectionStatus == .checking)
+                    if model.isLocalMode {
+                        Button {
+                            Task {
+                                await model.useOnlineMode()
+                                if model.canShowCourseContent {
+                                    dismiss()
+                                }
+                            }
+                        } label: {
+                            Label("切回 WiFi 模式", systemImage: "wifi")
+                                .imageScale(.small)
+                        }
+                        .disabled(model.connectionStatus == .checking)
+                    } else if model.canEnterLocalMode {
+                        Button {
+                            Task {
+                                await model.enterActiveLocalMode()
+                                if model.canShowCourseContent {
+                                    dismiss()
+                                }
+                            }
+                        } label: {
+                            Label("进入本地模式", systemImage: "internaldrive")
+                        }
+                        .disabled(model.isSyncingCourseLibrary || model.connectionStatus == .checking)
+                    }
                 }
 
                 Section("局域网发现") {
@@ -110,8 +176,8 @@ struct BackendSettingsView: View {
                                     }
                                     Spacer()
                                     if model.activeEndpointID == endpoint.id {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.green)
+                                        Image(systemName: model.isLocalMode ? "internaldrive.fill" : "checkmark.circle.fill")
+                                            .foregroundStyle(model.isLocalMode ? .blue : .green)
                                     }
                                 }
                             }
@@ -131,7 +197,7 @@ struct BackendSettingsView: View {
 
                 Section("电脑端要求") {
                     Label("电脑后端需要用局域网地址启动，而不是只监听 127.0.0.1。", systemImage: "desktopcomputer")
-                    Label("iPhone/iPad 首次访问会请求本地网络权限。", systemImage: "iphone")
+                    Label("当前设备首次访问会请求本地网络权限。", systemImage: "network")
                 }
             }
             .navigationTitle("后端设备")
@@ -148,7 +214,6 @@ struct BackendSettingsView: View {
             }
             .refreshable {
                 discovery.start()
-                await model.refreshAll()
             }
         }
     }
@@ -183,13 +248,13 @@ struct BackendSettingsView: View {
             return "不要填写 0.0.0.0；这是电脑后端的监听地址。请填写脚本打印的局域网 IP。"
         }
         if draft.isLinkLocalBaseURL {
-            return "不要填写 169.254 或 fe80 开头的地址；请确认电脑和手机在同一 Wi-Fi 后使用局域网地址。"
+            return "不要填写 169.254 或 fe80 开头的地址；请确认电脑和当前设备在同一 Wi-Fi 后使用局域网地址。"
         }
         #if targetEnvironment(simulator)
         return nil
         #else
         return draft.isLoopbackBaseURL
-            ? "iPhone/iPad 上不能使用 127.0.0.1 或 localhost；请填写电脑脚本打印的局域网地址。"
+            ? "当前设备不能使用 127.0.0.1 或 localhost；请填写电脑脚本打印的局域网地址。"
             : nil
         #endif
     }
@@ -243,7 +308,7 @@ struct BackendSettingsView: View {
     private func connectEndpoint(_ endpointID: UUID) {
         Task {
             await model.selectEndpoint(endpointID)
-            if model.isBackendOnline {
+            if model.canShowCourseContent {
                 dismiss()
             }
         }

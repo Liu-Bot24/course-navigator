@@ -18,6 +18,10 @@ struct CourseAPI {
         try await get("/items", queryItems: [URLQueryItem(name: "summary", value: "true")])
     }
 
+    func libraryState() async throws -> LibraryState {
+        try await get("/library-state")
+    }
+
     func item(itemID: String) async throws -> CourseItem {
         try await get("/items/\(itemID.urlPathEncoded)")
     }
@@ -172,24 +176,36 @@ struct CourseAPI {
     ) async throws -> T {
         var request = request
         request.timeoutInterval = timeout
+        Self.debugNetwork("START \(request.httpMethod ?? "GET") \(request.url?.absoluteString ?? "<invalid>") timeout=\(timeout)")
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await URLSession.shared.data(for: request)
         } catch let error as URLError {
+            Self.debugNetwork("ERROR \(error.code.rawValue) \(request.url?.absoluteString ?? "<invalid>") \(error.localizedDescription)")
             throw CourseAPIError.transport(Self.transportMessage(for: error))
         }
         guard let http = response as? HTTPURLResponse else {
+            Self.debugNetwork("ERROR invalid-response \(request.url?.absoluteString ?? "<invalid>")")
             throw CourseAPIError.invalidResponse
         }
         guard (200..<300).contains(http.statusCode) else {
+            Self.debugNetwork("ERROR status=\(http.statusCode) \(request.url?.absoluteString ?? "<invalid>")")
             throw CourseAPIError.server(message: Self.errorMessage(from: data) ?? "Request failed: \(http.statusCode)")
         }
         do {
-            return try JSONDecoder.courseNavigator.decode(T.self, from: data)
+            let value = try JSONDecoder.courseNavigator.decode(T.self, from: data)
+            Self.debugNetwork("OK status=\(http.statusCode) bytes=\(data.count) \(request.url?.absoluteString ?? "<invalid>")")
+            return value
         } catch {
+            Self.debugNetwork("ERROR decode \(request.url?.absoluteString ?? "<invalid>") \(error.localizedDescription)")
             throw CourseAPIError.decode(error.localizedDescription)
         }
+    }
+
+    private static func debugNetwork(_ message: String) {
+        guard ProcessInfo.processInfo.environment["COURSE_NAVIGATOR_DEBUG_NETWORK"] == "1" else { return }
+        print("[CourseNavigatorNetwork] \(message)")
     }
 
     private func apiURL(_ path: String, queryItems: [URLQueryItem] = []) -> URL? {
@@ -225,7 +241,7 @@ struct CourseAPI {
     private static func transportMessage(for error: URLError) -> String {
         switch error.code {
         case .timedOut:
-            "连接电脑后端超时，请确认电脑后端已启动，并且 iPhone/iPad 和电脑在同一局域网。"
+            "连接电脑后端超时，请确认电脑后端已启动，并且当前设备和电脑在同一局域网。"
         case .cannotFindHost:
             "找不到这个电脑后端地址，请检查局域网 IP 或 .local 地址是否填对。"
         case .cannotConnectToHost:

@@ -1,5 +1,8 @@
 import json
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -259,6 +262,7 @@ def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(mo
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/whisper" if name == "whisper" else None)
+    monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
     runner = YtDlpRunner(binary="yt-dlp")
     extract_request = ExtractRequest(
         url="https://www.youtube.com/watch?v=abc&list=PL123",
@@ -768,10 +772,13 @@ def test_extract_subtitles_falls_back_to_hls_manifest_tracks(monkeypatch, tmp_pa
 
 
 def test_download_video_returns_generated_video(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+
     class FakeProcess:
         returncode = 0
 
         def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            calls.append(cmd)
             self.cmd = cmd
             self.stdout = iter([])
 
@@ -780,12 +787,23 @@ def test_download_video_returns_generated_video(monkeypatch, tmp_path):
             return self.returncode
 
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", lambda path: {
+        "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+        "video_codec": "h264",
+        "audio_codecs": {"aac"},
+        "width": 1280,
+        "height": 720,
+    })
+    monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
     runner = YtDlpRunner(binary="yt-dlp")
     request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
 
     path = runner.download_video(request, tmp_path, "abc")
 
     assert path.name == "abc.mp4"
+    assert calls[0][calls[0].index("--format") + 1] == ytdlp_module.IOS_COMPATIBLE_DOWNLOAD_FORMAT
+    assert calls[0][calls[0].index("--remux-video") + 1] == "mp4"
+    assert "--force-overwrites" in calls[0]
 
 
 def test_download_video_reports_percentage_progress(monkeypatch, tmp_path):
@@ -801,6 +819,14 @@ def test_download_video_reports_percentage_progress(monkeypatch, tmp_path):
             return self.returncode
 
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", lambda path: {
+        "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+        "video_codec": "h264",
+        "audio_codecs": {"aac"},
+        "width": 1280,
+        "height": 720,
+    })
+    monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
     runner = YtDlpRunner(binary="yt-dlp")
     request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
     progress: list[int] = []
@@ -810,6 +836,377 @@ def test_download_video_reports_percentage_progress(monkeypatch, tmp_path):
     assert path.name == "abc.mp4"
     assert 7 in progress
     assert 95 in progress or 100 in progress
+
+
+def test_download_video_merges_newer_bilibili_audio_fragment(monkeypatch, tmp_path):
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            self.stdout = iter([])
+
+        def wait(self):
+            video = tmp_path / "abc.f30120.mp4"
+            audio = tmp_path / "abc.f30280.m4a"
+            video.write_bytes(b"video")
+            time.sleep(0.01)
+            audio.write_bytes(b"audio")
+            return self.returncode
+
+    ffmpeg_commands: list[list[str]] = []
+
+    def fake_probe(path: Path):
+        if path.name == "abc.f30120.mp4":
+            return {
+                "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+                "video_codec": "h264",
+                "audio_codecs": set(),
+                "width": 3840,
+                "height": 2160,
+            }
+        if path.name.startswith(".abc.merged-") or path.name == "abc.mp4":
+            return {
+                "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+                "video_codec": "h264",
+                "audio_codecs": {"aac"},
+                "width": 3840,
+                "height": 2160,
+            }
+        raise YtDlpError("缓存视频整理失败：下载结果中没有视频轨道。")
+
+    def fake_ffmpeg(cmd):
+        ffmpeg_commands.append(cmd)
+        Path(cmd[-1]).write_bytes(b"merged")
+
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", fake_probe)
+    monkeypatch.setattr(ytdlp_module, "_run_ffmpeg_or_raise", fake_ffmpeg)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.bilibili.com/video/BV1abc", mode="browser")
+
+    path = runner.download_video(request, tmp_path, "abc")
+
+    assert path == tmp_path / "abc.mp4"
+    assert path.read_bytes() == b"merged"
+    assert not (tmp_path / "abc.f30120.mp4").exists()
+    assert not (tmp_path / "abc.f30280.m4a").exists()
+    assert ffmpeg_commands
+    assert str(tmp_path / "abc.f30120.mp4") in ffmpeg_commands[0]
+    assert str(tmp_path / "abc.f30280.m4a") in ffmpeg_commands[0]
+
+
+def test_download_video_prefers_complete_video_over_newer_audio(monkeypatch, tmp_path):
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            self.stdout = iter([])
+
+        def wait(self):
+            complete = tmp_path / "abc.mp4"
+            audio = tmp_path / "abc.f30280.m4a"
+            complete.write_bytes(b"complete")
+            time.sleep(0.01)
+            audio.write_bytes(b"audio")
+            return self.returncode
+
+    def fake_probe(path: Path):
+        if path.name == "abc.mp4":
+            return {
+                "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+                "video_codec": "h264",
+                "audio_codecs": {"aac"},
+                "width": 1920,
+                "height": 1080,
+            }
+        raise YtDlpError("缓存视频整理失败：下载结果中没有视频轨道。")
+
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", fake_probe)
+    monkeypatch.setattr(ytdlp_module, "_run_ffmpeg_or_raise", lambda cmd: pytest.fail("should not merge"))
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.bilibili.com/video/BV1abc", mode="browser")
+
+    path = runner.download_video(request, tmp_path, "abc")
+
+    assert path == tmp_path / "abc.mp4"
+    assert path.read_bytes() == b"complete"
+
+
+def test_ensure_ios_compatible_video_remuxes_mpegts_h264_aac(monkeypatch, tmp_path):
+    source = tmp_path / "abc.mp4"
+    source.write_bytes(b"mpegts")
+    calls: list[list[str]] = []
+    probe_count = 0
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        nonlocal probe_count
+        calls.append(cmd)
+        if Path(cmd[0]).name == "ffprobe":
+            probe_count += 1
+            format_name = "mpegts" if probe_count == 1 else "mov,mp4,m4a,3gp,3g2,mj2"
+            return type("Result", (), {
+                "returncode": 0,
+                "stderr": "",
+                "stdout": json.dumps({
+                    "format": {"format_name": format_name},
+                    "streams": [
+                        {"codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080},
+                        {"codec_type": "audio", "codec_name": "aac"},
+                    ],
+                }),
+            })()
+        if Path(cmd[0]).name == "ffmpeg":
+            Path(cmd[-1]).write_bytes(b"mp4")
+            return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = ytdlp_module._ensure_ios_compatible_video(source)
+
+    assert result == source
+    assert source.read_bytes() == b"mp4"
+    ffmpeg_cmd = next(cmd for cmd in calls if Path(cmd[0]).name == "ffmpeg")
+    assert "-c" in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-c") + 1] == "copy"
+    assert "-movflags" in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-movflags") + 1] == "+faststart"
+
+
+def test_ensure_ios_compatible_video_transcodes_webm_to_h264_mp4(monkeypatch, tmp_path):
+    source = tmp_path / "abc.webm"
+    source.write_bytes(b"webm")
+    calls: list[list[str]] = []
+    probe_count = 0
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        nonlocal probe_count
+        calls.append(cmd)
+        if Path(cmd[0]).name == "ffprobe":
+            probe_count += 1
+            if probe_count == 1:
+                payload = {
+                    "format": {"format_name": "matroska,webm"},
+                    "streams": [
+                        {"codec_type": "video", "codec_name": "vp9", "width": 1280, "height": 720},
+                        {"codec_type": "audio", "codec_name": "opus"},
+                    ],
+                }
+            else:
+                payload = {
+                    "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+                    "streams": [
+                        {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720},
+                        {"codec_type": "audio", "codec_name": "aac"},
+                    ],
+                }
+            return type("Result", (), {"returncode": 0, "stderr": "", "stdout": json.dumps(payload)})()
+        if Path(cmd[0]).name == "ffmpeg" and cmd[1:] == ["-hide_banner", "-encoders"]:
+            return type("Result", (), {"returncode": 0, "stderr": "", "stdout": " V....D libx264 H.264 encoder"})()
+        if Path(cmd[0]).name == "ffmpeg":
+            Path(cmd[-1]).write_bytes(b"mp4")
+            return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = ytdlp_module._ensure_ios_compatible_video(source)
+
+    assert result == tmp_path / "abc.mp4"
+    assert result.read_bytes() == b"mp4"
+    assert not source.exists()
+    ffmpeg_cmd = [cmd for cmd in calls if Path(cmd[0]).name == "ffmpeg" and "-hide_banner" not in cmd][0]
+    assert "-c:v" in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "libx264"
+    assert "-c:a" in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-c:a") + 1] == "aac"
+
+
+def test_prepare_ios_compatible_video_copy_returns_compatible_source_without_copy(monkeypatch, tmp_path):
+    source = tmp_path / "NAS Lesson.mp4"
+    source.write_bytes(b"mp4")
+    output = tmp_path / "downloads" / "device-compatible" / "NAS-Lesson.mp4"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        if Path(cmd[0]).name == "ffprobe":
+            payload = {
+                "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+                "streams": [
+                    {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720},
+                    {"codec_type": "audio", "codec_name": "aac"},
+                ],
+            }
+            return type("Result", (), {"returncode": 0, "stderr": "", "stdout": json.dumps(payload)})()
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = YtDlpRunner().prepare_ios_compatible_video_copy(source, output)
+
+    assert result == source
+    assert source.read_bytes() == b"mp4"
+    assert not output.exists()
+    assert len(calls) == 1
+
+
+def test_prepare_ios_compatible_video_copy_transcodes_hevc_without_mutating_source(monkeypatch, tmp_path):
+    source = tmp_path / "NAS Lesson.mp4"
+    source.write_bytes(b"hevc")
+    output = tmp_path / "downloads" / "device-compatible" / "NAS-Lesson.mp4"
+    calls: list[list[str]] = []
+    probe_count = 0
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        nonlocal probe_count
+        calls.append(cmd)
+        if Path(cmd[0]).name == "ffprobe":
+            probe_count += 1
+            video_codec = "hevc" if probe_count == 1 else "h264"
+            payload = {
+                "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+                "streams": [
+                    {"codec_type": "video", "codec_name": video_codec, "width": 1920, "height": 1080},
+                    {"codec_type": "audio", "codec_name": "aac"},
+                ],
+            }
+            return type("Result", (), {"returncode": 0, "stderr": "", "stdout": json.dumps(payload)})()
+        if Path(cmd[0]).name == "ffmpeg" and cmd[1:] == ["-hide_banner", "-encoders"]:
+            return type("Result", (), {"returncode": 0, "stderr": "", "stdout": " V....D libx264 H.264 encoder"})()
+        if Path(cmd[0]).name == "ffmpeg":
+            Path(cmd[-1]).write_bytes(b"h264")
+            return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = YtDlpRunner().prepare_ios_compatible_video_copy(source, output)
+
+    assert result == output
+    assert source.read_bytes() == b"hevc"
+    assert output.read_bytes() == b"h264"
+    ffmpeg_cmd = [cmd for cmd in calls if Path(cmd[0]).name == "ffmpeg" and "-hide_banner" not in cmd][0]
+    assert "-c:v" in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-c:v") + 1] == "libx264"
+    assert "-c:a" in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-c:a") + 1] == "aac"
+
+
+def test_prepare_ios_compatible_video_copy_serializes_duplicate_transcodes(monkeypatch, tmp_path):
+    source = tmp_path / "NAS Lesson.mp4"
+    source.write_bytes(b"hevc")
+    output = tmp_path / "downloads" / "device-compatible" / "NAS-Lesson.mp4"
+    write_started = threading.Event()
+    writes: list[Path] = []
+
+    hevc_probe = {
+        "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+        "video_codec": "hevc",
+        "audio_codecs": {"aac"},
+        "width": 1920,
+        "height": 1080,
+    }
+    h264_probe = {
+        "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+        "video_codec": "h264",
+        "audio_codecs": {"aac"},
+        "width": 1920,
+        "height": 1080,
+    }
+
+    def fake_probe(path: Path):
+        if path == output and output.exists():
+            return h264_probe
+        return hevc_probe
+
+    def fake_write(source_path, output_path, probe, progress=None, delete_source=False):
+        writes.append(output_path)
+        write_started.set()
+        time.sleep(0.1)
+        output_path.write_bytes(b"h264")
+        return output_path
+
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", fake_probe)
+    monkeypatch.setattr(ytdlp_module, "_write_ios_compatible_video", fake_write)
+
+    runner = YtDlpRunner()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(runner.prepare_ios_compatible_video_copy, source, output)
+        assert write_started.wait(timeout=1)
+        second = pool.submit(runner.prepare_ios_compatible_video_copy, source, output)
+        results = [first.result(timeout=2), second.result(timeout=2)]
+
+    assert results == [output, output]
+    assert writes == [output]
+
+
+def test_prepare_ios_compatible_video_copy_limits_parallel_transcodes(monkeypatch, tmp_path):
+    sources = [tmp_path / "NAS Lesson 1.mp4", tmp_path / "NAS Lesson 2.mp4"]
+    outputs = [
+        tmp_path / "downloads" / "device-compatible" / "NAS-Lesson-1.mp4",
+        tmp_path / "downloads" / "device-compatible" / "NAS-Lesson-2.mp4",
+    ]
+    for index, source in enumerate(sources):
+        source.write_bytes(f"hevc-{index}".encode("utf-8"))
+
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+
+    hevc_probe = {
+        "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+        "video_codec": "hevc",
+        "audio_codecs": {"aac"},
+        "width": 1920,
+        "height": 1080,
+    }
+    h264_probe = {
+        "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+        "video_codec": "h264",
+        "audio_codecs": {"aac"},
+        "width": 1920,
+        "height": 1080,
+    }
+
+    def fake_probe(path: Path):
+        if path.exists() and (
+            path in outputs
+            or ".ios-compatible-" in path.name
+        ):
+            return h264_probe
+        return hevc_probe
+
+    def fake_transcode(source_path, output_path, probe):
+        nonlocal active, max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.1)
+        output_path.write_bytes(b"h264")
+        with active_lock:
+            active -= 1
+
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", fake_probe)
+    monkeypatch.setattr(ytdlp_module, "_transcode_to_ios_h264", fake_transcode)
+
+    runner = YtDlpRunner()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(runner.prepare_ios_compatible_video_copy, source, output)
+            for source, output in zip(sources, outputs)
+        ]
+        results = [future.result(timeout=2) for future in futures]
+
+    assert results == outputs
+    assert max_active == 1
+
+
+def test_target_h264_bitrate_keeps_device_cache_reasonable_for_course_video():
+    assert ytdlp_module._target_h264_bitrate({"width": 1920, "height": 1080}) == "1800k"
+    assert ytdlp_module._target_h264_bitrate({"width": 1280, "height": 720}) == "1200k"
+    assert ytdlp_module._target_h264_bitrate({"width": 640, "height": 360}) == "900k"
 
 
 def test_download_video_explains_missing_ffmpeg(monkeypatch, tmp_path):

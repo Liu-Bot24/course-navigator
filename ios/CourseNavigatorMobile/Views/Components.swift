@@ -3,12 +3,25 @@ import SwiftUI
 struct StatusBadge: View {
     var text: String
     var color: Color
+    var minWidth: CGFloat?
+    var height: CGFloat?
+
+    init(text: String, color: Color, minWidth: CGFloat? = nil, height: CGFloat? = nil) {
+        self.text = text
+        self.color = color
+        self.minWidth = minWidth
+        self.height = height
+    }
 
     var body: some View {
         Text(text)
             .font(.caption.weight(.medium))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.vertical, height == nil ? 4 : 0)
+            .frame(minWidth: minWidth)
+            .frame(height: height)
             .background(color.opacity(0.14), in: Capsule())
             .foregroundStyle(color)
     }

@@ -328,6 +328,7 @@ class CourseItem(BaseModel):
     sort_order: float | None = None
     duration: float | None = None
     created_at: str
+    updated_at: str | None = None
     transcript: list[TranscriptSegment] = Field(default_factory=list)
     transcript_source: TranscriptSource | None = None
     metadata: VideoMetadata | None = None

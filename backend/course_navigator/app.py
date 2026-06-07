@@ -166,7 +166,13 @@ def create_app(
 
     @app.get("/api/items")
     def list_items(summary: bool = False) -> list[CourseItem]:
-        items = [_normalize_item_for_response(item, active_workspace_dir) for item in library.list_items()]
+        items = [
+            _with_item_updated_at(
+                _normalize_item_for_response(item, active_workspace_dir),
+                library.item_updated_at(item.id),
+            )
+            for item in library.list_items()
+        ]
         if summary:
             return [_summary_item_for_response(item) for item in items]
         return items
@@ -176,7 +182,10 @@ def create_app(
         item = library.get(item_id)
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
-        return _normalize_item_for_response(item, active_workspace_dir)
+        return _with_item_updated_at(
+            _normalize_item_for_response(item, active_workspace_dir),
+            library.item_updated_at(item.id),
+        )
 
     @app.get("/api/library-state")
     def get_library_state() -> LibraryState:
@@ -577,7 +586,10 @@ def create_app(
             raise HTTPException(status_code=400, detail="No course updates provided")
         item = item.model_copy(update=updates)
         library.save(item)
-        return _normalize_item_for_response(item, active_workspace_dir)
+        return _with_item_updated_at(
+            _normalize_item_for_response(item, active_workspace_dir),
+            library.item_updated_at(item.id),
+        )
 
     @app.put("/api/items/{item_id}/transcript")
     def update_transcript(item_id: str, request: TranscriptUpdateRequest) -> CourseItem:
@@ -594,7 +606,10 @@ def create_app(
                 }
             )
         library.save(item)
-        return _normalize_item_for_response(item, active_workspace_dir)
+        return _with_item_updated_at(
+            _normalize_item_for_response(item, active_workspace_dir),
+            library.item_updated_at(item.id),
+        )
 
     @app.delete("/api/items/{item_id}")
     def delete_item(item_id: str) -> dict[str, bool]:
@@ -993,6 +1008,27 @@ def create_app(
         if not video_path:
             detail = "Linked video file is unavailable" if _is_external_video_item(item) else "Local video not found"
             raise HTTPException(status_code=404, detail=detail)
+        if _is_downloaded_workspace_video(item):
+            prepare_video = getattr(ytdlp_runner, "prepare_ios_compatible_video", None)
+            if callable(prepare_video):
+                try:
+                    prepared_video_path = prepare_video(video_path)
+                except (ValueError, YtDlpError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                if prepared_video_path != video_path:
+                    item.local_video_path = _workspace_relative_path(active_workspace_dir, prepared_video_path)
+                    library.save(item)
+                    video_path = prepared_video_path
+        elif _is_external_video_item(item):
+            prepare_copy = getattr(ytdlp_runner, "prepare_ios_compatible_video_copy", None)
+            if callable(prepare_copy):
+                try:
+                    video_path = prepare_copy(
+                        video_path,
+                        _device_compatible_video_path(active_workspace_dir, item),
+                    )
+                except (ValueError, YtDlpError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
         return FileResponse(video_path)
 
     def _set_job(job_id: str, **updates: object) -> StudyJobStatus | None:
@@ -1853,6 +1889,15 @@ def _probe_local_video_duration(runner: YtDlpRunner, video_path: Path) -> float 
     return None
 
 
+def _is_downloaded_workspace_video(item: CourseItem) -> bool:
+    path = str(item.local_video_path or "").replace("\\", "/")
+    return item.video_source_type == "workspace" and path.startswith("downloads/")
+
+
+def _device_compatible_video_path(workspace_dir: Path, item: CourseItem) -> Path:
+    return workspace_dir / "downloads" / "device-compatible" / f"{_safe_item_id(item.id)}.mp4"
+
+
 def _safe_item_id(value: str) -> str:
     safe = "".join(ch if ch.isascii() and (ch.isalnum() or ch in "_-") else "-" for ch in value)
     return safe if safe.strip("-_") else "course"
@@ -2259,6 +2304,10 @@ def _summary_item_for_response(item: CourseItem) -> CourseItem:
             "study": _summary_study_for_response(item.study),
         }
     )
+
+
+def _with_item_updated_at(item: CourseItem, updated_at: str | None) -> CourseItem:
+    return item.model_copy(update={"updated_at": updated_at})
 
 
 def _summary_study_for_response(study: StudyMaterial | None) -> StudyMaterial | None:

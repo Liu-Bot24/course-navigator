@@ -3,6 +3,7 @@ import SwiftUI
 struct RootView: View {
     @Environment(AppModel.self) private var model
     @State private var showingDevices = false
+    @State private var showingStorage = false
     @State private var didOfferInitialBackendSetup = false
 
     var body: some View {
@@ -10,10 +11,11 @@ struct RootView: View {
         NavigationSplitView {
             CourseSidebar(
                 selectedCourseID: $model.selectedCourseID,
-                showingDevices: $showingDevices
+                showingDevices: $showingDevices,
+                showingStorage: $showingStorage
             )
         } detail: {
-            if model.isBackendOnline {
+            if model.canShowCourseContent {
                 CourseDetail()
             } else {
                 BackendRequiredView(showingDevices: $showingDevices)
@@ -22,6 +24,9 @@ struct RootView: View {
         .sheet(isPresented: $showingDevices) {
             BackendSettingsView()
         }
+        .sheet(isPresented: $showingStorage) {
+            StorageManagementView()
+        }
         .onAppear {
             offerInitialBackendSetupIfNeeded()
         }
@@ -29,6 +34,7 @@ struct RootView: View {
             offerInitialBackendSetupIfNeeded()
         }
         .onChange(of: model.selectedCourseID) { _, _ in
+            guard !model.isLoading else { return }
             Task { await model.refreshSelectedCourse() }
         }
         .alert("需要处理", isPresented: Binding(
@@ -60,7 +66,7 @@ struct RootView: View {
     ) -> Bool {
         guard !didOffer, !isShowingDevices else { return false }
         switch connectionStatus {
-        case .online, .checking:
+        case .online, .local, .checking:
             return false
         case .unknown:
             return endpointCount == 0
@@ -117,7 +123,12 @@ struct BackendRequiredView: View {
 
     private var retryButton: some View {
         Button {
-            Task { await model.refreshAll() }
+            Task {
+                await model.refreshAll(
+                    allowExplicitLocalMode: false,
+                    allowOfflineFallback: false
+                )
+            }
         } label: {
             Label(model.connectionStatus == .checking ? "连接中" : "重新连接", systemImage: "arrow.clockwise")
                 .frame(maxWidth: .infinity)
@@ -144,6 +155,8 @@ struct BackendRequiredView: View {
             "等待电脑后端"
         case .offline:
             "电脑后端未连接"
+        case .local:
+            "正在使用本地课程资料"
         case .online:
             "电脑后端已连接"
         }
@@ -153,6 +166,8 @@ struct BackendRequiredView: View {
         switch model.connectionStatus {
         case .offline(let message):
             message
+        case .local(let name):
+            "\(name) 的课程资料已保存在当前设备，可离线学习。"
         case .checking:
             "正在检查当前设备。"
         case .unknown:
@@ -170,6 +185,8 @@ struct BackendRequiredView: View {
             "clock"
         case .offline:
             "exclamationmark.triangle.fill"
+        case .local:
+            "internaldrive"
         case .unknown:
             "dot.radiowaves.left.and.right"
         }
@@ -183,6 +200,8 @@ struct BackendRequiredView: View {
             .orange
         case .offline:
             .red
+        case .local:
+            .blue
         case .unknown:
             .secondary
         }

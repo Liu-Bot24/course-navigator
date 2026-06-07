@@ -8,7 +8,7 @@ struct CourseDetail: View {
     @State private var showingVideoSource = false
     @State private var showingRename = false
     @State private var showingDeleteConfirmation = false
-    @State private var showingRemoveCacheConfirmation = false
+    @State private var showingRemoveDeviceCacheConfirmation = false
     @State private var showingCoursePackageExporter = false
     @State private var coursePackageDocument = CoursePackageDocument()
     @State private var coursePackageFilename = "course-navigator.course-nav.json"
@@ -27,9 +27,10 @@ struct CourseDetail: View {
                             resumeTime: playbackPositionStore.position(for: item.id),
                             player: $player,
                             currentTime: $currentPlaybackTime,
-                            canCacheVideo: item.canCacheToComputer,
-                            isLoading: model.isLoading,
-                            cacheVideo: { cacheVideo(item) },
+                            isLocalMode: model.isLocalMode,
+                            canCacheVideo: model.canCacheVideoToDevice(item),
+                            isLoading: model.isLoading || model.isCachingDeviceVideo,
+                            cacheVideo: { cacheVideoToDevice(item) },
                             onPlaybackTimeChange: { itemID, seconds, force in
                                 savePlaybackTime(seconds, for: itemID, force: force)
                             }
@@ -39,8 +40,12 @@ struct CourseDetail: View {
                             showingVideoSource: $showingVideoSource,
                             showingRename: $showingRename,
                             showingDeleteConfirmation: $showingDeleteConfirmation,
-                            showingRemoveCacheConfirmation: $showingRemoveCacheConfirmation,
-                            cacheVideo: cacheVideo,
+                            showingRemoveDeviceCacheConfirmation: $showingRemoveDeviceCacheConfirmation,
+                            canCacheVideo: model.canCacheVideoToDevice(item),
+                            hasDeviceVideoCache: model.hasDeviceVideoCache(for: item),
+                            isLocalMode: model.isLocalMode,
+                            isCachingDeviceVideo: model.isCachingDeviceVideo,
+                            cacheVideo: cacheVideoToDevice,
                             openSource: openSource,
                             exportCourse: exportCoursePackage
                         )
@@ -71,15 +76,15 @@ struct CourseDetail: View {
                     }
                     Button("取消", role: .cancel) {}
                 } message: {
-                    Text("会删除电脑后端课程记录和已缓存的课程文件，外部/NAS 原始文件不会被删除。")
+                    Text("会删除电脑后端课程记录，以及后端 Workspace/下载缓存中的课程视频；本地视频缓存和外部/NAS 原始文件不会被删除。")
                 }
-                .confirmationDialog("移除电脑缓存？", isPresented: $showingRemoveCacheConfirmation, titleVisibility: .visible) {
+                .confirmationDialog("移除 \(MobileDeviceText.localCacheTitle)？", isPresented: $showingRemoveDeviceCacheConfirmation, titleVisibility: .visible) {
                     Button("移除缓存", role: .destructive) {
-                        removeComputerCache(item)
+                        removeDeviceCache(item)
                     }
                     Button("取消", role: .cancel) {}
                 } message: {
-                    Text("只删除电脑 Workspace 中这个课程的本地视频副本，字幕和学习地图会保留。")
+                    Text("只删除当前设备上的视频副本，课程资料、字幕和学习地图会保留。")
                 }
                 .fileExporter(
                     isPresented: $showingCoursePackageExporter,
@@ -124,19 +129,17 @@ struct CourseDetail: View {
         player == nil ? nil : currentPlaybackTime
     }
 
-    private func cacheVideo(_ item: CourseItem) {
+    private func cacheVideoToDevice(_ item: CourseItem) {
         Task {
-            await model.cacheVideo(item)
+            await model.cacheVideoToDevice(item)
         }
     }
 
-    private func removeComputerCache(_ item: CourseItem) {
+    private func removeDeviceCache(_ item: CourseItem) {
         player?.pause()
         player = nil
         currentPlaybackTime = 0
-        Task {
-            await model.removeComputerCache(item)
-        }
+        model.removeDeviceVideoCache(item)
     }
 
     private func openSource(_ item: CourseItem) {
@@ -211,17 +214,22 @@ struct CourseVideoPanel: View {
     var resumeTime: Double?
     @Binding var player: AVPlayer?
     @Binding var currentTime: Double
+    var isLocalMode: Bool
     var canCacheVideo: Bool
     var isLoading: Bool
     var cacheVideo: () -> Void
     var onPlaybackTimeChange: (String, Double, Bool) -> Void
     @State private var timeObserver = PlayerTimeObserver()
     @State private var observedItemID: String?
+    @State private var floatingSubtitleMode: FloatingSubtitleMode = .hidden
+    @State private var showingFullScreenVideo = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let player {
-                VideoPlayer(player: player)
+                VideoPlayer(player: player) {
+                    VideoSubtitleOverlay(cue: activeSubtitleCue, mode: floatingSubtitleMode)
+                }
                     .frame(minHeight: 220)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                 VideoPlaybackStatus(currentTime: currentTime, duration: item.duration)
@@ -230,6 +238,11 @@ struct CourseVideoPanel: View {
                     seekBackward: { seek(by: -15) },
                     restart: { seek(to: 0) },
                     seekForward: { seek(by: 15) }
+                )
+                VideoViewingControls(
+                    subtitleMode: $floatingSubtitleMode,
+                    hasSubtitles: hasFloatingSubtitles,
+                    showFullScreen: { showingFullScreenVideo = true }
                 )
             } else {
                 VStack(spacing: 12) {
@@ -242,7 +255,7 @@ struct CourseVideoPanel: View {
                         Button {
                             cacheVideo()
                         } label: {
-                            Label("缓存到电脑", systemImage: "arrow.down.circle")
+                            Label(MobileDeviceText.cacheButtonTitle, systemImage: "arrow.down.circle")
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
@@ -251,6 +264,16 @@ struct CourseVideoPanel: View {
                 }
                 .frame(minHeight: 220)
                 .frame(maxWidth: .infinity)
+            }
+        }
+        .fullScreenCover(isPresented: $showingFullScreenVideo) {
+            if let player {
+                FullScreenVideoView(
+                    item: item,
+                    player: player,
+                    currentTime: $currentTime,
+                    subtitleMode: $floatingSubtitleMode
+                )
             }
         }
         .task(id: playbackIdentity) {
@@ -301,9 +324,20 @@ struct CourseVideoPanel: View {
     }
 
     private var emptyVideoDescription: String {
-        canCacheVideo
-            ? "这门课还没有电脑缓存。先让电脑后端缓存视频，再在手机上播放。"
+        if isLocalMode {
+            return "本地模式只播放当前设备已缓存的视频；这门课还没有本地视频缓存。"
+        }
+        return canCacheVideo
+            ? "这门课还没有 \(MobileDeviceText.localCacheTitle)。缓存后离线也可以播放。"
             : "可以为课程绑定电脑/NAS 上的视频文件，或在电脑端准备可播放的视频源。"
+    }
+
+    private var hasFloatingSubtitles: Bool {
+        !item.transcript.isEmpty || item.study?.translatedTranscript.isEmpty == false
+    }
+
+    private var activeSubtitleCue: FloatingSubtitleCue? {
+        FloatingSubtitleCue.make(for: item, at: currentTime)
     }
 
     private func seek(by delta: Double) {
@@ -331,6 +365,254 @@ struct CourseVideoPanel: View {
             return min(positive, duration)
         }
         return positive
+    }
+}
+
+enum FloatingSubtitleMode: String, CaseIterable, Identifiable {
+    case hidden
+    case source
+    case translated
+    case bilingual
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .hidden: "关闭"
+        case .source: "原文"
+        case .translated: "译文"
+        case .bilingual: "双语"
+        }
+    }
+}
+
+struct FloatingSubtitleCue {
+    var source: String?
+    var translated: String?
+
+    static func make(for item: CourseItem, at time: Double) -> FloatingSubtitleCue? {
+        let sourceSegment = item.transcript.activeSegment(at: time)
+        let translatedSegments = item.study?.translatedTranscript ?? []
+        let translatedSegment = translatedSegments.activeSegment(at: time)
+            ?? sourceSegment.flatMap { translatedSegments.nearestSegment(to: $0.start) }
+        let cue = FloatingSubtitleCue(source: sourceSegment?.text, translated: translatedSegment?.text)
+        return cue.source == nil && cue.translated == nil ? nil : cue
+    }
+
+    func lines(for mode: FloatingSubtitleMode) -> [String] {
+        switch mode {
+        case .hidden:
+            []
+        case .source:
+            source.map { [$0] } ?? []
+        case .translated:
+            translated.map { [$0] } ?? []
+        case .bilingual:
+            [source, translated].compactMap { $0 }
+        }
+    }
+}
+
+struct VideoSubtitleOverlay: View {
+    var cue: FloatingSubtitleCue?
+    var mode: FloatingSubtitleMode
+    var placement: VideoSubtitleOverlayPlacement = .inline
+
+    var body: some View {
+        Group {
+            if let cue, !cue.lines(for: mode).isEmpty {
+                switch placement {
+                case .inline:
+                    inlineSubtitle(lines: cue.lines(for: mode))
+                case let .fullScreen(videoSize):
+                    fullScreenSubtitle(lines: cue.lines(for: mode), videoSize: videoSize)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func inlineSubtitle(lines: [String]) -> some View {
+        VStack {
+            Spacer()
+            subtitleCard(lines: lines, isFullScreen: false)
+                .padding(.horizontal, 24)
+                .padding(.bottom, 18)
+        }
+    }
+
+    private func fullScreenSubtitle(lines: [String], videoSize: CGSize?) -> some View {
+        GeometryReader { proxy in
+            let videoRect = fittedVideoRect(in: proxy.size, videoSize: videoSize)
+            let bottomOffset = min(max(videoRect.height * 0.12, 56), 112)
+            subtitleCard(lines: lines, isFullScreen: true)
+                .frame(maxWidth: min(videoRect.width - 48, proxy.size.width * 0.78))
+                .position(x: videoRect.midX, y: videoRect.maxY - bottomOffset)
+        }
+    }
+
+    private func subtitleCard(lines: [String], isFullScreen: Bool) -> some View {
+        VStack(spacing: isFullScreen ? 6 : 5) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                Text(line)
+                    .font((isFullScreen ? Font.title3 : Font.body).weight(.semibold))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.9), radius: 2, x: 0, y: 1)
+            }
+        }
+        .padding(.horizontal, isFullScreen ? 18 : 16)
+        .padding(.vertical, isFullScreen ? 11 : 10)
+        .background(.black.opacity(0.58), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func fittedVideoRect(in containerSize: CGSize, videoSize: CGSize?) -> CGRect {
+        let fallbackAspectRatio = 16.0 / 9.0
+        let sourceSize = videoSize ?? CGSize(width: fallbackAspectRatio, height: 1)
+        let videoWidth = max(sourceSize.width, 1)
+        let videoHeight = max(sourceSize.height, 1)
+        let videoAspectRatio = videoWidth / videoHeight
+        let containerAspectRatio = max(containerSize.width, 1) / max(containerSize.height, 1)
+
+        if containerAspectRatio > videoAspectRatio {
+            let fittedWidth = containerSize.height * videoAspectRatio
+            return CGRect(
+                x: (containerSize.width - fittedWidth) / 2,
+                y: 0,
+                width: fittedWidth,
+                height: containerSize.height
+            )
+        }
+
+        let fittedHeight = containerSize.width / videoAspectRatio
+        return CGRect(
+            x: 0,
+            y: (containerSize.height - fittedHeight) / 2,
+            width: containerSize.width,
+            height: fittedHeight
+        )
+    }
+}
+
+enum VideoSubtitleOverlayPlacement {
+    case inline
+    case fullScreen(videoSize: CGSize?)
+}
+
+struct VideoViewingControls: View {
+    @Binding var subtitleMode: FloatingSubtitleMode
+    var hasSubtitles: Bool
+    var showFullScreen: () -> Void
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                controls
+            }
+            VStack(spacing: 8) {
+                controls
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var controls: some View {
+        Button {
+            showFullScreen()
+        } label: {
+            Label("全屏", systemImage: "arrow.up.left.and.arrow.down.right")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+
+        FloatingSubtitleMenu(subtitleMode: $subtitleMode, hasSubtitles: hasSubtitles)
+    }
+}
+
+struct FloatingSubtitleMenu: View {
+    @Binding var subtitleMode: FloatingSubtitleMode
+    var hasSubtitles: Bool
+
+    var body: some View {
+        Menu {
+            ForEach(FloatingSubtitleMode.allCases) { mode in
+                Button {
+                    subtitleMode = mode
+                } label: {
+                    if subtitleMode == mode {
+                        Label(mode.title, systemImage: "checkmark")
+                    } else {
+                        Text(mode.title)
+                    }
+                }
+            }
+        } label: {
+            Label("字幕浮层：\(subtitleMode.title)", systemImage: "captions.bubble")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!hasSubtitles)
+    }
+}
+
+struct FullScreenVideoView: View {
+    @Environment(\.dismiss) private var dismiss
+    var item: CourseItem
+    var player: AVPlayer
+    @Binding var currentTime: Double
+    @Binding var subtitleMode: FloatingSubtitleMode
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black.ignoresSafeArea()
+            VideoPlayer(player: player) {
+                VideoSubtitleOverlay(
+                    cue: FloatingSubtitleCue.make(for: item, at: currentTime),
+                    mode: subtitleMode,
+                    placement: .fullScreen(videoSize: presentationSize)
+                )
+            }
+            .ignoresSafeArea()
+
+            HStack(spacing: 10) {
+                FloatingSubtitleMenu(subtitleMode: $subtitleMode, hasSubtitles: hasSubtitles)
+                    .fixedSize(horizontal: true, vertical: false)
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title2)
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+            }
+            .padding()
+        }
+    }
+
+    private var hasSubtitles: Bool {
+        !item.transcript.isEmpty || item.study?.translatedTranscript.isEmpty == false
+    }
+
+    private var presentationSize: CGSize? {
+        guard let size = player.currentItem?.presentationSize, size.width > 0, size.height > 0 else {
+            return nil
+        }
+        return size
+    }
+}
+
+private extension Array where Element == TranscriptSegment {
+    func activeSegment(at time: Double) -> TranscriptSegment? {
+        first { segment in
+            time >= segment.start && time < Swift.max(segment.end, segment.start + 0.5)
+        }
+    }
+
+    func nearestSegment(to start: Double) -> TranscriptSegment? {
+        self.min { left, right in
+            abs(left.start - start) < abs(right.start - start)
+        }
     }
 }
 
@@ -478,7 +760,11 @@ struct CourseHeader: View {
     @Binding var showingVideoSource: Bool
     @Binding var showingRename: Bool
     @Binding var showingDeleteConfirmation: Bool
-    @Binding var showingRemoveCacheConfirmation: Bool
+    @Binding var showingRemoveDeviceCacheConfirmation: Bool
+    var canCacheVideo: Bool
+    var hasDeviceVideoCache: Bool
+    var isLocalMode: Bool
+    var isCachingDeviceVideo: Bool
     var cacheVideo: (CourseItem) -> Void
     var openSource: (CourseItem) -> Void
     var exportCourse: (CourseItem) -> Void
@@ -520,7 +806,7 @@ struct CourseHeader: View {
 
     @ViewBuilder
     private var statusBadges: some View {
-        StatusBadge(text: item.videoSourceType?.label ?? "在线视频", color: .blue)
+        StatusBadge(text: videoStatusText, color: videoStatusColor)
         if item.transcript.isEmpty {
             StatusBadge(text: "无字幕", color: .orange)
         } else {
@@ -529,6 +815,20 @@ struct CourseHeader: View {
         if item.study != nil {
             StatusBadge(text: "已生成学习地图", color: .purple)
         }
+    }
+
+    private var videoStatusText: String {
+        if isLocalMode {
+            return hasDeviceVideoCache ? "本地视频缓存" : "仅本地资料"
+        }
+        return item.videoSourceType?.label ?? "在线视频"
+    }
+
+    private var videoStatusColor: Color {
+        if isLocalMode {
+            return hasDeviceVideoCache ? .green : .secondary
+        }
+        return .blue
     }
 
     private func primaryActions(expands: Bool) -> some View {
@@ -541,16 +841,22 @@ struct CourseHeader: View {
                     .frame(maxWidth: maxWidth)
             }
             .buttonStyle(.bordered)
+            .disabled(isLocalMode)
 
             Button {
                 cacheVideo(item)
             } label: {
-                Label("缓存", systemImage: "arrow.down.circle")
+                Label(cacheButtonTitle, systemImage: "arrow.down.circle")
                     .frame(maxWidth: maxWidth)
             }
             .buttonStyle(.bordered)
-            .disabled(!item.canCacheToComputer)
+            .disabled(!canCacheVideo || isCachingDeviceVideo)
         }
+    }
+
+    private var cacheButtonTitle: String {
+        if isCachingDeviceVideo { return "缓存中" }
+        return hasDeviceVideoCache ? "重新缓存" : MobileDeviceText.cacheButtonTitle
     }
 
     private func moreActions(expands: Bool) -> some View {
@@ -568,26 +874,28 @@ struct CourseHeader: View {
             } label: {
                 Label("编辑信息", systemImage: "pencil")
             }
+            .disabled(isLocalMode)
 
             Button {
                 openSource(item)
             } label: {
                 Label("打开源链接", systemImage: "safari")
             }
-            .disabled(MobileURLNormalizer.normalizedHTTPURLString(item.sourceURL) == nil)
+            .disabled(isLocalMode || MobileURLNormalizer.normalizedHTTPURLString(item.sourceURL) == nil)
 
             Button(role: .destructive) {
-                showingRemoveCacheConfirmation = true
+                showingRemoveDeviceCacheConfirmation = true
             } label: {
-                Label("移除电脑缓存", systemImage: "xmark.bin")
+                Label("移除本地缓存", systemImage: "xmark.bin")
             }
-            .disabled(!item.canRemoveComputerCache)
+            .disabled(!hasDeviceVideoCache)
 
             Button(role: .destructive) {
                 showingDeleteConfirmation = true
             } label: {
                 Label("删除课程", systemImage: "trash")
             }
+            .disabled(isLocalMode)
         } label: {
             Label("更多", systemImage: "ellipsis.circle")
                 .frame(maxWidth: maxWidth)

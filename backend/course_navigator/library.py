@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import CourseItem, LibraryState
@@ -45,6 +45,12 @@ class CourseLibrary:
             return False
         path.unlink()
         return True
+
+    def item_updated_at(self, item_id: str) -> str | None:
+        path = self._item_path(item_id)
+        if not path or not path.exists():
+            return None
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
 
     def list_items(self) -> list[CourseItem]:
         items = [

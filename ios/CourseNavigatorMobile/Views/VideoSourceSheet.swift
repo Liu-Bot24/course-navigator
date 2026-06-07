@@ -51,7 +51,7 @@ struct VideoSourceSheet: View {
                     }
                     .disabled(model.isLoading)
 
-                    Text("让电脑后端选择一个视频并复制进当前 Workspace，适合希望课程文件跟项目一起保存的情况。")
+                    Text("让电脑后端选择一个视频并复制进当前 Workspace，适合需要电脑后端保存一份视频副本的情况。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -119,8 +119,8 @@ enum SourceKind: String, CaseIterable, Identifiable {
         switch self {
         case .remote:
             "在线视频链接由电脑后端解析和提取字幕。"
-        case .path:
-            "这里填写的是电脑后端能访问的路径，不是 iPhone/iPad 本机文件路径。"
+            case .path:
+                "这里填写的是电脑后端能访问的路径，不是当前设备的本机文件路径。"
         }
     }
 }

@@ -117,6 +117,7 @@ enum ConnectionStatus: Equatable {
     case unknown
     case checking
     case online(String)
+    case local(String)
     case offline(String)
 
     var label: String {
@@ -127,9 +128,18 @@ enum ConnectionStatus: Equatable {
             "正在检查"
         case .online:
             "已连接"
+        case .local:
+            "本地模式"
         case .offline:
             "连接失败"
         }
+    }
+
+    var isLocal: Bool {
+        if case .local = self {
+            return true
+        }
+        return false
     }
 }
 
@@ -199,7 +209,7 @@ enum StudySection: String, Codable, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .all: "全部"
-        case .guide: "导读"
+        case .guide: "导览"
         case .outline: "大纲"
         case .detailed: "解读"
         case .high: "详解"
@@ -255,7 +265,7 @@ enum LocalVideoImportMode: String, Codable, CaseIterable, Identifiable {
     var help: String {
         switch self {
         case .external: "只记录电脑上的原文件位置，不复制视频。"
-        case .workspace: "让电脑后端复制到 Workspace，适合需要离线副本的视频。"
+        case .workspace: "让电脑后端复制到 Workspace，适合需要后端保存一份视频副本的情况。"
         }
     }
 
@@ -764,6 +774,103 @@ struct VideoMetadata: Codable, Hashable {
     }
 }
 
+struct LibraryState: Codable, Hashable {
+    var manualCollections: [String]
+    var manualCollectionGroups: [String]
+    var collectionOrder: [String]
+    var collectionGroupOrder: [String]
+    var collectionGroupAssignments: [String: String]
+
+    init(
+        manualCollections: [String] = [],
+        manualCollectionGroups: [String] = [],
+        collectionOrder: [String] = [],
+        collectionGroupOrder: [String] = [],
+        collectionGroupAssignments: [String: String] = [:]
+    ) {
+        self.manualCollections = manualCollections
+        self.manualCollectionGroups = manualCollectionGroups
+        self.collectionOrder = collectionOrder
+        self.collectionGroupOrder = collectionGroupOrder
+        self.collectionGroupAssignments = collectionGroupAssignments
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case manualCollections = "manual_collections"
+        case manualCollectionGroups = "manual_collection_groups"
+        case collectionOrder = "collection_order"
+        case collectionGroupOrder = "collection_group_order"
+        case collectionGroupAssignments = "collection_group_assignments"
+    }
+
+    func collectionGroupTitle(for item: CourseItem) -> String? {
+        let explicitGroup = item.collectionGroupTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !explicitGroup.isEmpty {
+            return explicitGroup
+        }
+        let assignedGroup = collectionGroupAssignments[Self.collectionStorageKey(item.collectionTitle)]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return assignedGroup.isEmpty ? nil : assignedGroup
+    }
+
+    static func collectionStorageKey(_ value: String?) -> String {
+        let normalized = (value ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.isEmpty ? "collection:" : "collection:\(normalized)"
+    }
+
+    static func collectionGroupStorageKey(_ value: String?) -> String {
+        let normalized = (value ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.isEmpty ? "collection-group:" : "collection-group:\(normalized)"
+    }
+
+    func sortsCategoryBefore(_ left: String, _ right: String) -> Bool {
+        sortedByPersistedOrder(
+            left,
+            right,
+            bottomTitle: "未分类",
+            order: collectionGroupOrder,
+            key: Self.collectionGroupStorageKey
+        )
+    }
+
+    func sortsCollectionBefore(_ left: String, _ right: String) -> Bool {
+        sortedByPersistedOrder(
+            left,
+            right,
+            bottomTitle: "未归档",
+            order: collectionOrder,
+            key: Self.collectionStorageKey
+        )
+    }
+
+    private func sortedByPersistedOrder(
+        _ left: String,
+        _ right: String,
+        bottomTitle: String,
+        order: [String],
+        key: (String?) -> String
+    ) -> Bool {
+        if left == bottomTitle && right != bottomTitle { return false }
+        if right == bottomTitle && left != bottomTitle { return true }
+        var orderIndex: [String: Int] = [:]
+        for (index, value) in order.enumerated() where orderIndex[value] == nil {
+            orderIndex[value] = index
+        }
+        let leftIndex = orderIndex[key(left)]
+        let rightIndex = orderIndex[key(right)]
+        if let leftIndex, let rightIndex, leftIndex != rightIndex {
+            return leftIndex < rightIndex
+        }
+        if leftIndex != nil, rightIndex == nil { return true }
+        if leftIndex == nil, rightIndex != nil { return false }
+        return left.localizedStandardCompare(right) == .orderedAscending
+    }
+}
+
 struct CourseItem: Codable, Identifiable, Hashable {
     var id: String
     var sourceURL: String
@@ -775,6 +882,7 @@ struct CourseItem: Codable, Identifiable, Hashable {
     var sortOrder: Double?
     var duration: Double?
     var createdAt: String
+    var updatedAt: String?
     var transcript: [TranscriptSegment]
     var transcriptSource: TranscriptSource?
     var metadata: VideoMetadata?
@@ -793,6 +901,7 @@ struct CourseItem: Codable, Identifiable, Hashable {
         case sortOrder = "sort_order"
         case duration
         case createdAt = "created_at"
+        case updatedAt = "updated_at"
         case transcript
         case transcriptSource = "transcript_source"
         case metadata
@@ -838,6 +947,37 @@ struct CourseItem: Codable, Identifiable, Hashable {
             && !source.hasPrefix("local-video://")
             && !source.hasPrefix("external-video://")
             && videoSourceType != .external
+    }
+
+    var offlinePayloadScore: Int {
+        var score = transcript.count * 100
+        if metadata != nil {
+            score += 10
+        }
+        if localVideoPath?.isEmpty == false {
+            score += 1
+        }
+        guard let study else { return score }
+
+        score += study.detailedNotes.count
+        score += study.highFidelityText.count
+        score += study.translatedTranscript.count * 50
+        score += study.timeMap.count * 20
+        score += study.outline.count * 20
+        score += study.prerequisites.count
+        score += study.thoughtPrompts.count
+        score += study.reviewSuggestions.count
+        score += study.beginnerFocus.count
+        score += study.experiencedGuidance.count
+        return score
+    }
+}
+
+extension CourseItem {
+    func applyingLibraryState(_ state: LibraryState) -> CourseItem {
+        var copy = self
+        copy.collectionGroupTitle = state.collectionGroupTitle(for: self)
+        return copy
     }
 }
 

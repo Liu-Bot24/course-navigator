@@ -47,7 +47,7 @@ struct ImportCourseSheet: View {
                         Label("导入课程包", systemImage: "doc.badge.plus")
                     }
                     .disabled(model.isLoading)
-                    Text("从 Files 选择 Course Navigator 课程包 JSON，手机只读取包内容，导入仍由电脑后端完成。")
+                    Text("从 Files 选择 Course Navigator 课程包 JSON，当前设备只读取包内容，导入仍由电脑后端完成。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -68,7 +68,7 @@ struct ImportCourseSheet: View {
                         } label: {
                             Label("填写 Cookie", systemImage: "key")
                         }
-                        Text("Cookie 会保存到电脑后端的数据目录，手机只负责提交文本。")
+                        Text("Cookie 会保存到电脑后端的数据目录，当前设备只负责提交文本。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         if let cookieSaveMessage {

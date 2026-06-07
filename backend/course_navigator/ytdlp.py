@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -38,6 +39,21 @@ DEFAULT_SUBTITLE_LANGUAGE_PRIORITY = (
     "ja",
 )
 YTDLP_RUNTIME_ARGS = ("--remote-components", "ejs:github", "--no-playlist")
+IOS_COMPATIBLE_DOWNLOAD_FORMAT = (
+    "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/"
+    "b[ext=mp4][vcodec^=avc1]/"
+    "bv*[ext=mp4][vcodec^=h264]+ba[ext=m4a]/"
+    "b[ext=mp4][vcodec^=h264]/"
+    "b[ext=mp4]/"
+    "bv*+ba/b"
+)
+IOS_MP4_FORMAT_NAMES = {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}
+IOS_AUDIO_CODECS = {"aac", "mp3", "alac"}
+VIDEO_DOWNLOAD_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".ts", ".m2ts"}
+AUDIO_DOWNLOAD_EXTENSIONS = {".m4a", ".aac", ".mp3", ".opus", ".webm"}
+_IOS_COMPATIBLE_VIDEO_LOCKS: dict[Path, threading.Lock] = {}
+_IOS_COMPATIBLE_VIDEO_LOCKS_GUARD = threading.Lock()
+_IOS_COMPATIBLE_VIDEO_WRITE_LOCK = threading.Lock()
 
 
 def build_runtime_args() -> list[str]:
@@ -175,14 +191,18 @@ class YtDlpRunner:
         progress: Callable[[int, str], None] | None = None,
     ) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
+        _delete_download_files_for_item(target_dir, item_id)
         output_template = str(target_dir / f"{item_id}.%(ext)s")
         cmd = [
             *self.command_prefix(),
             "--newline",
             "--format",
-            "bv*+ba/b",
+            IOS_COMPATIBLE_DOWNLOAD_FORMAT,
             "--merge-output-format",
             "mp4",
+            "--remux-video",
+            "mp4",
+            "--force-overwrites",
             "--output",
             output_template,
             *build_runtime_args(),
@@ -209,11 +229,9 @@ class YtDlpRunner:
         if returncode != 0:
             raise YtDlpError(_friendly_error(output, request, "yt-dlp video download failed"))
         if progress:
-            progress(98, "正在整理缓存文件")
-        candidates = list(target_dir.glob(f"{item_id}.*"))
-        if not candidates:
-            raise YtDlpError("yt-dlp did not produce a video file")
-        return max(candidates, key=lambda path: path.stat().st_mtime)
+            progress(96, "正在校验缓存视频")
+        video_path = _find_downloaded_video_file(target_dir, item_id, progress=progress)
+        return _ensure_ios_compatible_video(video_path, progress=progress)
 
     def extract_asr(
         self,
@@ -269,6 +287,17 @@ class YtDlpRunner:
     def probe_local_video_duration(self, path: Path) -> float | None:
         duration = _media_duration(path)
         return duration if duration > 0 else None
+
+    def prepare_ios_compatible_video(self, path: Path, progress: Callable[[int, str], None] | None = None) -> Path:
+        return _ensure_ios_compatible_video(path, progress=progress)
+
+    def prepare_ios_compatible_video_copy(
+        self,
+        source: Path,
+        output: Path,
+        progress: Callable[[int, str], None] | None = None,
+    ) -> Path:
+        return _ensure_ios_compatible_video_copy(source, output, progress=progress)
 
 
 def _run_with_browser_cookie_retry(
@@ -729,6 +758,116 @@ def _find_newest_audio(target_dir: Path, item_id: str) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def _delete_download_files_for_item(target_dir: Path, item_id: str) -> None:
+    if not target_dir.exists():
+        return
+    for path in target_dir.glob(f"{item_id}.*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+    for path in target_dir.glob(f".{item_id}.*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def _find_downloaded_video_file(
+    target_dir: Path,
+    item_id: str,
+    progress: Callable[[int, str], None] | None = None,
+) -> Path:
+    candidates = [
+        path
+        for path in target_dir.glob(f"{item_id}.*")
+        if path.is_file() and path.suffix.lower() in VIDEO_DOWNLOAD_EXTENSIONS | AUDIO_DOWNLOAD_EXTENSIONS
+    ]
+    if not candidates:
+        raise YtDlpError("yt-dlp did not produce a video file")
+
+    video_candidates: list[tuple[Path, dict[str, object]]] = []
+    audio_candidates: list[Path] = []
+    for path in candidates:
+        if path.suffix.lower() in AUDIO_DOWNLOAD_EXTENSIONS:
+            audio_candidates.append(path)
+        try:
+            probe = _probe_video_file(path)
+        except YtDlpError:
+            continue
+        video_candidates.append((path, probe))
+
+    if not video_candidates:
+        raise YtDlpError("缓存视频整理失败：下载结果中没有视频轨道。")
+
+    exact_mp4 = target_dir / f"{item_id}.mp4"
+    for path, probe in video_candidates:
+        audio_codecs = probe.get("audio_codecs")
+        if path == exact_mp4 and isinstance(audio_codecs, set) and audio_codecs:
+            return path
+
+    video_with_audio = [
+        (path, probe)
+        for path, probe in video_candidates
+        if isinstance(probe.get("audio_codecs"), set) and probe["audio_codecs"]
+    ]
+    if video_with_audio:
+        return max(video_with_audio, key=lambda pair: pair[0].stat().st_mtime)[0]
+
+    video_path = max(video_candidates, key=lambda pair: pair[0].stat().st_mtime)[0]
+    audio_path = _find_matching_downloaded_audio(audio_candidates, video_path)
+    if audio_path:
+        return _merge_downloaded_video_audio_fragments(video_path, audio_path, exact_mp4, progress=progress)
+    return video_path
+
+
+def _find_matching_downloaded_audio(audio_candidates: list[Path], video_path: Path) -> Path | None:
+    candidates = [path for path in audio_candidates if path != video_path and path.exists()]
+    if not candidates:
+        return None
+    video_mtime = video_path.stat().st_mtime
+    return min(candidates, key=lambda path: abs(path.stat().st_mtime - video_mtime))
+
+
+def _merge_downloaded_video_audio_fragments(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    progress: Callable[[int, str], None] | None = None,
+) -> Path:
+    if progress:
+        progress(97, "正在合并视频和音频缓存")
+    temporary_path = output_path.with_name(f".{output_path.stem}.merged-{time.time_ns()}.mp4")
+    cmd = [
+        _media_tool("ffmpeg"),
+        "-y",
+        "-i",
+        str(video_path),
+        "-i",
+        str(audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(temporary_path),
+    ]
+    try:
+        _run_ffmpeg_or_raise(cmd)
+        _probe_video_file(temporary_path)
+        if output_path.exists():
+            output_path.unlink()
+        temporary_path.replace(output_path)
+        for source in (video_path, audio_path):
+            if source != output_path:
+                source.unlink(missing_ok=True)
+        return output_path
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def _extract_audio_file(video_path: Path, target_dir: Path, item_id: str) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     if not shutil.which("ffmpeg"):
@@ -805,7 +944,7 @@ def _run_whisper_asr(
 
 def _media_duration(path: Path) -> float:
     cmd = [
-        "ffprobe",
+        _media_tool("ffprobe"),
         "-v",
         "error",
         "-show_entries",
@@ -824,6 +963,253 @@ def _media_duration(path: Path) -> float:
         return float(result.stdout.strip())
     except ValueError:
         return 0.0
+
+
+def _ensure_ios_compatible_video(
+    path: Path,
+    progress: Callable[[int, str], None] | None = None,
+) -> Path:
+    output_path = path.with_suffix(".mp4")
+    with _ios_compatible_video_lock(output_path):
+        if output_path != path and output_path.exists():
+            try:
+                if (
+                    not path.exists()
+                    or output_path.stat().st_mtime >= path.stat().st_mtime
+                ) and _is_ios_compatible_mp4(_probe_video_file(output_path)):
+                    return output_path
+            except OSError:
+                pass
+
+        probe = _probe_video_file(path)
+        if _is_ios_compatible_mp4(probe):
+            return path
+
+        return _write_ios_compatible_video(path, output_path, probe, progress=progress, delete_source=True)
+
+
+def _ensure_ios_compatible_video_copy(
+    source: Path,
+    output: Path,
+    progress: Callable[[int, str], None] | None = None,
+) -> Path:
+    with _ios_compatible_video_lock(output):
+        source_probe = _probe_video_file(source)
+        if _is_ios_compatible_mp4(source_probe):
+            return source
+
+        if output.exists():
+            try:
+                output_mtime = output.stat().st_mtime
+                source_mtime = source.stat().st_mtime
+                if output_mtime >= source_mtime and _is_ios_compatible_mp4(_probe_video_file(output)):
+                    return output
+            except OSError:
+                pass
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return _write_ios_compatible_video(source, output, source_probe, progress=progress, delete_source=False)
+
+
+def _ios_compatible_video_lock(path: Path) -> threading.Lock:
+    try:
+        key = path.resolve(strict=False)
+    except OSError:
+        key = path.absolute()
+    with _IOS_COMPATIBLE_VIDEO_LOCKS_GUARD:
+        lock = _IOS_COMPATIBLE_VIDEO_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _IOS_COMPATIBLE_VIDEO_LOCKS[key] = lock
+        return lock
+
+
+def _write_ios_compatible_video(
+    source: Path,
+    output_path: Path,
+    probe: dict[str, object],
+    progress: Callable[[int, str], None] | None = None,
+    *,
+    delete_source: bool,
+) -> Path:
+    with _IOS_COMPATIBLE_VIDEO_WRITE_LOCK:
+        temporary_path = output_path.with_name(f".{output_path.stem}.ios-compatible-{time.time_ns()}.mp4")
+        try:
+            if _can_remux_to_ios_mp4(probe):
+                if progress:
+                    progress(98, "正在整理 MP4 缓存文件")
+                _remux_to_ios_mp4(source, temporary_path)
+            else:
+                if progress:
+                    progress(98, "正在转码为可离线播放的视频")
+                _transcode_to_ios_h264(source, temporary_path, probe)
+
+            verified_probe = _probe_video_file(temporary_path)
+            if not _is_ios_compatible_mp4(verified_probe):
+                raise YtDlpError("缓存视频整理失败：输出文件仍不是 iOS 可直接播放的 H.264/AAC MP4。")
+            if output_path.exists():
+                output_path.unlink()
+            temporary_path.replace(output_path)
+            if delete_source and source != output_path and source.exists():
+                source.unlink()
+            return output_path
+        except Exception:
+            if temporary_path.exists():
+                temporary_path.unlink()
+            raise
+
+
+def _probe_video_file(path: Path) -> dict[str, object]:
+    cmd = [
+        _media_tool("ffprobe"),
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(path),
+    ]
+    try:
+        result = run_hidden(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise YtDlpError("缺少 ffprobe，无法校验缓存视频是否可在当前设备离线播放。") from exc
+    if result.returncode != 0:
+        raise YtDlpError(result.stderr.strip() or "ffprobe failed to inspect downloaded video")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise YtDlpError("ffprobe returned invalid JSON while inspecting downloaded video") from exc
+
+    format_payload = payload.get("format") if isinstance(payload, dict) else None
+    format_name = str((format_payload or {}).get("format_name") or "")
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    stream_list = streams if isinstance(streams, list) else []
+    video_stream = next((stream for stream in stream_list if stream.get("codec_type") == "video"), None)
+    if not isinstance(video_stream, dict):
+        raise YtDlpError("缓存视频整理失败：下载结果中没有视频轨道。")
+    audio_streams = [stream for stream in stream_list if stream.get("codec_type") == "audio"]
+    return {
+        "format_names": {part for part in format_name.split(",") if part},
+        "video_codec": str(video_stream.get("codec_name") or "").lower(),
+        "audio_codecs": {str(stream.get("codec_name") or "").lower() for stream in audio_streams},
+        "width": _safe_int(video_stream.get("width")),
+        "height": _safe_int(video_stream.get("height")),
+    }
+
+
+def _is_ios_compatible_mp4(probe: dict[str, object]) -> bool:
+    format_names = probe.get("format_names")
+    audio_codecs = probe.get("audio_codecs")
+    return (
+        isinstance(format_names, set)
+        and bool(format_names & IOS_MP4_FORMAT_NAMES)
+        and probe.get("video_codec") == "h264"
+        and isinstance(audio_codecs, set)
+        and audio_codecs <= IOS_AUDIO_CODECS
+    )
+
+
+def _can_remux_to_ios_mp4(probe: dict[str, object]) -> bool:
+    audio_codecs = probe.get("audio_codecs")
+    return probe.get("video_codec") == "h264" and isinstance(audio_codecs, set) and audio_codecs <= IOS_AUDIO_CODECS
+
+
+def _remux_to_ios_mp4(source: Path, output: Path) -> None:
+    cmd = [
+        _media_tool("ffmpeg"),
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    _run_ffmpeg_or_raise(cmd)
+
+
+def _transcode_to_ios_h264(source: Path, output: Path, probe: dict[str, object]) -> None:
+    encoder = _select_h264_encoder()
+    video_args = _h264_encoder_args(encoder, probe)
+    cmd = [
+        _media_tool("ffmpeg"),
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        *video_args,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    _run_ffmpeg_or_raise(cmd)
+
+
+def _select_h264_encoder() -> str:
+    if _ffmpeg_has_encoder("h264_videotoolbox"):
+        return "h264_videotoolbox"
+    if _ffmpeg_has_encoder("libx264"):
+        return "libx264"
+    raise YtDlpError("缺少可用的 H.264 编码器，无法把缓存视频转为 iOS 可直接播放的 MP4。")
+
+
+def _h264_encoder_args(encoder: str, probe: dict[str, object]) -> list[str]:
+    if encoder == "h264_videotoolbox":
+        return ["-c:v", encoder, "-b:v", _target_h264_bitrate(probe), "-pix_fmt", "yuv420p"]
+    return ["-c:v", encoder, "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+
+
+def _target_h264_bitrate(probe: dict[str, object]) -> str:
+    width = int(probe.get("width") or 0)
+    height = int(probe.get("height") or 0)
+    if width >= 3840 or height >= 2160:
+        return "4500k"
+    if width >= 1920 or height >= 1080:
+        return "1800k"
+    if width >= 1280 or height >= 720:
+        return "1200k"
+    return "900k"
+
+
+def _ffmpeg_has_encoder(encoder: str) -> bool:
+    try:
+        result = run_hidden([_media_tool("ffmpeg"), "-hide_banner", "-encoders"], capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise YtDlpError("缺少 ffmpeg，无法把缓存视频整理为 iOS 可直接播放的 MP4。") from exc
+    return result.returncode == 0 and encoder in result.stdout
+
+
+def _run_ffmpeg_or_raise(cmd: list[str]) -> None:
+    try:
+        result = run_hidden(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise YtDlpError("缺少 ffmpeg，无法把缓存视频整理为 iOS 可直接播放的 MP4。") from exc
+    if result.returncode != 0:
+        raise YtDlpError(result.stderr.strip() or result.stdout.strip() or "ffmpeg failed to prepare iOS compatible video")
+
+
+def _media_tool(name: str) -> str:
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    for directory in ("/opt/homebrew/bin", "/usr/local/bin"):
+        candidate = Path(directory) / name
+        if candidate.exists():
+            return str(candidate)
+    return name
 
 
 def _whisper_language(language: str) -> str:

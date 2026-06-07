@@ -176,6 +176,27 @@ def test_list_items_summary_omits_heavy_mobile_fields(tmp_path):
     assert summary_payload["study"]["translated_transcript"] == []
 
 
+def test_items_expose_updated_at_for_differential_sync(tmp_path):
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    full_payload = client.get("/api/items/abc123").json()
+    summary_payload = client.get("/api/items?summary=true").json()[0]
+
+    assert full_payload["updated_at"]
+    assert summary_payload["updated_at"] == full_payload["updated_at"]
+
+    sleep(0.01)
+    renamed = client.patch("/api/items/abc123", json={"title": "Renamed lesson"}).json()
+    refreshed_summary = client.get("/api/items?summary=true").json()[0]
+
+    assert renamed["updated_at"] != full_payload["updated_at"]
+    assert refreshed_summary["updated_at"] == renamed["updated_at"]
+
+
 def test_deeplearning_lesson_url_uses_lesson_slug_as_display_title(tmp_path):
     class DeepLearningRunner(FakeRunner):
         def fetch_metadata(self, request):
@@ -2939,6 +2960,33 @@ def test_external_video_route_serves_linked_file(tmp_path):
     assert response.content == b"external video"
 
 
+def test_external_video_route_serves_device_compatible_copy_without_mutating_source(tmp_path):
+    source = tmp_path / "NAS Lesson.mp4"
+    source.write_bytes(b"external video")
+    workspace_dir = tmp_path / "workspace"
+
+    class PreparingExternalRunner(FakeLocalVideoRunner):
+        def prepare_ios_compatible_video_copy(self, source_path: Path, output_path: Path, progress=None):
+            assert source_path == source.resolve()
+            assert output_path == workspace_dir / "downloads" / "device-compatible" / "NAS-Lesson.mp4"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"fixed external video")
+            return output_path
+
+    client = make_client(tmp_path / "process", workspace_dir=workspace_dir, runner=PreparingExternalRunner())
+    item = client.post(
+        "/api/local-video-paths",
+        json={"paths": [str(source)], "mode": "external"},
+    ).json()[0]
+
+    response = client.get(f"/api/items/{item['id']}/video")
+
+    assert response.status_code == 200
+    assert response.content == b"fixed external video"
+    assert source.read_bytes() == b"external video"
+    assert Path(client.get(f"/api/items/{item['id']}").json()["local_video_path"]).resolve() == source.resolve()
+
+
 def test_external_video_path_is_not_rewritten_to_workspace_file_with_same_name(tmp_path):
     source = tmp_path / "nas" / "Lesson.mp4"
     source.parent.mkdir()
@@ -3167,6 +3215,40 @@ def test_video_route_serves_downloaded_file(tmp_path):
 
     assert response.status_code == 200
     assert response.content == b"video"
+
+
+def test_video_route_prepares_downloaded_workspace_file_before_serving(tmp_path):
+    process_dir = tmp_path / "process"
+    workspace_dir = tmp_path / "workspace"
+    downloads_dir = workspace_dir / "downloads"
+    downloads_dir.mkdir(parents=True)
+    source = downloads_dir / "bad-cache.mp4"
+    source.write_bytes(b"mpegts")
+    library = CourseLibrary(workspace_dir)
+    library.save(CourseItem(
+        id="course",
+        title="Course",
+        source_url="https://example.com/course",
+        created_at="2026-01-01T00:00:00+00:00",
+        local_video_path=Path("downloads/bad-cache.mp4"),
+        video_source_type="workspace",
+    ))
+
+    class PreparingRunner(FakeRunner):
+        def prepare_ios_compatible_video(self, path: Path, progress=None):
+            assert path == source
+            prepared = downloads_dir / "course.mp4"
+            prepared.write_bytes(b"fixed video")
+            source.unlink()
+            return prepared
+
+    client = make_client(process_dir, workspace_dir=workspace_dir, runner=PreparingRunner())
+
+    response = client.get("/api/items/course/video")
+
+    assert response.status_code == 200
+    assert response.content == b"fixed video"
+    assert client.get("/api/items/course").json()["local_video_path"] == "downloads/course.mp4"
 
 
 def test_delete_item_removes_record_and_artifacts(tmp_path):

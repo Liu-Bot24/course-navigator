@@ -23,7 +23,7 @@ struct StudyContentView: View {
 
             switch tab {
             case .guide:
-                GuideView(study: item.study)
+                GuideView(itemID: item.id, study: item.study)
             case .timeline:
                 TimeMapView(
                     study: item.study,
@@ -87,7 +87,7 @@ enum StudyTab: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .guide: "导读"
+        case .guide: "导览"
         case .timeline: "时间"
         case .outline: "大纲"
         case .notes: "笔记"
@@ -113,20 +113,30 @@ enum TranscriptDisplayMode: String, CaseIterable, Identifiable {
 }
 
 struct GuideView: View {
+    var itemID: String
     var study: StudyMaterial?
+    @State private var isContextExpanded = false
 
     var body: some View {
         if let study {
             VStack(alignment: .leading, spacing: 16) {
                 StudySectionBlock(title: "一句话", text: study.oneLine)
                 if let context = study.contextSummary, !context.isEmpty {
-                    StudySectionBlock(title: "上下文", text: context)
+                    CollapsibleStudySectionBlock(
+                        title: "上下文",
+                        systemImage: "text.alignleft",
+                        text: context,
+                        isExpanded: $isContextExpanded
+                    )
                 }
                 BulletList(title: "预备知识", items: study.prerequisites)
-                BulletList(title: "思考问题", items: study.thoughtPrompts)
+                BulletList(title: "思考提示", items: study.thoughtPrompts)
                 BulletList(title: "复习建议", items: study.reviewSuggestions)
-                BulletList(title: "新手重点", items: study.beginnerFocus)
-                BulletList(title: "进阶路线", items: study.experiencedGuidance)
+                BulletList(title: "初学学习建议", items: study.beginnerFocus)
+                BulletList(title: "进阶学习建议", items: study.experiencedGuidance)
+            }
+            .onChange(of: itemID) { _, _ in
+                isContextExpanded = false
             }
         } else {
             EmptyStudyView()
@@ -327,34 +337,107 @@ private struct NoteDisclosureSection: View {
 
 private struct ProgressiveStudyText: View {
     var text: String
-    @State private var visibleCharacterLimit = 12000
-    private static let characterIncrement = 12000
+    @State private var blocks: [StudyTextBlock] = []
+    @State private var isPreparing = false
+    @State private var visibleBlockLimit = 10
+    private static let blockIncrement = 10
 
     var body: some View {
-        let visible = visibleText
+        let visibleBlocks = blocks.prefix(visibleBlockLimit)
         VStack(alignment: .leading, spacing: 10) {
-            Text(visible.content.isEmpty ? "暂无内容" : visible.content)
-                .font(.body)
-                .textSelection(.enabled)
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text("暂无内容")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            } else if isPreparing {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("正在准备内容")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(visibleBlocks) { block in
+                        Text(block.text)
+                            .font(.body)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
 
-            if visible.hasMore {
+            if visibleBlockLimit < blocks.count {
                 Button {
-                    visibleCharacterLimit += Self.characterIncrement
+                    visibleBlockLimit += Self.blockIncrement
                 } label: {
-                    Label("继续加载", systemImage: "chevron.down")
+                    Label("继续加载 \(min(Self.blockIncrement, blocks.count - visibleBlockLimit)) 段", systemImage: "chevron.down")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             }
         }
+        .task(id: text) {
+            await prepareBlocks()
+        }
+        .onChange(of: text) { _, _ in
+            visibleBlockLimit = 10
+        }
     }
 
-    private var visibleText: (content: String, hasMore: Bool) {
-        guard !text.isEmpty else { return ("", false) }
-        guard let end = text.index(text.startIndex, offsetBy: visibleCharacterLimit, limitedBy: text.endIndex) else {
-            return (text, false)
+    private func prepareBlocks() async {
+        let source = text
+        guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            blocks = []
+            isPreparing = false
+            return
         }
-        return (String(text[..<end]), end < text.endIndex)
+
+        isPreparing = true
+        let prepared = await Task.detached(priority: .utility) {
+            StudyTextPaginator.blocks(from: source).enumerated().map { offset, text in
+                StudyTextBlock(id: offset, text: text)
+            }
+        }.value
+        guard !Task.isCancelled else { return }
+        blocks = prepared
+        isPreparing = false
+    }
+}
+
+private struct StudyTextBlock: Identifiable, Hashable {
+    var id: Int
+    var text: String
+}
+
+private enum StudyTextPaginator {
+    private static let maxBlockCharacters = 900
+
+    static func blocks(from text: String) -> [String] {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return [] }
+
+        let paragraphs = normalized
+            .components(separatedBy: "\n\n")
+            .flatMap(splitLongParagraph)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return paragraphs.isEmpty ? splitLongParagraph(normalized) : paragraphs
+    }
+
+    private static func splitLongParagraph(_ paragraph: String) -> [String] {
+        guard paragraph.count > maxBlockCharacters else { return [paragraph] }
+        var chunks: [String] = []
+        var start = paragraph.startIndex
+        while start < paragraph.endIndex {
+            let end = paragraph.index(start, offsetBy: maxBlockCharacters, limitedBy: paragraph.endIndex) ?? paragraph.endIndex
+            chunks.append(String(paragraph[start..<end]))
+            start = end
+        }
+        return chunks
     }
 }
 
@@ -410,7 +493,7 @@ struct TranscriptView: View {
 
     private var displayedTranscriptLines: [TranscriptDisplayLine] {
         guard focusAroundPlayback, let currentTime else { return transcriptLines }
-        return transcriptLines.nearbyWindow(around: currentTime, leading: 2, trailing: 4)
+        return transcriptLines.nearbyWindow(around: currentTime, leading: 2, trailing: 4, minimumCount: 14)
     }
 
     private var hasTranslatedTranscript: Bool {
@@ -554,6 +637,29 @@ struct StudySectionBlock: View {
     }
 }
 
+struct CollapsibleStudySectionBlock: View {
+    var title: String
+    var systemImage: String
+    var text: String
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            ProgressiveStudyText(text: text)
+                .padding(.top, 8)
+        } label: {
+            HStack(spacing: 8) {
+                Label(title, systemImage: systemImage)
+                    .font(.headline)
+                Spacer()
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
 struct BulletList: View {
     var title: String
     var items: [String]
@@ -624,7 +730,7 @@ extension TimeRange: TimedStudyItem {}
 extension TranscriptDisplayLine: TimedStudyItem {}
 
 private extension Array where Element: TimedStudyItem {
-    func nearbyWindow(around time: Double, leading: Int, trailing: Int) -> [Element] {
+    func nearbyWindow(around time: Double, leading: Int, trailing: Int, minimumCount: Int? = nil) -> [Element] {
         guard !isEmpty else { return [] }
         let activeIndex = firstIndex { item in
             time >= item.start && time < Swift.max(item.end, item.start + 0.5)
@@ -632,8 +738,15 @@ private extension Array where Element: TimedStudyItem {
         let nearestIndex = activeIndex ?? indices.min { left, right in
             abs(self[left].start - time) < abs(self[right].start - time)
         } ?? startIndex
-        let lowerBound = Swift.max(startIndex, nearestIndex - leading)
-        let upperBound = Swift.min(endIndex, nearestIndex + trailing + 1)
+        var lowerBound = Swift.max(startIndex, nearestIndex - leading)
+        var upperBound = Swift.min(endIndex, nearestIndex + trailing + 1)
+        if let minimumCount, minimumCount > upperBound - lowerBound {
+            let missingCount = minimumCount - (upperBound - lowerBound)
+            let forwardCount = Swift.min(endIndex - upperBound, missingCount)
+            upperBound += forwardCount
+            let remainingCount = missingCount - forwardCount
+            lowerBound = Swift.max(startIndex, lowerBound - remainingCount)
+        }
         return Array(self[lowerBound..<upperBound])
     }
 }
