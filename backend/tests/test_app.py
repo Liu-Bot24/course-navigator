@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from threading import Event
 from time import sleep
@@ -55,6 +56,15 @@ class FakeLocalVideoRunner(FakeRunner):
             progress(45, "正在转写本地视频")
         assert video_path.suffix == ".mp4"
         return [TranscriptSegment(start=0, end=2, text="Local transcript")]
+
+
+class CountingMetadataRunner(FakeRunner):
+    def __init__(self) -> None:
+        self.fetch_count = 0
+
+    def fetch_metadata(self, request):
+        self.fetch_count += 1
+        return super().fetch_metadata(request)
 
 
 def test_health_route(tmp_path):
@@ -2115,6 +2125,56 @@ def test_model_settings_can_be_read_and_updated(tmp_path):
     assert "COURSE_NAVIGATOR_TASK_PARAMETERS" in written
 
 
+def test_model_settings_default_env_path_does_not_follow_process_cwd(tmp_path, monkeypatch):
+    default_env = app_module.default_env_path()
+    original = default_env.read_text(encoding="utf-8") if default_env.exists() else None
+    monkeypatch.chdir(tmp_path)
+    try:
+        client = TestClient(
+            create_app(
+                data_dir=tmp_path / "data",
+                workspace_dir=tmp_path / "workspace",
+                runner=FakeRunner(),
+                settings=Settings(data_dir=tmp_path / "data", workspace_dir=tmp_path / "workspace"),
+            )
+        )
+
+        response = client.put(
+            "/api/settings/model",
+            json={
+                "profiles": [
+                    {
+                        "id": "portable",
+                        "name": "Portable Model",
+                        "provider_type": "openai",
+                        "base_url": "https://api.example.com/v1",
+                        "model": "portable-chat",
+                        "api_key": "sk-portable-secret",
+                    },
+                ],
+                "translation_model_id": "portable",
+                "learning_model_id": "portable",
+                "global_model_id": "portable",
+                "asr_model_id": "portable",
+                "study_detail_level": "faithful",
+                "task_parameters": {},
+            },
+        )
+
+        assert response.status_code == 200
+        assert not (tmp_path / ".env").exists()
+        assert default_env.exists()
+        written = default_env.read_text(encoding="utf-8")
+        assert "Portable Model" in written
+        assert "COURSE_NAVIGATOR_MODEL_PROFILES" in written
+    finally:
+        if original is None:
+            default_env.unlink(missing_ok=True)
+        else:
+            default_env.write_text(original, encoding="utf-8")
+            os.chmod(default_env, 0o600)
+
+
 def test_create_app_allows_configured_web_origin(tmp_path):
     client = make_client(
         tmp_path,
@@ -3095,6 +3155,55 @@ def test_local_video_download_route_rejects_recaching(tmp_path):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "本地视频已经在 Workspace 中，无需再次缓存。"
+
+
+def test_playback_source_resolves_missing_remote_stream_url(tmp_path):
+    runner = CountingMetadataRunner()
+    workspace = tmp_path / "workspace"
+    client = make_client(tmp_path, runner=runner, workspace_dir=workspace)
+    library = CourseLibrary(workspace)
+    library.save(
+        CourseItem(
+            id="remote-lesson",
+            source_url="https://www.youtube.com/watch?v=remote",
+            title="Remote Lesson",
+            created_at="2026-06-07T00:00:00+00:00",
+            duration=None,
+            metadata=VideoMetadata(
+                id="remote",
+                title="Remote Lesson",
+                webpage_url="https://www.youtube.com/watch?v=remote",
+                extractor="youtube",
+                stream_url=None,
+                hls_manifest_url=None,
+            ),
+        )
+    )
+
+    response = client.post("/api/items/remote-lesson/playback-source")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+    assert payload["duration"] == 42
+    assert runner.fetch_count == 1
+    persisted = client.get("/api/items/remote-lesson").json()
+    assert persisted["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+
+
+def test_playback_source_does_not_refresh_local_workspace_video(tmp_path):
+    runner = CountingMetadataRunner()
+    client = make_client(tmp_path, runner=runner)
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    ).json()
+
+    response = client.post(f"/api/items/{imported['id']}/playback-source")
+
+    assert response.status_code == 200
+    assert response.json()["local_video_path"]
+    assert runner.fetch_count == 0
 
 
 def test_extract_route_preserves_local_cache_when_refreshing_subtitles(tmp_path):

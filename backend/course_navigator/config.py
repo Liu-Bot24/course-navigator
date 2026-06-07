@@ -19,6 +19,10 @@ from .models import (
 )
 
 
+def default_env_path() -> Path:
+    return Path(__file__).resolve().parents[2] / ".env"
+
+
 class ModelProfileConfig(BaseModel):
     id: str
     name: str
@@ -148,7 +152,7 @@ class Settings(BaseModel):
 
 
 def load_settings() -> Settings:
-    load_dotenv()
+    load_dotenv(default_env_path())
     profiles = _load_model_profiles(os.getenv("COURSE_NAVIGATOR_MODEL_PROFILES"))
     legacy_model = os.getenv("COURSE_NAVIGATOR_LLM_MODEL")
     if not profiles and legacy_model:
