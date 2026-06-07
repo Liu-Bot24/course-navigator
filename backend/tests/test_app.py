@@ -1665,6 +1665,116 @@ def test_study_job_full_failure_restores_existing_study_after_partial_save(tmp_p
     assert study["high_fidelity_text"] == "已有详解"
 
 
+def test_running_study_job_can_be_cancelled_and_restores_existing_study(tmp_path, monkeypatch):
+    started = Event()
+    release = Event()
+
+    def cancellable_generate(**kwargs):
+        kwargs["partial_study"](
+            StudyMaterial(
+                one_line="临时导览",
+                time_map=[],
+                outline=[],
+                detailed_notes="临时解读",
+                high_fidelity_text="临时详解",
+            )
+        )
+        started.set()
+        assert release.wait(2)
+        kwargs["progress"]("learning_blocks", 50, "正在生成学习块 1/2")
+        return StudyMaterial(
+            one_line="不应保存",
+            time_map=[],
+            outline=[],
+            detailed_notes="不应保存",
+            high_fidelity_text="不应保存",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", cancellable_generate)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    item = CourseLibrary(tmp_path).get("abc123")
+    assert item is not None
+    item.study = StudyMaterial(
+        one_line="已有导览",
+        time_map=[],
+        outline=[],
+        detailed_notes="已有解读",
+        high_fidelity_text="已有详解",
+    )
+    CourseLibrary(tmp_path).save(item)
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "all"})
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "cancelling"
+
+    release.set()
+    payload = cancel_response.json()
+    for _ in range(30):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    assert payload["message"] == "学习地图生成已取消"
+    study = client.get("/api/items/abc123").json()["study"]
+    assert study["one_line"] == "已有导览"
+    assert study["high_fidelity_text"] == "已有详解"
+
+
+def test_queued_study_job_can_be_cancelled_before_it_runs(tmp_path, monkeypatch):
+    first_started = Event()
+    release_first = Event()
+    calls = 0
+
+    def blocking_generate(**kwargs):
+        nonlocal calls
+        calls += 1
+        first_started.set()
+        assert release_first.wait(2)
+        return StudyMaterial(
+            one_line="成功导览",
+            time_map=[],
+            outline=[],
+            detailed_notes="成功解读",
+            high_fidelity_text="成功详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", blocking_generate)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    first = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "all"}).json()
+    assert first_started.wait(2)
+    second = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN", "section": "all"}).json()
+
+    cancel_response = client.post(f"/api/jobs/{second['job_id']}/cancel")
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "cancelled"
+
+    release_first.set()
+    for _ in range(30):
+        payload = client.get(f"/api/jobs/{first['job_id']}").json()
+        if payload["status"] == "succeeded":
+            break
+        sleep(0.02)
+    sleep(0.05)
+
+    assert client.get(f"/api/jobs/{second['job_id']}").json()["status"] == "cancelled"
+    assert calls == 1
+
+
 def test_study_jobs_for_same_course_run_serially_without_old_failure_overwriting_new_success(tmp_path, monkeypatch):
     first_started = Event()
     release_first = Event()

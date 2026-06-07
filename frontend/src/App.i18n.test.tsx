@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bindVideoSource,
   bindVideoSourceFromPicker,
+  cancelStudyJob,
   deleteLocalVideo,
   extractCourse,
   getAsrCacheSettings,
@@ -42,6 +43,7 @@ vi.mock("./api", () => ({
   }),
   bindVideoSource: vi.fn(),
   bindVideoSourceFromPicker: vi.fn(),
+  cancelStudyJob: vi.fn(),
   deleteCourse: vi.fn(),
   deleteLocalVideo: vi.fn(),
   downloadVideo: vi.fn(),
@@ -2213,6 +2215,52 @@ describe("App language defaults", () => {
 
     await waitFor(() => expect(getStudyJob).toHaveBeenCalledTimes(2), { timeout: 3500 });
     expect(screen.getByRole("heading", { name: "Other Lesson" })).toBeTruthy();
+  });
+
+  it("lets the user stop the current study map generation job", async () => {
+    vi.mocked(listItems).mockReset();
+    vi.mocked(startStudyJob).mockReset();
+    vi.mocked(getStudyJob).mockReset();
+    vi.mocked(cancelStudyJob).mockReset();
+    const lesson = studyQueueCourse("lesson-a", "Lesson A");
+    vi.mocked(listItems).mockResolvedValue([lesson]);
+    vi.mocked(startStudyJob).mockResolvedValue({
+      job_id: "lesson-a-all",
+      item_id: "lesson-a",
+      status: "running",
+      progress: 18,
+      phase: "learning_blocks",
+      message: "正在生成学习块 1/58",
+      error: null,
+    });
+    vi.mocked(cancelStudyJob).mockResolvedValue({
+      job_id: "lesson-a-all",
+      item_id: "lesson-a",
+      status: "cancelled",
+      progress: 100,
+      phase: "cancelled",
+      message: "学习地图生成已取消",
+      error: null,
+    });
+    vi.mocked(getStudyJob).mockResolvedValue({
+      job_id: "lesson-a-all",
+      item_id: "lesson-a",
+      status: "cancelled",
+      progress: 100,
+      phase: "cancelled",
+      message: "学习地图生成已取消",
+      error: null,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "展开学习地图设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "全部重新生成" }));
+
+    const stopButton = await screen.findByRole("button", { name: "停止生成学习地图" });
+    fireEvent.click(stopButton);
+
+    await waitFor(() => expect(cancelStudyJob).toHaveBeenCalledWith("lesson-a-all"));
   });
 
   it("queues study rebuild clicks across courses and sections in click order", async () => {

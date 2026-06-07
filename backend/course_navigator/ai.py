@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from time import sleep
 from typing import Callable, Literal
 
 import httpx
@@ -20,6 +23,16 @@ from .models import (
     TimeRange,
     TranscriptSegment,
     VideoMetadata,
+)
+
+logger = logging.getLogger("course_navigator.ai")
+
+TRANSIENT_LLM_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+TRANSIENT_LLM_EXCEPTIONS = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
 )
 
 
@@ -385,7 +398,7 @@ def _chat_text(
             for message in messages
             if message["role"] != "system"
         ]
-        response = httpx.post(
+        response = _post_llm_with_retries(
             _anthropic_endpoint_url(base_url, "messages"),
             headers={
                 "x-api-key": provider.api_key,
@@ -400,8 +413,9 @@ def _chat_text(
                 "max_tokens": effective_max_tokens,
             },
             timeout=timeout,
+            provider=provider,
+            task_key=task_key,
         )
-        response.raise_for_status()
         parts = response.json().get("content") or []
         if isinstance(parts, list):
             return "".join(
@@ -411,7 +425,7 @@ def _chat_text(
             )
         return ""
 
-    response = httpx.post(
+    response = _post_llm_with_retries(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {provider.api_key}"},
         json={
@@ -422,9 +436,96 @@ def _chat_text(
             "response_format": {"type": "json_object"},
         },
         timeout=timeout,
+        provider=provider,
+        task_key=task_key,
     )
-    response.raise_for_status()
     return str(response.json()["choices"][0]["message"]["content"])
+
+
+def _post_llm_with_retries(
+    url: str,
+    *,
+    headers: dict[str, str],
+    json: dict,
+    timeout: float,
+    provider: LlmProvider,
+    task_key: TaskParameterKey | None,
+) -> httpx.Response:
+    max_attempts = _llm_retry_attempts()
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = httpx.post(
+                url,
+                headers=headers,
+                json=json,
+                timeout=_llm_http_timeout(timeout),
+            )
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts or not _is_transient_llm_error(exc):
+                raise
+            delay = _llm_retry_delay(attempt, exc)
+            logger.warning(
+                "Transient LLM request failure; retrying: model=%s task=%s attempt=%s/%s delay=%.1fs error=%s",
+                provider.model,
+                task_key or "default",
+                attempt,
+                max_attempts,
+                delay,
+                exc,
+            )
+            sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
+def _llm_http_timeout(timeout: float) -> httpx.Timeout:
+    bounded = max(1.0, float(timeout))
+    return httpx.Timeout(
+        timeout=bounded,
+        connect=min(30.0, bounded),
+        read=min(120.0, bounded),
+        write=min(30.0, bounded),
+        pool=min(30.0, bounded),
+    )
+
+
+def _llm_retry_attempts() -> int:
+    raw = os.getenv("COURSE_NAVIGATOR_LLM_RETRY_ATTEMPTS", "3")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, min(value, 6))
+
+
+def _llm_retry_delay(attempt: int, exc: Exception) -> float:
+    if isinstance(exc, httpx.HTTPStatusError):
+        retry_after = exc.response.headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(0.0, min(float(retry_after), 20.0))
+            except ValueError:
+                pass
+    return min(1.5 * attempt, 6.0)
+
+
+def _is_transient_llm_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in TRANSIENT_LLM_STATUS_CODES
+    return isinstance(exc, TRANSIENT_LLM_EXCEPTIONS)
+
+
+def _learning_block_worker_count() -> int:
+    raw = os.getenv("COURSE_NAVIGATOR_LEARNING_BLOCK_WORKERS", "1")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1
+    return max(1, min(value, 3))
 
 
 def _effective_task_parameters(
@@ -1732,6 +1833,7 @@ def _generate_learning_blocks_with_provider(
         )
         _report(progress, "segmentation", 78, f"已完成语义分块，共 {len(ranges)} 个学习块")
     except Exception:
+        logger.exception("Semantic segmentation failed; falling back to local time ranges")
         ranges = _fallback_time_ranges_from_transcript(source_transcript, output_language, strategy)
         _report(progress, "segmentation", 78, f"语义分块失败，已使用本地分块，共 {len(ranges)} 个学习块")
 
@@ -1782,7 +1884,7 @@ def _generate_learning_blocks_for_ranges_with_provider(
 
     translated_by_start = {round(segment.start, 2): segment for segment in translated_transcript}
     blocks_by_index: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=_learning_block_worker_count()) as executor:
         futures = {}
         for index, time_range in enumerate(ranges):
             source_chunk = [
@@ -1911,7 +2013,7 @@ def _generate_existing_range_blocks_with_provider(
 ) -> list[dict]:
     translated_by_start = {round(segment.start, 2): segment for segment in translated_transcript}
     blocks_by_index: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=_learning_block_worker_count()) as executor:
         futures = {}
         for index, time_range in enumerate(ranges):
             source_chunk, translated_chunk = _chunks_for_time_range(

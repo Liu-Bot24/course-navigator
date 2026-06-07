@@ -345,18 +345,67 @@ button:disabled {
 
 .status-strip {
   display: grid;
-  grid-template-columns: 1fr minmax(160px, 240px);
-  gap: 12px;
+  grid-template-columns: 1fr minmax(180px, 240px) 16px;
+  gap: 8px;
   align-items: center;
   border-color: #cbd8ff;
   background: #eef3ff;
   color: #234087;
 }
 
-.status-strip progress {
+.status-strip-progress {
   width: 100%;
-  height: 8px;
-  accent-color: #2454d6;
+  height: 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: #dfe6f2;
+  box-shadow: none;
+}
+
+.status-strip-progress span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2f6df6 0%, #2454d6 100%);
+}
+
+.status-strip-cancel {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #e96f78;
+  border-radius: 999px;
+  background: #e86a72;
+  color: #ffffff;
+  padding: 0;
+  box-shadow: none;
+}
+
+.status-strip-cancel:hover:not(:disabled) {
+  border-color: #d9555f;
+  background: #d9555f;
+  box-shadow: none;
+}
+
+.status-strip-cancel:disabled {
+  border-color: #eba2a7;
+  background: #eba2a7;
+  color: #ffffff;
+  cursor: wait;
+  opacity: 0.8;
+}
+
+.status-strip-cancel span {
+  display: none;
+}
+
+.status-strip-cancel svg {
+  width: 9px;
+  height: 9px;
+  stroke-width: 3.1;
 }
 
 .study-queue-drawer {
