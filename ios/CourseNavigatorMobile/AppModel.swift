@@ -21,6 +21,7 @@ final class AppModel {
     var backendCapabilityError: String?
     var isSyncingCourseLibrary = false
     var isCachingDeviceVideo = false
+    var isResolvingPlaybackSource = false
     var deviceVideoCacheRecords: [DeviceVideoCacheRecord] = []
     var localCourseLibraries: [LocalCourseLibrary] = []
     var isLoading = false
@@ -38,6 +39,7 @@ final class AppModel {
     private var courseLibrarySyncTask: Task<Void, Never>?
     private var connectionRefreshSequence = 0
     private var isRefreshingAll = false
+    private var resolvingPlaybackSourceIDs = Set<String>()
     private var libraryState = LibraryState()
 
     init() {
@@ -775,6 +777,31 @@ final class AppModel {
             return url
         }
         return nil
+    }
+
+    func ensureOnlinePlaybackSource(for item: CourseItem) async {
+        guard !isLocalMode, let api else { return }
+        guard !item.hasPlayableLocalVideo, metadataRemoteVideoURL(for: item) == nil else { return }
+        guard item.canCacheToComputer else { return }
+        guard !resolvingPlaybackSourceIDs.contains(item.id) else { return }
+        resolvingPlaybackSourceIDs.insert(item.id)
+        isResolvingPlaybackSource = true
+        defer {
+            resolvingPlaybackSourceIDs.remove(item.id)
+            isResolvingPlaybackSource = !resolvingPlaybackSourceIDs.isEmpty
+        }
+        do {
+            let updated = try await api.resolvePlaybackSource(itemID: item.id)
+            upsertCourse(updated)
+            if selectedCourseID == item.id {
+                selectedCourseID = updated.id
+            }
+            saveCachedCoursesForActiveEndpoint()
+        } catch {
+            if selectedCourseID == item.id {
+                errorMessage = "在线播放源解析失败：\(error.localizedDescription)"
+            }
+        }
     }
 
     func hasDeviceVideoCache(for item: CourseItem) -> Bool {

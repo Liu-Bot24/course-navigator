@@ -57,6 +57,15 @@ class FakeLocalVideoRunner(FakeRunner):
         return [TranscriptSegment(start=0, end=2, text="Local transcript")]
 
 
+class CountingMetadataRunner(FakeRunner):
+    def __init__(self) -> None:
+        self.fetch_count = 0
+
+    def fetch_metadata(self, request):
+        self.fetch_count += 1
+        return super().fetch_metadata(request)
+
+
 def test_health_route(tmp_path):
     client = make_client(tmp_path)
 
@@ -3178,6 +3187,55 @@ def test_local_video_download_route_rejects_recaching(tmp_path):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "本地视频已经在 Workspace 中，无需再次缓存。"
+
+
+def test_playback_source_resolves_missing_remote_stream_url(tmp_path):
+    runner = CountingMetadataRunner()
+    workspace = tmp_path / "workspace"
+    client = make_client(tmp_path, runner=runner, workspace_dir=workspace)
+    library = CourseLibrary(workspace)
+    library.save(
+        CourseItem(
+            id="remote-lesson",
+            source_url="https://www.youtube.com/watch?v=remote",
+            title="Remote Lesson",
+            created_at="2026-06-07T00:00:00+00:00",
+            duration=None,
+            metadata=VideoMetadata(
+                id="remote",
+                title="Remote Lesson",
+                webpage_url="https://www.youtube.com/watch?v=remote",
+                extractor="youtube",
+                stream_url=None,
+                hls_manifest_url=None,
+            ),
+        )
+    )
+
+    response = client.post("/api/items/remote-lesson/playback-source")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+    assert payload["duration"] == 42
+    assert runner.fetch_count == 1
+    persisted = client.get("/api/items/remote-lesson").json()
+    assert persisted["metadata"]["stream_url"] == "https://cdn.example.com/sample.m3u8"
+
+
+def test_playback_source_does_not_refresh_local_workspace_video(tmp_path):
+    runner = CountingMetadataRunner()
+    client = make_client(tmp_path, runner=runner)
+    imported = client.post(
+        "/api/local-videos",
+        files={"file": ("Local Lesson.mp4", b"local video", "video/mp4")},
+    ).json()
+
+    response = client.post(f"/api/items/{imported['id']}/playback-source")
+
+    assert response.status_code == 200
+    assert response.json()["local_video_path"]
+    assert runner.fetch_count == 0
 
 
 def test_extract_route_preserves_local_cache_when_refreshing_subtitles(tmp_path):

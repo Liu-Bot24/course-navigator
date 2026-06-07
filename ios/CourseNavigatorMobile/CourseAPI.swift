@@ -83,6 +83,10 @@ struct CourseAPI {
         try await send("/items/\(itemID.urlPathEncoded)/download-jobs", method: "POST", body: request)
     }
 
+    func resolvePlaybackSource(itemID: String) async throws -> CourseItem {
+        try await post("/items/\(itemID.urlPathEncoded)/playback-source")
+    }
+
     func bindVideoSource(itemID: String, request: VideoSourceBindingRequest) async throws -> CourseItem {
         try await send("/items/\(itemID.urlPathEncoded)/video-source", method: "POST", body: request)
     }

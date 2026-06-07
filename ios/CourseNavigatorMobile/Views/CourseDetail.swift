@@ -29,7 +29,7 @@ struct CourseDetail: View {
                             currentTime: $currentPlaybackTime,
                             isLocalMode: model.isLocalMode,
                             canCacheVideo: model.canCacheVideoToDevice(item),
-                            isLoading: model.isLoading || model.isCachingDeviceVideo,
+                            isLoading: model.isLoading || model.isCachingDeviceVideo || model.isResolvingPlaybackSource,
                             cacheVideo: { cacheVideoToDevice(item) },
                             onPlaybackTimeChange: { itemID, seconds, force in
                                 savePlaybackTime(seconds, for: itemID, force: force)
@@ -64,6 +64,9 @@ struct CourseDetail: View {
                 }
                 .navigationTitle(item.displayTitle)
                 .inlineNavigationTitle()
+                .task(id: "\(item.id)|\(model.isLocalMode)") {
+                    await model.ensureOnlinePlaybackSource(for: item)
+                }
                 .sheet(isPresented: $showingVideoSource) {
                     VideoSourceSheet(item: item)
                 }

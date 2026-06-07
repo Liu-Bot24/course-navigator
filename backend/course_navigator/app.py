@@ -999,6 +999,36 @@ def create_app(
         library.save(item)
         return DownloadResponse(path=str(item.local_video_path))
 
+    @app.post("/api/items/{item_id}/playback-source")
+    def resolve_playback_source(item_id: str) -> CourseItem:
+        item = library.get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Course item not found")
+        if item.local_video_path or _metadata_playback_url(item):
+            return _with_item_updated_at(
+                _normalize_item_for_response(item, active_workspace_dir),
+                library.item_updated_at(item.id),
+            )
+        try:
+            metadata = ytdlp_runner.fetch_metadata(
+                ExtractRequest(
+                    url=item.source_url,
+                    mode="browser",
+                    browser="chrome",
+                )
+            )
+        except (ValueError, YtDlpError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not metadata.stream_url and not metadata.hls_manifest_url:
+            raise HTTPException(status_code=400, detail="No playable online video URL found")
+        item.metadata = metadata
+        item.duration = _best_duration(item.duration, metadata.duration, _duration_from_transcript(item.transcript))
+        library.save(item)
+        return _with_item_updated_at(
+            _normalize_item_for_response(item, active_workspace_dir),
+            library.item_updated_at(item.id),
+        )
+
     @app.get("/api/items/{item_id}/video")
     def serve_video(item_id: str) -> FileResponse:
         item = library.get(item_id)
@@ -2339,6 +2369,12 @@ def _with_available_video_source_for_response(item: CourseItem, workspace_dir: P
     ):
         return item.model_copy(update={"local_video_path": None})
     return item
+
+
+def _metadata_playback_url(item: CourseItem) -> str | None:
+    if not item.metadata:
+        return None
+    return item.metadata.hls_manifest_url or item.metadata.stream_url
 
 
 def _with_duration_fallback(item: CourseItem) -> CourseItem:
