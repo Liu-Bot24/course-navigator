@@ -31,6 +31,8 @@ type TauriConfig = {
         installerIcon?: string;
         uninstallerIcon?: string;
         installerHooks?: string;
+        languages?: string[];
+        displayLanguageSelector?: boolean;
       };
     };
   };
@@ -51,6 +53,11 @@ describe("Tauri app shell", () => {
     expect(config.bundle.windows?.nsis?.installerIcon).toBe("icons/icon.ico");
     expect(config.bundle.windows?.nsis?.uninstallerIcon).toBe("icons/icon.ico");
     expect(config.bundle.windows?.nsis?.installerHooks).toBe("windows/installer-hooks.nsh");
+  });
+
+  it("lets the Windows installer use Chinese or English instead of falling back to English only", () => {
+    expect(config.bundle.windows?.nsis?.languages).toEqual(["English", "SimpChinese", "TradChinese"]);
+    expect(config.bundle.windows?.nsis?.displayLanguageSelector).toBe(true);
   });
 
   it("uses the macOS template tray icon only on macOS and the product icon elsewhere", async () => {
