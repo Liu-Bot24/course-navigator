@@ -78,6 +78,10 @@ final class AppModel {
         return false
     }
 
+    var shouldKeepDeviceAwake: Bool {
+        activeJob != nil || isCachingDeviceVideo
+    }
+
     var canShowCourseContent: Bool {
         isBackendOnline || !courses.isEmpty
     }
@@ -322,6 +326,7 @@ final class AppModel {
         if case .checking = connectionStatus { return }
 
         await refreshAll()
+        await resumeSelectedDownloadJobIfPresent()
     }
 
     private func checkHealth(refreshToken: ConnectionRefreshToken? = nil) async {
@@ -381,6 +386,7 @@ final class AppModel {
             courses = applyLibraryState(to: summaries)
                 .sorted(by: courseSort)
             saveCachedCoursesForActiveEndpoint()
+            pruneDeviceVideoCacheForActiveCourses()
             selectAvailableCourse()
             if let selectedCourseID, let previousSelectedCourse, previousSelectedCourse.id == selectedCourseID {
                 upsertCourse(previousSelectedCourse)
@@ -625,8 +631,7 @@ final class AppModel {
     func cacheVideo(_ item: CourseItem) async {
         guard let api, item.canCacheToComputer else { return }
         await runCourseMutation {
-            let request = backendDownloadRequest(for: item)
-            let job = try await api.startDownloadJob(itemID: item.id, request: request)
+            let job = try await activeOrStartedDownloadJob(for: item, using: api)
             activeJob = job
             selectedCourseID = item.id
             try await poll(jobID: job.jobID, using: api)
@@ -754,7 +759,10 @@ final class AppModel {
                 throw CourseAPIError.server(message: "课程删除失败")
             }
             courses.removeAll { $0.id == item.id }
+            try deviceVideoCacheStore.removeVideo(item, endpoint: activeEndpointDescriptor)
+            refreshDeviceVideoCacheIndex()
             selectedCourseID = courses.first?.id
+            saveCachedCoursesForActiveEndpoint(replacingExisting: true)
         }
     }
 
@@ -938,6 +946,7 @@ final class AppModel {
             courses = Array(mergedByID.values).sorted(by: courseSort)
             selectAvailableCourse()
             saveCachedCoursesForActiveEndpoint(replacingExisting: true)
+            pruneDeviceVideoCacheForActiveCourses()
             errorMessage = failedCount == 0 ? nil : "\(failedCount) 门课程资料暂时没有同步成功"
             if failedCount > 0, let descriptor {
                 autoSyncedEndpointKeys.remove(descriptor.key)
@@ -993,12 +1002,31 @@ final class AppModel {
         errorMessage = nil
         defer { isLoading = false }
         do {
-            let request = backendDownloadRequest(for: item)
-            let job = try await api.startDownloadJob(itemID: item.id, request: request)
+            let job = try await activeOrStartedDownloadJob(for: item, using: api)
             activeJob = job
             selectedCourseID = item.id
             try await poll(jobID: job.jobID, using: api)
             await refreshSelectedCourse()
+        } catch {
+            errorMessage = error.localizedDescription
+            activeJob = nil
+        }
+    }
+
+    private func activeOrStartedDownloadJob(for item: CourseItem, using api: CourseAPI) async throws -> StudyJobStatus {
+        if let activeDownloadJob = try await api.downloadJob(itemID: item.id) {
+            return activeDownloadJob
+        }
+        let request = backendDownloadRequest(for: item)
+        return try await api.startDownloadJob(itemID: item.id, request: request)
+    }
+
+    private func resumeSelectedDownloadJobIfPresent() async {
+        guard let api, isBackendOnline, activeJob == nil, let selectedCourseID else { return }
+        do {
+            guard let job = try await api.downloadJob(itemID: selectedCourseID) else { return }
+            activeJob = job
+            try await poll(jobID: job.jobID, using: api)
         } catch {
             errorMessage = error.localizedDescription
             activeJob = nil
@@ -1179,7 +1207,7 @@ final class AppModel {
     }
 
     private func saveCachedCoursesForActiveEndpoint(replacingExisting: Bool = false) {
-        guard let descriptor = activeEndpointDescriptor, !courses.isEmpty else { return }
+        guard let descriptor = activeEndpointDescriptor else { return }
         let coursesToSave: [CourseItem]
         if replacingExisting {
             coursesToSave = courses
@@ -1192,6 +1220,19 @@ final class AppModel {
         }
         try? courseCacheStore.save(courses: coursesToSave, libraryState: libraryState, endpoint: descriptor)
         refreshLocalCourseLibraryIndex()
+    }
+
+    private func pruneDeviceVideoCacheForActiveCourses() {
+        guard let descriptor = activeEndpointDescriptor else { return }
+        let validCourseIDs = Set(courses.map(\.id))
+        do {
+            let removedCount = try deviceVideoCacheStore.removeVideos(endpoint: descriptor, excludingCourseIDs: validCourseIDs)
+            if removedCount > 0 {
+                refreshDeviceVideoCacheIndex()
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     private func richestOfflineCourse(_ candidates: CourseItem?...) -> CourseItem {
@@ -1734,6 +1775,21 @@ struct DeviceVideoCacheStore {
         var records = try loadRecords()
         records.removeAll { $0.id == record.id }
         try save(records)
+    }
+
+    func removeVideos(endpoint: EndpointCacheDescriptor, excludingCourseIDs validCourseIDs: Set<String>) throws -> Int {
+        var records = try loadRecords()
+        let removedRecords = records.filter { record in
+            record.endpointKey == endpoint.key && !validCourseIDs.contains(record.courseID)
+        }
+        guard !removedRecords.isEmpty else { return 0 }
+        for record in removedRecords {
+            removeCachedFileIfNeeded(record)
+        }
+        let removedIDs = Set(removedRecords.map(\.id))
+        records.removeAll { removedIDs.contains($0.id) }
+        try save(records)
+        return removedRecords.count
     }
 
     private func upsert(_ record: DeviceVideoCacheRecord) throws {

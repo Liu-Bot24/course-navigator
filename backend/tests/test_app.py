@@ -3716,6 +3716,87 @@ def test_download_job_cleans_file_when_course_is_deleted_during_download(tmp_pat
     assert not list((tmp_path / "downloads").glob("abc123.*"))
 
 
+def test_download_job_reuses_active_item_job(tmp_path):
+    class BlockingDownloadRunner(FakeRunner):
+        def __init__(self) -> None:
+            self.started = Event()
+            self.release = Event()
+            self.calls = 0
+
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None):
+            self.calls += 1
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if progress:
+                progress(42, "正在缓存视频")
+            self.started.set()
+            assert self.release.wait(2)
+            path = target_dir / f"{item_id}.mp4"
+            path.write_text("video", encoding="utf-8")
+            return path
+
+    runner = BlockingDownloadRunner()
+    client = make_client(tmp_path, runner=runner)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    first = client.post(
+        "/api/items/abc123/download-jobs",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    assert first.status_code == 200
+    first_job_id = first.json()["job_id"]
+    assert runner.started.wait(1)
+
+    second = client.post(
+        "/api/items/abc123/download-jobs",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    assert second.status_code == 200
+    assert second.json()["job_id"] == first_job_id
+    assert runner.calls == 1
+
+    active = client.get("/api/items/abc123/download-job")
+    assert active.status_code == 200
+    assert active.json()["job_id"] == first_job_id
+
+    runner.release.set()
+    for _ in range(20):
+        payload = client.get(f"/api/jobs/{first_job_id}").json()
+        if payload["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "succeeded"
+    assert runner.calls == 1
+    assert client.get("/api/items/abc123/download-job").status_code == 404
+
+
+def test_partial_download_file_is_not_treated_as_workspace_cache(tmp_path):
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir(parents=True)
+    (downloads_dir / "abc123.mp4.part").write_text("partial", encoding="utf-8")
+    (downloads_dir / "abc123.mp4.ytdl").write_text("resume", encoding="utf-8")
+    CourseLibrary(tmp_path).save(
+        CourseItem(
+            id="abc123",
+            source_url="https://www.youtube.com/watch?v=abc123",
+            title="Partial download",
+            duration=42,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            transcript=[],
+            local_video_path=Path("downloads/abc123.mp4"),
+            video_source_type="workspace",
+        )
+    )
+
+    client = make_client(tmp_path)
+    payload = client.get("/api/items/abc123").json()
+
+    assert payload["local_video_path"] is None
+    assert payload["video_source_type"] == "remote"
+
+
 def test_delete_local_video_keeps_course_item(tmp_path):
     client = make_client(tmp_path)
     client.post(

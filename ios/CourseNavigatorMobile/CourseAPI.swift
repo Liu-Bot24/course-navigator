@@ -83,6 +83,10 @@ struct CourseAPI {
         try await send("/items/\(itemID.urlPathEncoded)/download-jobs", method: "POST", body: request)
     }
 
+    func downloadJob(itemID: String) async throws -> StudyJobStatus? {
+        try await getOptional("/items/\(itemID.urlPathEncoded)/download-job")
+    }
+
     func resolvePlaybackSource(itemID: String) async throws -> CourseItem {
         try await post("/items/\(itemID.urlPathEncoded)/playback-source")
     }
@@ -138,6 +142,45 @@ struct CourseAPI {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         return try await perform(request, timeout: timeout)
+    }
+
+    private func getOptional<T: Decodable>(
+        _ path: String,
+        timeout: TimeInterval = Self.defaultTimeout
+    ) async throws -> T? {
+        guard let url = apiURL(path) else { throw CourseAPIError.invalidURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = timeout
+        Self.debugNetwork("START \(request.httpMethod ?? "GET") \(request.url?.absoluteString ?? "<invalid>") timeout=\(timeout)")
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError {
+            Self.debugNetwork("ERROR \(error.code.rawValue) \(request.url?.absoluteString ?? "<invalid>") \(error.localizedDescription)")
+            throw CourseAPIError.transport(Self.transportMessage(for: error))
+        }
+        guard let http = response as? HTTPURLResponse else {
+            Self.debugNetwork("ERROR invalid-response \(request.url?.absoluteString ?? "<invalid>")")
+            throw CourseAPIError.invalidResponse
+        }
+        if http.statusCode == 404 {
+            Self.debugNetwork("OK status=404 optional-empty \(request.url?.absoluteString ?? "<invalid>")")
+            return nil
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            Self.debugNetwork("ERROR status=\(http.statusCode) \(request.url?.absoluteString ?? "<invalid>")")
+            throw CourseAPIError.server(message: Self.errorMessage(from: data) ?? "Request failed: \(http.statusCode)")
+        }
+        do {
+            let value = try JSONDecoder.courseNavigator.decode(T.self, from: data)
+            Self.debugNetwork("OK status=\(http.statusCode) bytes=\(data.count) \(request.url?.absoluteString ?? "<invalid>")")
+            return value
+        } catch {
+            Self.debugNetwork("ERROR decode \(request.url?.absoluteString ?? "<invalid>") \(error.localizedDescription)")
+            throw CourseAPIError.decode(error.localizedDescription)
+        }
     }
 
     private func delete<T: Decodable>(

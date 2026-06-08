@@ -191,7 +191,6 @@ class YtDlpRunner:
         progress: Callable[[int, str], None] | None = None,
     ) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
-        _delete_download_files_for_item(target_dir, item_id)
         output_template = str(target_dir / f"{item_id}.%(ext)s")
         cmd = [
             *self.command_prefix(),

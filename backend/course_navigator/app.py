@@ -165,6 +165,7 @@ def create_app(
     ytdlp_runner = runner or YtDlpRunner(cookie_cache_dir=active_data_dir / "cookies")
     _backfill_local_video_items(library, active_workspace_dir, ytdlp_runner)
     jobs: dict[str, StudyJobStatus] = {}
+    download_jobs_by_item_id: dict[str, str] = {}
     study_job_ids: set[str] = set()
     cancelled_study_jobs: set[str] = set()
     asr_results: dict[str, AsrCorrectionResult] = {}
@@ -797,8 +798,22 @@ def create_app(
             updated_at=now,
         )
         with jobs_lock:
+            active_job = _active_download_job_for_item_locked(item_id)
+            if active_job:
+                return active_job
             jobs[job_id] = job
+            download_jobs_by_item_id[item_id] = job_id
         download_executor.submit(_run_download_job, job_id, item_id, request)
+        return job
+
+    @app.get("/api/items/{item_id}/download-job")
+    def get_download_job_for_item(item_id: str) -> StudyJobStatus:
+        if not library.get(item_id):
+            raise HTTPException(status_code=404, detail="Course item not found")
+        with jobs_lock:
+            job = _active_download_job_for_item_locked(item_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Download job not found")
         return job
 
     @app.post("/api/extract-jobs")
@@ -1148,7 +1163,19 @@ def create_app(
             updates.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
             next_job = job.model_copy(update=updates)
             jobs[job_id] = next_job
+            if next_job.status not in {"queued", "running"} and download_jobs_by_item_id.get(next_job.item_id) == job_id:
+                download_jobs_by_item_id.pop(next_job.item_id, None)
             return next_job
+
+    def _active_download_job_for_item_locked(item_id: str) -> StudyJobStatus | None:
+        job_id = download_jobs_by_item_id.get(item_id)
+        if not job_id:
+            return None
+        job = jobs.get(job_id)
+        if job and job.status in {"queued", "running"}:
+            return job
+        download_jobs_by_item_id.pop(item_id, None)
+        return None
 
     def _study_job_cancel_requested(job_id: str) -> bool:
         with jobs_lock:
@@ -1651,6 +1678,11 @@ def _normalize_library_video_paths(library: CourseLibrary, workspace_dir: Path) 
         if normalized is not None and str(normalized) != str(item.local_video_path):
             item.local_video_path = normalized
             library.save(item)
+        elif normalized is None and item.local_video_path and not _is_local_video_item(item):
+            item.local_video_path = None
+            if item.video_source_type == "workspace":
+                item.video_source_type = "remote"
+            library.save(item)
 
 
 def _backfill_study_guidance_fields(library: CourseLibrary) -> None:
@@ -1947,15 +1979,15 @@ def _normalized_local_video_reference(workspace_dir: Path, item: CourseItem) -> 
     raw_path = Path(item.local_video_path)
     resolved = _resolve_workspace_path(workspace_dir, raw_path)
     downloads_dir = (workspace_dir / "downloads").resolve()
-    if resolved.exists() and downloads_dir in resolved.parents:
+    if _is_complete_local_video_file(resolved) and downloads_dir in resolved.parents:
         return _workspace_relative_path(workspace_dir, resolved)
     basename_candidate = downloads_dir / raw_path.name
-    if basename_candidate.exists():
+    if _is_complete_local_video_file(basename_candidate):
         return _workspace_relative_path(workspace_dir, basename_candidate)
     prefix = f"{item.id}."
     if downloads_dir.exists():
         for candidate in sorted(downloads_dir.iterdir()):
-            if candidate.is_file() and (candidate.name == item.id or candidate.name.startswith(prefix)):
+            if _is_complete_local_video_file(candidate) and (candidate.name == item.id or candidate.name.startswith(prefix)):
                 return _workspace_relative_path(workspace_dir, candidate)
     return None
 
@@ -1965,9 +1997,13 @@ def _local_video_path_for_workspace_item(workspace_dir: Path, item: CourseItem) 
         return None
     video_path = _resolve_workspace_path(workspace_dir, Path(item.local_video_path))
     downloads_dir = (workspace_dir / "downloads").resolve()
-    if video_path.exists() and downloads_dir in video_path.parents:
+    if _is_complete_local_video_file(video_path) and downloads_dir in video_path.parents:
         return video_path
     return None
+
+
+def _is_complete_local_video_file(path: Path) -> bool:
+    return path.exists() and path.is_file() and path.suffix.lower() in LOCAL_VIDEO_EXTENSIONS
 
 
 def _file_video_path_for_workspace_item(workspace_dir: Path, item: CourseItem) -> Path | None:
