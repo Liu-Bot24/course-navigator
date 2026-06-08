@@ -11,6 +11,8 @@ const resourceDir = path.join(rootDir, "launcher", "src-tauri", "resources", "ru
 const runtimeToolsDir = path.join(rootDir, "launcher", "src-tauri", "resources", "runtime-tools");
 const manifestPath = path.join(resourceDir, ".course-navigator-runtime.json");
 const execFileAsync = promisify(execFile);
+const DEFAULT_NODE_VERSION = "v24.16.0";
+const DEFAULT_UV_VERSION = "0.11.19";
 
 const excludedDirs = new Set([
   ".git",
@@ -40,7 +42,6 @@ const excludedFiles = new Set([
   ".DS_Store",
   "DEVELOPMENT_LOG.md",
   "scripts/build-mac-dmg.sh",
-  "scripts/prepare-mac-runtime-source.sh",
   "scripts/prepare-runtime-source.mjs",
 ]);
 
@@ -53,6 +54,9 @@ function isExcluded(relativePath, isDirectory) {
   const name = path.posix.basename(rel);
   if (!rel) {
     return false;
+  }
+  if (isLocalPackagingJunk(name)) {
+    return true;
   }
   if (name === ".env.example") {
     return false;
@@ -84,6 +88,37 @@ function isExcluded(relativePath, isDirectory) {
     }
   }
   return false;
+}
+
+function isLocalPackagingJunk(name) {
+  return (
+    name === ".DS_Store" ||
+    name.startsWith("._") ||
+    name.endsWith("~") ||
+    name.endsWith(".swp") ||
+    name.endsWith(".swo") ||
+    name.endsWith(".swx")
+  );
+}
+
+async function purgeLocalPackagingJunk(dir) {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  for (const entry of entries) {
+    const entryPath = path.join(dir, entry.name);
+    if (isLocalPackagingJunk(entry.name)) {
+      await fs.rm(entryPath, { recursive: true, force: true });
+    } else if (entry.isDirectory()) {
+      await purgeLocalPackagingJunk(entryPath);
+    }
+  }
 }
 
 async function copyDir(source, target) {
@@ -153,7 +188,7 @@ async function prepareWindowsRuntimeTools() {
   await fs.mkdir(windowsDir, { recursive: true });
   await fs.mkdir(tempDir, { recursive: true });
 
-  const nodeVersion = process.env.COURSE_NAVIGATOR_WINDOWS_NODE_VERSION || (await latestNodeLtsVersion("win-x64-zip"));
+  const nodeVersion = process.env.COURSE_NAVIGATOR_WINDOWS_NODE_VERSION || DEFAULT_NODE_VERSION;
   const nodeZip = path.join(tempDir, `node-${nodeVersion}-win-x64.zip`);
   const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/node-${nodeVersion}-win-x64.zip`;
   await downloadFile(nodeUrl, nodeZip);
@@ -161,9 +196,10 @@ async function prepareWindowsRuntimeTools() {
   await expandArchive(nodeZip, nodeExtractDir);
   await renameOnlyChildDirectory(nodeExtractDir, path.join(windowsDir, "node"), "Downloaded Node archive did not contain a directory");
 
+  const uvVersion = process.env.COURSE_NAVIGATOR_UV_VERSION || DEFAULT_UV_VERSION;
   const uvZip = path.join(tempDir, "uv-x86_64-pc-windows-msvc.zip");
   await downloadFile(
-    "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip",
+    `https://github.com/astral-sh/uv/releases/download/${uvVersion}/uv-x86_64-pc-windows-msvc.zip`,
     uvZip,
   );
   await expandArchive(uvZip, path.join(windowsDir, "uv"));
@@ -178,9 +214,7 @@ async function prepareMacRuntimeTools() {
   await fs.mkdir(macDir, { recursive: true });
   await fs.mkdir(tempDir, { recursive: true });
 
-  const nodeVersion =
-    process.env.COURSE_NAVIGATOR_MAC_NODE_VERSION ||
-    (await latestNodeLtsVersion(`osx-${arch}-tar`));
+  const nodeVersion = process.env.COURSE_NAVIGATOR_MAC_NODE_VERSION || DEFAULT_NODE_VERSION;
   const nodeArchive = path.join(tempDir, `node-${nodeVersion}-darwin-${arch}.tar.gz`);
   const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/node-${nodeVersion}-darwin-${arch}.tar.gz`;
   await downloadFile(nodeUrl, nodeArchive);
@@ -192,9 +226,10 @@ async function prepareMacRuntimeTools() {
   await writeMacNodeCliWrappers(nodeDir);
 
   const uvArchiveName = macUvArchiveName(arch);
+  const uvVersion = process.env.COURSE_NAVIGATOR_UV_VERSION || DEFAULT_UV_VERSION;
   const uvArchive = path.join(tempDir, uvArchiveName);
   await downloadFile(
-    `https://github.com/astral-sh/uv/releases/latest/download/${uvArchiveName}`,
+    `https://github.com/astral-sh/uv/releases/download/${uvVersion}/${uvArchiveName}`,
     uvArchive,
   );
   const uvExtractDir = path.join(tempDir, "uv");
@@ -276,10 +311,15 @@ async function copyExecutable(source, target) {
 
 async function prepareWindowsMediaTools(windowsDir, tempDir) {
   const ffmpegZip = path.join(tempDir, "ffmpeg-release-essentials.zip");
-  const ffmpegUrl =
-    process.env.COURSE_NAVIGATOR_WINDOWS_FFMPEG_URL ||
-    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
-  await downloadFile(ffmpegUrl, ffmpegZip);
+  const ffmpegArchive = process.env.COURSE_NAVIGATOR_WINDOWS_FFMPEG_ARCHIVE;
+  if (ffmpegArchive) {
+    await fs.copyFile(ffmpegArchive, ffmpegZip);
+  } else {
+    const ffmpegUrl =
+      process.env.COURSE_NAVIGATOR_WINDOWS_FFMPEG_URL ||
+      "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+    await downloadFile(ffmpegUrl, ffmpegZip);
+  }
   const ffmpegExtractDir = path.join(tempDir, "ffmpeg");
   await expandArchive(ffmpegZip, ffmpegExtractDir);
   const binDir = await findDirectoryContaining(ffmpegExtractDir, ["ffmpeg.exe", "ffprobe.exe"]);
@@ -320,19 +360,6 @@ async function renameOnlyChildDirectory(source, target, errorMessage) {
   await fs.rename(path.join(source, topDir.name), target);
 }
 
-async function latestNodeLtsVersion(requiredFile) {
-  const response = await fetch("https://nodejs.org/dist/index.json");
-  if (!response.ok) {
-    throw new Error(`Unable to read Node release index: ${response.status}`);
-  }
-  const releases = await response.json();
-  const release = releases.find((entry) => entry.lts && entry.files?.includes(requiredFile));
-  if (!release?.version) {
-    throw new Error(`Unable to find a Node LTS release with ${requiredFile}`);
-  }
-  return release.version;
-}
-
 async function downloadFile(url, target) {
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -357,25 +384,12 @@ async function downloadFile(url, target) {
 async function expandArchive(zipPath, destination) {
   await fs.rm(destination, { recursive: true, force: true });
   await fs.mkdir(destination, { recursive: true });
-  if (process.platform === "win32") {
-    await execFileAsync("powershell", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      `Expand-Archive -LiteralPath ${powershellQuote(zipPath)} -DestinationPath ${powershellQuote(destination)} -Force`,
-    ]);
-  } else {
-    await execFileAsync("tar", ["-xf", zipPath, "-C", destination]);
-  }
-}
-
-function powershellQuote(value) {
-  return `'${value.replace(/'/g, "''")}'`;
+  await execFileAsync("tar", ["-xf", zipPath, "-C", destination]);
 }
 
 await fs.rm(resourceDir, { recursive: true, force: true });
 await copyDir(rootDir, resourceDir);
+await purgeLocalPackagingJunk(resourceDir);
 await fs.writeFile(path.join(resourceDir, ".gitkeep"), "");
 await fs.writeFile(
   manifestPath,
@@ -389,6 +403,7 @@ await fs.writeFile(
   )}\n`,
 );
 await prepareRuntimeTools();
+await purgeLocalPackagingJunk(runtimeToolsDir);
 
 console.log(`Prepared runtime source at ${resourceDir}`);
 console.log(`Prepared runtime tools at ${runtimeToolsDir}`);

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
@@ -43,8 +43,19 @@ const apiMocks = vi.hoisted(() => ({
   })),
 }));
 
+const eventMocks = vi.hoisted(() => {
+  const listeners = new Map<string, (event: { payload: unknown }) => void>();
+  return {
+    listeners,
+    listen: vi.fn(async (event: string, handler: (event: { payload: unknown }) => void) => {
+      listeners.set(event, handler);
+      return () => listeners.delete(event);
+    }),
+  };
+});
+
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => () => undefined),
+  listen: eventMocks.listen,
 }));
 
 vi.mock("./api", () => ({
@@ -138,6 +149,8 @@ vi.mock("./api", () => ({
 describe("App", () => {
   beforeEach(() => {
     window.history.pushState({}, "", "/");
+    eventMocks.listeners.clear();
+    eventMocks.listen.mockClear();
     apiMocks.saveConfig.mockClear();
     apiMocks.saveModelConfig.mockClear();
     apiMocks.chooseWorkspaceDirectory.mockClear();
@@ -165,6 +178,27 @@ describe("App", () => {
     expect(screen.queryByText("Workspace 迁移")).toBeNull();
     expect(screen.queryByText("缓存视频仍属于 Workspace；迁移前会先做路径检查，旧 Workspace 默认保留。")).toBeNull();
     expect(screen.getByLabelText("状态消息").textContent).toBe("尚未启动");
+  });
+
+  it("updates the visible status when tray actions emit launcher status", async () => {
+    render(<App />);
+    expect(await screen.findByText("stopped")).toBeTruthy();
+    const handler = eventMocks.listeners.get("launcher-status-changed");
+    expect(handler).toBeTruthy();
+
+    act(() => {
+      handler?.({
+        payload: {
+          state: "failed",
+          apiUrl: "http://127.0.0.1:18000",
+          webUrl: "http://127.0.0.1:15173",
+          message: "托盘停止失败：端口仍在监听",
+        },
+      });
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("状态消息").textContent).toBe("托盘停止失败：端口仍在监听"));
+    expect(screen.getByText("failed")).toBeTruthy();
   });
 
   it("saves model role selections from the launcher panel", async () => {

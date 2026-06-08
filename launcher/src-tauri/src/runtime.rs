@@ -1,5 +1,6 @@
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
@@ -29,8 +30,10 @@ const PS_PATH: &str = "/bin/ps";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const DEPENDENCY_MARKER_FILE: &str = ".course-navigator-deps.json";
 const INSTALL_TARGET_MEDIA_TOOLS: &str = "media-tools";
+const RUNTIME_TOOL_PATHS_ENV: &str = "COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS";
 #[cfg(windows)]
-const FFMPEG_DOWNLOAD_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+const FFMPEG_DOWNLOAD_URL: &str =
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCommand {
@@ -98,13 +101,19 @@ pub fn resolve_available_ports(config: &LauncherConfig) -> (LauncherConfig, Vec<
     let mut messages = Vec::new();
     if endpoint_listening(&config.api_host, config.api_port) && !course_api_ready(config) {
         if let Some(port) = first_available_port(&config.api_host, config.api_port) {
-            messages.push(format!("API 端口 {} 被占用，已改用 {port}", config.api_port));
+            messages.push(format!(
+                "API 端口 {} 被占用，已改用 {port}",
+                config.api_port
+            ));
             next.api_port = port;
         }
     }
     if endpoint_listening(&config.web_host, config.web_port) && !course_web_ready(config) {
         if let Some(port) = first_available_port(&config.web_host, config.web_port) {
-            messages.push(format!("网页端口 {} 被占用，已改用 {port}", config.web_port));
+            messages.push(format!(
+                "网页端口 {} 被占用，已改用 {port}",
+                config.web_port
+            ));
             next.web_port = port;
         }
     }
@@ -228,7 +237,14 @@ pub fn check_dependencies(project_root: &Path) -> Vec<DependencyStatus> {
                 None
             },
             install_label: if cfg!(windows) {
-                Some(if media_tools_available() { "更新" } else { "准备" }.into())
+                Some(
+                    if media_tools_available() {
+                        "更新"
+                    } else {
+                        "准备"
+                    }
+                    .into(),
+                )
             } else {
                 None
             },
@@ -268,9 +284,7 @@ fn prepare_preferred_windows_tools() {
 #[cfg(windows)]
 fn prepare_latest_windows_tools() -> Result<(), String> {
     let mut errors = Vec::new();
-    if bundled_tool_program("ffmpeg").is_none()
-        || bundled_tool_program("ffprobe").is_none()
-    {
+    if bundled_tool_program("ffmpeg").is_none() || bundled_tool_program("ffprobe").is_none() {
         if let Err(error) = download_latest_media_tools() {
             errors.push(format!("ffmpeg / ffprobe 更新失败: {error}"));
         }
@@ -291,7 +305,8 @@ fn download_latest_media_tools() -> Result<(), String> {
     let zip_path = temp_root.join("ffmpeg-release-essentials.zip");
     let extract_dir = temp_root.join("extract");
     fs::create_dir_all(&target_dir).map_err(|error| format!("无法创建媒体工具目录: {error}"))?;
-    fs::create_dir_all(&extract_dir).map_err(|error| format!("无法创建媒体工具临时目录: {error}"))?;
+    fs::create_dir_all(&extract_dir)
+        .map_err(|error| format!("无法创建媒体工具临时目录: {error}"))?;
 
     let url = env::var("COURSE_NAVIGATOR_WINDOWS_FFMPEG_URL")
         .unwrap_or_else(|_| FFMPEG_DOWNLOAD_URL.to_string());
@@ -335,7 +350,13 @@ fn copy_media_tools_from_archive(source: &Path, target: &Path) -> Result<(), Str
 #[cfg(windows)]
 fn run_powershell_script(script: &str, context: &str) -> Result<(), String> {
     let output = hidden_command("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
         .output()
         .map_err(|error| format!("{context}: {error}"))?;
     if output.status.success() {
@@ -441,6 +462,9 @@ fn apply_service_env(command: &mut Command, config: &LauncherConfig) {
         .env("COURSE_NAVIGATOR_WEB_HOST", &config.web_host)
         .env("COURSE_NAVIGATOR_WEB_PORT", config.web_port.to_string())
         .env("COURSE_NAVIGATOR_WORKSPACE_DIR", &config.workspace_dir);
+    if let Some(tool_paths) = runtime_tool_paths_env_value() {
+        command.env(RUNTIME_TOOL_PATHS_ENV, tool_paths);
+    }
 }
 
 pub fn stop_project_services(state: &ServiceState) -> Result<(), String> {
@@ -1198,6 +1222,17 @@ fn bundled_tool_program(name: &str) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+fn runtime_tool_paths_env_value() -> Option<OsString> {
+    runtime_tool_paths_env_value_from(&bundled_tool_paths())
+}
+
+fn runtime_tool_paths_env_value_from(paths: &[PathBuf]) -> Option<OsString> {
+    if paths.is_empty() {
+        return None;
+    }
+    env::join_paths(paths).ok()
+}
+
 fn bundled_tools_root() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
     bundled_tools_root_from_exe(&exe, platform_tool_dir())
@@ -1205,14 +1240,12 @@ fn bundled_tools_root() -> Option<PathBuf> {
 
 fn bundled_tools_root_from_exe(exe: &Path, platform_dir: &str) -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
-        exe.parent()?
-            .parent()
-            .map(|contents_dir| {
-                contents_dir
-                    .join("Resources")
-                    .join("runtime-tools")
-                    .join(platform_dir)
-            })
+        exe.parent()?.parent().map(|contents_dir| {
+            contents_dir
+                .join("Resources")
+                .join("runtime-tools")
+                .join(platform_dir)
+        })
     } else {
         exe.parent()
             .map(|dir| dir.join("runtime-tools").join(platform_dir))
@@ -1409,6 +1442,14 @@ mod tests {
     }
 
     #[test]
+    fn runtime_tool_paths_env_value_preserves_path_entries() {
+        let paths = vec![PathBuf::from("/runtime/node"), PathBuf::from("/runtime/uv")];
+        let joined = runtime_tool_paths_env_value_from(&paths).expect("join tool paths");
+
+        assert_eq!(env::split_paths(&joined).collect::<Vec<_>>(), paths);
+    }
+
+    #[test]
     fn stopping_empty_service_state_is_ok() {
         let state = ServiceState::new();
 
@@ -1563,9 +1604,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn macos_bundled_tools_root_uses_app_resources_dir() {
-        let exe = Path::new(
-            "/Applications/Course Navigator.app/Contents/MacOS/Course Navigator",
-        );
+        let exe = Path::new("/Applications/Course Navigator.app/Contents/MacOS/Course Navigator");
 
         assert_eq!(
             bundled_tools_root_from_exe(exe, "darwin-arm64"),
@@ -1787,8 +1826,12 @@ mod tests {
         assert!(!media.purpose.contains("内置"));
         assert!(media.purpose.contains("读取视频信息"));
         assert!(ytdlp.purpose.contains("提取在线视频"));
-        assert!(dependencies.iter().all(|dependency| !dependency.purpose.contains("启动")));
-        assert!(dependencies.iter().all(|dependency| !dependency.purpose.contains("准备")));
+        assert!(dependencies
+            .iter()
+            .all(|dependency| !dependency.purpose.contains("启动")));
+        assert!(dependencies
+            .iter()
+            .all(|dependency| !dependency.purpose.contains("准备")));
     }
 
     #[test]

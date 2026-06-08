@@ -69,7 +69,22 @@ class CountingMetadataRunner(FakeRunner):
 
 
 def test_health_route(tmp_path):
-    client = make_client(tmp_path)
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            model_profiles=[
+                {
+                    "id": "asr",
+                    "name": "ASR",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "careful-asr-model",
+                    "api_key": "sk-asr",
+                }
+            ],
+            asr_model_id="asr",
+        ),
+    )
 
     response = client.get("/api/health")
 
@@ -1287,6 +1302,51 @@ def test_extract_job_can_force_asr_source_with_progress(tmp_path):
     assert item["transcript"][0]["text"] == "Forced ASR line."
 
 
+def test_running_extract_job_can_be_cancelled_before_saving_transcript(tmp_path):
+    started = Event()
+    release = Event()
+
+    class SlowAsrRunner(FakeRunner):
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise AssertionError("subtitle extraction should not run when ASR is forced")
+
+        def extract_asr(self, request, target_dir: Path, item_id: str, progress=None):
+            if progress:
+                progress(55, "正在本地 ASR 转写音频")
+            started.set()
+            assert release.wait(2)
+            if progress:
+                progress(65, "本地 ASR 正在整理字幕")
+            return [TranscriptSegment(start=0, end=3, text="Should not be saved.")]
+
+    client = make_client(tmp_path, runner=SlowAsrRunner())
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": "https://learn.deeplearning.ai/courses/example",
+            "mode": "normal",
+            "subtitle_source": "asr",
+        },
+    )
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "cancelling"
+
+    release.set()
+    payload = cancel_response.json()
+    for _ in range(30):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    assert client.get("/api/items/abc123").status_code == 404
+
+
 def test_extract_route_can_force_online_asr_source(tmp_path, monkeypatch):
     class OnlineAsrRunner(FakeRunner):
         subtitle_called = False
@@ -2030,6 +2090,47 @@ def test_translation_job_writes_translated_transcript(tmp_path, monkeypatch):
     assert captured["metadata"].description == "A course summary mentioning D-tail terminology."
 
 
+def test_running_translation_job_can_be_cancelled_before_saving_translation(tmp_path, monkeypatch):
+    started = Event()
+    release = Event()
+
+    def slow_translate(**kwargs):
+        kwargs["progress"]("translation", 25, "正在翻译字幕")
+        started.set()
+        assert release.wait(2)
+        kwargs["progress"]("translation", 50, "正在继续翻译字幕")
+        return [
+            TranscriptSegment(start=segment.start, end=segment.end, text=f"不应保存 {segment.text}")
+            for segment in kwargs["transcript"]
+        ]
+
+    monkeypatch.setattr("course_navigator.app.translate_transcript_material", slow_translate)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post("/api/items/abc123/translation-jobs", json={"output_language": "zh-CN"})
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "cancelling"
+
+    release.set()
+    payload = cancel_response.json()
+    for _ in range(30):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    assert (client.get("/api/items/abc123").json()["study"] or {}).get("translated_transcript", []) == []
+
+
 def test_incomplete_cached_translation_is_hidden_from_response(tmp_path, monkeypatch):
     def fake_translate(**kwargs):
         return [
@@ -2221,6 +2322,72 @@ def test_asr_correction_job_uses_selected_profile_and_exposes_suggestions(tmp_pa
     assert result.status_code == 200
     assert result.json()["suggestions"][0]["corrected_text"] == "Important D-tail."
     assert result.json()["suggestions"][0]["confidence"] == 0.91
+
+
+def test_running_asr_correction_job_can_be_cancelled_before_storing_result(tmp_path, monkeypatch):
+    started = Event()
+    release = Event()
+
+    def slow_suggest(**kwargs):
+        kwargs["progress"]("model", 40, "正在生成 ASR 校正建议")
+        started.set()
+        assert release.wait(2)
+        kwargs["progress"]("model", 60, "正在继续生成 ASR 校正建议")
+        return [
+            {
+                "segment_index": 1,
+                "original_text": "Important detail.",
+                "corrected_text": "Should not be stored.",
+                "confidence": 0.91,
+                "reason": "不应保存",
+                "evidence": None,
+                "source": "model",
+            }
+        ]
+
+    monkeypatch.setattr("course_navigator.app.suggest_asr_corrections", slow_suggest)
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            model_profiles=[
+                {
+                    "id": "asr",
+                    "name": "ASR",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "careful-asr-model",
+                    "api_key": "sk-asr",
+                }
+            ],
+            asr_model_id="asr",
+        ),
+    )
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/items/abc123/asr-correction-jobs",
+        json={"output_language": "zh-CN", "search": {"enabled": False}},
+    )
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "cancelling"
+
+    release.set()
+    payload = cancel_response.json()
+    for _ in range(30):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    assert client.get(f"/api/asr-correction-jobs/{job_id}/result").status_code == 404
 
 
 def test_asr_correction_job_uses_saved_search_credentials(tmp_path, monkeypatch):
@@ -2751,6 +2918,54 @@ def test_download_job_reports_progress_and_updates_local_video_path(tmp_path):
     assert payload["progress"] == 100
     item_response = client.get("/api/items/abc123")
     assert item_response.json()["local_video_path"].endswith("abc123.mp4")
+
+
+def test_running_download_job_can_be_cancelled_before_binding_cached_video(tmp_path):
+    started = Event()
+    release = Event()
+
+    class SlowDownloadRunner(FakeRunner):
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if progress:
+                progress(42, "正在缓存视频")
+            started.set()
+            assert release.wait(2)
+            if progress:
+                progress(60, "正在继续缓存视频")
+            path = target_dir / f"{item_id}.mp4"
+            path.write_text("video", encoding="utf-8")
+            return path
+
+    client = make_client(tmp_path, runner=SlowDownloadRunner())
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/items/abc123/download-jobs",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "cancelling"
+
+    release.set()
+    payload = cancel_response.json()
+    for _ in range(30):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    item_response = client.get("/api/items/abc123")
+    assert item_response.json()["local_video_path"] is None
+    assert not (tmp_path / "downloads" / "abc123.mp4").exists()
 
 
 def test_import_local_video_copies_file_to_workspace_downloads_and_creates_course_item(tmp_path):

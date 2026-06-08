@@ -12,6 +12,8 @@ from course_navigator.config import OnlineAsrServiceConfig, OnlineAsrSettings
 from course_navigator.models import DownloadRequest, ExtractRequest, VideoMetadata
 from course_navigator.online_asr import (
     _audio_chunks,
+    _audio_duration,
+    _compress_audio,
     _segments_from_payload,
     _transcribe_chunk,
     extract_online_asr_transcript,
@@ -19,9 +21,18 @@ from course_navigator.online_asr import (
 from course_navigator.ytdlp import (
     YtDlpError,
     YtDlpRunner,
+    _extract_audio_file,
     build_auth_args,
+    build_runtime_args,
     choose_source_subtitle_language,
 )
+
+
+def _fake_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
 
 def test_build_auth_args_for_normal_mode():
@@ -88,6 +99,24 @@ def test_cookie_file_mode_requires_path():
 
     with pytest.raises(ValueError, match="cookies_path"):
         build_auth_args(request)
+
+
+def test_runtime_args_enable_node_for_youtube_challenge_solver(monkeypatch, tmp_path):
+    runtime_node_dir = tmp_path / "runtime-tools" / "node"
+    executable_name = "node.exe" if sys.platform == "win32" else "node"
+    node = _fake_executable(runtime_node_dir / executable_name)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.setenv("COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS", str(runtime_node_dir))
+
+    args = build_runtime_args()
+
+    assert "--js-runtimes" in args
+    node_runtime = args[args.index("--js-runtimes") + 1]
+    assert node_runtime.startswith("node:")
+    assert Path(node_runtime.removeprefix("node:")).samefile(node)
+    assert "--remote-components" in args
+    assert args[args.index("--remote-components") + 1] == "ejs:github"
+    assert "--no-playlist" in args
 
 
 def test_default_ytdlp_runner_uses_current_python_module(monkeypatch):
@@ -261,7 +290,7 @@ def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(mo
 
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/whisper" if name == "whisper" else None)
+    monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/whisper" if name == "whisper" else None)
     monkeypatch.setattr(ytdlp_module, "_probe_video_file", lambda path: {"streams": [{"codec_type": "video"}]})
     monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
     runner = YtDlpRunner(binary="yt-dlp")
@@ -285,6 +314,8 @@ def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(mo
     yt_dlp_commands = [cmd for cmd in [*run_calls, *popen_calls] if cmd[0] == "yt-dlp"]
     assert len(yt_dlp_commands) == 4
     for cmd in yt_dlp_commands:
+        assert "--js-runtimes" in cmd
+        assert cmd[cmd.index("--js-runtimes") + 1].startswith("node")
         assert "--remote-components" in cmd
         assert cmd[cmd.index("--remote-components") + 1] == "ejs:github"
         assert "--no-playlist" in cmd
@@ -1238,6 +1269,29 @@ def test_probe_local_video_duration_returns_none_when_ffprobe_is_missing(monkeyp
     assert YtDlpRunner().probe_local_video_duration(source) is None
 
 
+def test_extract_audio_file_uses_runtime_tool_paths_for_ffmpeg(monkeypatch, tmp_path):
+    runtime_ffmpeg_dir = tmp_path / "runtime-tools" / "ffmpeg"
+    executable_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    _fake_executable(runtime_ffmpeg_dir / executable_name)
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+    calls = []
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        Path(cmd[-1]).write_text("audio", encoding="utf-8")
+        return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.setenv("COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS", str(runtime_ffmpeg_dir))
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    audio = _extract_audio_file(source, tmp_path, "abc")
+
+    assert audio == tmp_path / "abc.wav"
+    assert calls[0][0] == "ffmpeg"
+
+
 def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_path):
     calls = []
 
@@ -1262,7 +1316,7 @@ def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_pa
 
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/whisper" if name == "whisper" else None)
+    monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/whisper" if name == "whisper" else None)
     runner = YtDlpRunner(binary="yt-dlp")
     progress: list[int] = []
 
@@ -1278,6 +1332,47 @@ def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_pa
     assert max(progress) >= 90
 
 
+def test_extract_asr_finds_whisper_from_current_virtualenv_when_path_is_missing(monkeypatch, tmp_path):
+    calls = []
+    script_dir = tmp_path / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
+    script_dir.mkdir(parents=True)
+    python_name = "python.exe" if sys.platform == "win32" else "python"
+    whisper_name = "whisper.exe" if sys.platform == "win32" else "whisper"
+    python_path = script_dir / python_name
+    whisper_path = script_dir / whisper_name
+    python_path.write_text("", encoding="utf-8")
+    whisper_path.write_text("", encoding="utf-8")
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        Path(tmp_path, "abc.wav").write_text("audio", encoding="utf-8")
+        return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            calls.append(cmd)
+            Path(tmp_path, "abc.vtt").write_text(
+                "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi\n",
+                encoding="utf-8",
+            )
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    monkeypatch.setattr(sys, "executable", str(python_path))
+    monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+
+    runner = YtDlpRunner(binary="yt-dlp")
+    result = runner.extract_asr_from_file(tmp_path / "video.mp4", tmp_path, "abc")
+
+    assert result[0].text == "Hi"
+    assert Path(calls[-1][0]) == whisper_path
+
+
 def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypatch, tmp_path):
     calls = []
 
@@ -1290,7 +1385,7 @@ def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypat
         return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
 
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
     monkeypatch.setattr(
         "course_navigator.online_asr._transcribe_chunk",
         lambda provider, service, audio_path, language: {
@@ -1314,6 +1409,38 @@ def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypat
     assert "-b:a" in ffmpeg_cmd
     assert ffmpeg_cmd[ffmpeg_cmd.index("-b:a") + 1] == "64k"
     assert result[0].text == "online transcript"
+
+
+def test_online_asr_compress_audio_uses_runtime_tool_paths_for_ffmpeg(monkeypatch, tmp_path):
+    runtime_ffmpeg_dir = tmp_path / "runtime-tools" / "ffmpeg"
+    executable_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    _fake_executable(runtime_ffmpeg_dir / executable_name)
+    source = tmp_path / "source.wav"
+    source.write_text("audio", encoding="utf-8")
+    target = tmp_path / "target.mp3"
+    calls = []
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"mp3")
+        return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.setenv("COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS", str(runtime_ffmpeg_dir))
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert _compress_audio(source, target) == target
+    assert calls[0][0] == "ffmpeg"
+
+
+def test_online_asr_audio_duration_returns_zero_when_ffprobe_is_missing(monkeypatch, tmp_path):
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"mp3")
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.delenv("COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS", raising=False)
+    monkeypatch.setattr("course_navigator.processes.DEFAULT_TOOL_DIRS", ())
+
+    assert _audio_duration(audio) == 0.0
 
 
 def test_online_asr_retries_plain_browser_with_profile_when_login_required(monkeypatch, tmp_path):
@@ -1341,7 +1468,7 @@ def test_online_asr_retries_plain_browser_with_profile_when_login_required(monke
         return SuccessResult()
 
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
     monkeypatch.setattr(ytdlp_module, "_browser_cookie_profile_sources", lambda browser: [f"{browser}:Default"])
     monkeypatch.setattr(
         "course_navigator.online_asr._transcribe_chunk",
@@ -1381,7 +1508,7 @@ def test_online_asr_defaults_to_current_python_ytdlp_module(monkeypatch, tmp_pat
         return type("Result", (), {"returncode": 0, "stderr": "", "stdout": ""})()
 
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
     monkeypatch.setattr(
         "course_navigator.online_asr._transcribe_chunk",
         lambda provider, service, audio_path, language: {

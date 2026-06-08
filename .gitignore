@@ -1,5 +1,8 @@
 .DS_Store
 ._*
+*.swp
+*.swo
+*.swx
 DEVELOPMENT_LOG.md
 .env
 .env.*
