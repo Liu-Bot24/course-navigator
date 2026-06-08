@@ -85,7 +85,11 @@ from .ytdlp import YtDlpError, YtDlpRunner, is_subtitle_unavailable_error
 logger = logging.getLogger("course_navigator.app")
 
 
-class StudyJobCancelled(Exception):
+class JobCancelled(Exception):
+    """Raised inside job callbacks when the user cancels the current task."""
+
+
+class StudyJobCancelled(JobCancelled):
     """Raised inside study generation callbacks when the user cancels the job."""
 
 
@@ -165,7 +169,9 @@ def create_app(
     _backfill_local_video_items(library, active_workspace_dir, ytdlp_runner)
     jobs: dict[str, StudyJobStatus] = {}
     study_job_ids: set[str] = set()
-    cancelled_study_jobs: set[str] = set()
+    cancellable_job_ids: set[str] = set()
+    cancelled_job_ids: set[str] = set()
+    job_cancel_messages: dict[str, tuple[str, str]] = {}
     asr_results: dict[str, AsrCorrectionResult] = {}
     jobs_lock = Lock()
     asr_results_lock = Lock()
@@ -559,6 +565,8 @@ def create_app(
                 "study": item.study if keep_existing_study else None,
             }
         )
+        if progress:
+            progress("saving", 96, "正在保存字幕")
         library.save(next_item)
         _maybe_auto_cleanup_asr_cache(active_data_dir, settings_state["value"])
         return _normalize_item_for_response(next_item, active_workspace_dir)
@@ -727,6 +735,8 @@ def create_app(
         with jobs_lock:
             jobs[job_id] = job
             study_job_ids.add(job_id)
+            cancellable_job_ids.add(job_id)
+            job_cancel_messages[job_id] = ("学习地图生成已取消", "正在取消学习地图生成")
         output_language = request.output_language if request else "zh-CN"
         section = request.section if request else "all"
         detail_level = request.detail_level if request and request.detail_level else settings_state["value"].study_detail_level
@@ -754,6 +764,8 @@ def create_app(
         )
         with jobs_lock:
             jobs[job_id] = job
+            cancellable_job_ids.add(job_id)
+            job_cancel_messages[job_id] = ("字幕翻译已取消", "正在取消字幕翻译")
         output_language = request.output_language if request else "zh-CN"
         study_executor.submit(_run_translation_job, job_id, item_id, output_language)
         return job
@@ -779,6 +791,8 @@ def create_app(
         )
         with jobs_lock:
             jobs[job_id] = job
+            cancellable_job_ids.add(job_id)
+            job_cancel_messages[job_id] = ("视频缓存已取消", "正在取消视频缓存")
         download_executor.submit(_run_download_job, job_id, item_id, request)
         return job
 
@@ -805,6 +819,8 @@ def create_app(
         )
         with jobs_lock:
             jobs[job_id] = job
+            cancellable_job_ids.add(job_id)
+            job_cancel_messages[job_id] = ("字幕提取已取消", "正在取消字幕提取")
         extract_executor.submit(_run_extract_job, job_id, request)
         return job
 
@@ -836,6 +852,8 @@ def create_app(
         )
         with jobs_lock:
             jobs[job_id] = job
+            cancellable_job_ids.add(job_id)
+            job_cancel_messages[job_id] = ("ASR 校正已取消", "正在取消 ASR 校正")
         with asr_results_lock:
             asr_results.pop(job_id, None)
         study_executor.submit(_run_asr_correction_job, job_id, item_id, _validated_transcript(transcript), model_id, active_request)
@@ -855,18 +873,19 @@ def create_app(
             job = jobs.get(job_id)
             if not job:
                 raise HTTPException(status_code=404, detail="Study job not found")
-            if job_id not in study_job_ids:
-                raise HTTPException(status_code=400, detail="Only study map generation jobs can be cancelled")
+            if job_id not in cancellable_job_ids:
+                raise HTTPException(status_code=400, detail="This job cannot be cancelled")
             if job.status in {"succeeded", "failed", "cancelled"}:
                 return job
-            cancelled_study_jobs.add(job_id)
+            cancelled_job_ids.add(job_id)
             status: JobStatusValue = "cancelled" if job.status == "queued" else "cancelling"
+            cancelled_message, cancelling_message = job_cancel_messages.get(job_id, ("任务已取消", "正在取消任务"))
             next_job = job.model_copy(
                 update={
                     "status": status,
                     "progress": 100 if status == "cancelled" else job.progress,
                     "phase": "cancelled" if status == "cancelled" else "cancelling",
-                    "message": "学习地图生成已取消" if status == "cancelled" else "正在取消学习地图生成",
+                    "message": cancelled_message if status == "cancelled" else cancelling_message,
                     "error": None,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -1103,28 +1122,42 @@ def create_app(
             jobs[job_id] = next_job
             return next_job
 
-    def _study_job_cancel_requested(job_id: str) -> bool:
+    def _job_cancel_requested(job_id: str) -> bool:
         with jobs_lock:
             job = jobs.get(job_id)
-            return job_id in cancelled_study_jobs or bool(job and job.status in {"cancelling", "cancelled"})
+            return job_id in cancelled_job_ids or bool(job and job.status in {"cancelling", "cancelled"})
+
+    def _raise_if_job_cancelled(job_id: str) -> None:
+        if _job_cancel_requested(job_id):
+            raise JobCancelled("Job was cancelled")
+
+    def _finish_cancelled_job(job_id: str) -> None:
+        with jobs_lock:
+            cancelled_job_ids.discard(job_id)
+            cancelled_message = job_cancel_messages.get(job_id, ("任务已取消", "正在取消任务"))[0]
+        _set_job(
+            job_id,
+            status="cancelled",
+            progress=100,
+            phase="cancelled",
+            message=cancelled_message,
+            error=None,
+        )
+
+    def _study_job_cancel_requested(job_id: str) -> bool:
+        return _job_cancel_requested(job_id)
 
     def _raise_if_study_job_cancelled(job_id: str) -> None:
         if _study_job_cancel_requested(job_id):
             raise StudyJobCancelled("Study job was cancelled")
 
     def _finish_cancelled_study_job(job_id: str) -> None:
-        with jobs_lock:
-            cancelled_study_jobs.discard(job_id)
-        _set_job(
-            job_id,
-            status="cancelled",
-            progress=100,
-            phase="cancelled",
-            message="学习地图生成已取消",
-            error=None,
-        )
+        _finish_cancelled_job(job_id)
 
     def _run_extract_job(job_id: str, request: ExtractRequest) -> None:
+        if _job_cancel_requested(job_id):
+            _finish_cancelled_job(job_id)
+            return
         _set_job(
             job_id,
             status="running",
@@ -1134,6 +1167,7 @@ def create_app(
         )
 
         def update_progress(phase: str, progress: int, message: str) -> None:
+            _raise_if_job_cancelled(job_id)
             _set_job(
                 job_id,
                 status="running",
@@ -1147,6 +1181,7 @@ def create_app(
                 item = _extract_and_save_local_video_course(request, progress=update_progress)
             else:
                 item = _extract_and_save_course(request, progress=update_progress)
+            _raise_if_job_cancelled(job_id)
             _set_job(
                 job_id,
                 item_id=item.id,
@@ -1155,6 +1190,8 @@ def create_app(
                 phase="complete",
                 message="字幕已提取",
             )
+        except JobCancelled:
+            _finish_cancelled_job(job_id)
         except Exception as exc:
             logger.exception("Extract job failed: job_id=%s url=%s", job_id, request.url)
             _set_job(
@@ -1295,7 +1332,7 @@ def create_app(
         except Exception as exc:
             logger.exception("Study job failed: job_id=%s item_id=%s", job_id, item_id)
             with jobs_lock:
-                cancelled_study_jobs.discard(job_id)
+                cancelled_job_ids.discard(job_id)
             with deleted_items_lock:
                 item_deleted = item_id in deleted_items
             if not item_deleted:
@@ -1313,7 +1350,7 @@ def create_app(
             )
             return
         with jobs_lock:
-            cancelled_study_jobs.discard(job_id)
+            cancelled_job_ids.discard(job_id)
         _set_job(
             job_id,
             status="succeeded",
@@ -1323,6 +1360,9 @@ def create_app(
         )
 
     def _run_translation_job(job_id: str, item_id: str, output_language: str) -> None:
+        if _job_cancel_requested(job_id):
+            _finish_cancelled_job(job_id)
+            return
         _set_job(
             job_id,
             status="running",
@@ -1332,6 +1372,7 @@ def create_app(
         )
 
         def update_progress(phase: str, progress: int, message: str) -> None:
+            _raise_if_job_cancelled(job_id)
             _set_job(
                 job_id,
                 status="running",
@@ -1344,6 +1385,7 @@ def create_app(
         context_summary_state: dict[str, str | None] = {"value": None}
 
         def save_translated_title(title: str | None) -> None:
+            _raise_if_job_cancelled(job_id)
             if not title:
                 return
             translated_title_state["value"] = title
@@ -1359,6 +1401,7 @@ def create_app(
             library.save(item)
 
         def save_context_summary(summary: str) -> None:
+            _raise_if_job_cancelled(job_id)
             if not summary:
                 return
             context_summary_state["value"] = summary
@@ -1374,6 +1417,7 @@ def create_app(
             library.save(item)
 
         def save_partial_translation(segments) -> None:
+            _raise_if_job_cancelled(job_id)
             with deleted_items_lock:
                 if item_id in deleted_items:
                     return
@@ -1388,10 +1432,13 @@ def create_app(
             )
             library.save(item)
 
+        original_study: StudyMaterial | None = None
         try:
+            _raise_if_job_cancelled(job_id)
             item = library.get(item_id)
             if not item:
                 raise ValueError("Course item not found")
+            original_study = item.study.model_copy(deep=True) if item.study else None
             translated_title_state["value"] = item.study.translated_title if item.study else None
             context_summary_state["value"] = item.study.context_summary if item.study else None
             translated = translate_transcript_material(
@@ -1412,6 +1459,7 @@ def create_app(
             item = library.get(item_id)
             if not item:
                 raise ValueError("Course item not found")
+            _raise_if_job_cancelled(job_id)
             item.study = _study_with_translation(
                 item,
                 translated,
@@ -1419,6 +1467,16 @@ def create_app(
                 context_summary_state["value"],
             )
             library.save(item)
+        except JobCancelled:
+            with deleted_items_lock:
+                item_deleted = item_id in deleted_items
+            if not item_deleted:
+                cancelled_item = library.get(item_id)
+                if cancelled_item:
+                    cancelled_item.study = original_study
+                    library.save(cancelled_item)
+            _finish_cancelled_job(job_id)
+            return
         except Exception as exc:
             _set_job(
                 job_id,
@@ -1438,6 +1496,9 @@ def create_app(
         )
 
     def _run_download_job(job_id: str, item_id: str, request: DownloadRequest) -> None:
+        if _job_cancel_requested(job_id):
+            _finish_cancelled_job(job_id)
+            return
         _set_job(
             job_id,
             status="running",
@@ -1447,6 +1508,7 @@ def create_app(
         )
 
         def update_progress(progress: int, message: str) -> None:
+            _raise_if_job_cancelled(job_id)
             _set_job(
                 job_id,
                 status="running",
@@ -1466,6 +1528,7 @@ def create_app(
                 item_id,
                 progress=update_progress,
             )
+            _raise_if_job_cancelled(job_id)
             with deleted_items_lock:
                 if item_id in deleted_items:
                     _delete_download_path(active_workspace_dir, video_path)
@@ -1478,6 +1541,12 @@ def create_app(
             item.local_video_path = _workspace_relative_path(active_workspace_dir, video_path)
             item.video_source_type = "workspace"
             library.save(item)
+        except JobCancelled:
+            if video_path is not None:
+                _delete_download_path(active_workspace_dir, video_path)
+            _delete_download_files_for_item(active_workspace_dir, item_id)
+            _finish_cancelled_job(job_id)
+            return
         except Exception as exc:
             if video_path is not None:
                 _delete_download_path(active_workspace_dir, video_path)
@@ -1505,6 +1574,9 @@ def create_app(
         model_id: str,
         request: AsrCorrectionRequest,
     ) -> None:
+        if _job_cancel_requested(job_id):
+            _finish_cancelled_job(job_id)
+            return
         _set_job(
             job_id,
             status="running",
@@ -1514,6 +1586,7 @@ def create_app(
         )
 
         def update_progress(phase: str, progress: int, message: str) -> None:
+            _raise_if_job_cancelled(job_id)
             _set_job(
                 job_id,
                 status="running",
@@ -1523,6 +1596,7 @@ def create_app(
             )
 
         try:
+            _raise_if_job_cancelled(job_id)
             item = library.get(item_id)
             if not item:
                 raise ValueError("Course item not found")
@@ -1538,6 +1612,7 @@ def create_app(
                 output_language=request.output_language,
                 progress=update_progress,
             )
+            _raise_if_job_cancelled(job_id)
             update_progress("finalizing", 96, "正在整理校正建议和置信度")
             normalized = _coerce_asr_suggestions(suggestions, transcript)
             result = AsrCorrectionResult(
@@ -1550,6 +1625,11 @@ def create_app(
             )
             with asr_results_lock:
                 asr_results[job_id] = result
+        except JobCancelled:
+            with asr_results_lock:
+                asr_results.pop(job_id, None)
+            _finish_cancelled_job(job_id)
+            return
         except Exception as exc:
             _set_job(
                 job_id,

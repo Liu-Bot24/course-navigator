@@ -146,6 +146,18 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<LauncherStatus>("launcher-status-changed", (event) => {
+      setStatus(event.payload);
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
   async function refreshDependencies() {
     try {
       setDependencies(await checkDependencies());

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,20 +12,36 @@ DEFAULT_TOOL_DIRS = (
     Path("/opt/homebrew/bin"),
     Path("/usr/local/bin"),
 )
+RUNTIME_TOOL_PATHS_ENV = "COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS"
 
 
 def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
     merged = os.environ.copy() if env is None else dict(env)
     path = merged.get("PATH", "")
     path_parts = [part for part in path.split(os.pathsep) if part]
-    extra_paths = [
-        str(tool_dir)
-        for tool_dir in DEFAULT_TOOL_DIRS
-        if tool_dir.exists() and str(tool_dir) not in path_parts
-    ]
+    extra_paths = []
+    for tool_dir in _candidate_tool_dirs(merged):
+        tool_path = str(tool_dir)
+        if tool_dir.exists() and tool_path not in path_parts and tool_path not in extra_paths:
+            extra_paths.append(tool_path)
     if extra_paths:
         merged["PATH"] = os.pathsep.join([*extra_paths, *path_parts])
     return merged
+
+
+def _candidate_tool_dirs(env: dict[str, str]) -> list[Path]:
+    runtime_paths = [
+        Path(part)
+        for part in env.get(RUNTIME_TOOL_PATHS_ENV, "").split(os.pathsep)
+        if part
+    ]
+    return [*runtime_paths, *DEFAULT_TOOL_DIRS]
+
+
+def resolve_tool(name: str, env: dict[str, str] | None = None) -> Path | None:
+    merged = _subprocess_env(env)
+    resolved = shutil.which(name, path=merged.get("PATH", ""))
+    return Path(resolved) if resolved else None
 
 
 def _hidden_windows_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:

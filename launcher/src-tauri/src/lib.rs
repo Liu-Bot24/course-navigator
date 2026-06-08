@@ -16,6 +16,7 @@ use tauri::{
 use tauri::{ActivationPolicy, RunEvent};
 
 const TRAY_ID: &str = "course-navigator-tray";
+const LAUNCHER_STATUS_EVENT: &str = "launcher-status-changed";
 const MAIN_WINDOW_WIDTH: f64 = 1000.0;
 const MAIN_WINDOW_HEIGHT: f64 = 800.0;
 const MAIN_WINDOW_MIN_WIDTH: f64 = 900.0;
@@ -83,11 +84,18 @@ fn start_services(
     app: tauri::AppHandle,
     state: tauri::State<'_, runtime::ServiceState>,
 ) -> LauncherStatus {
-    let (config, port_messages) = start_config_with_available_ports(&app);
+    start_services_from_app(&app, state.inner())
+}
+
+fn start_services_from_app(
+    app: &tauri::AppHandle,
+    state: &runtime::ServiceState,
+) -> LauncherStatus {
+    let (config, port_messages) = start_config_with_available_ports(app);
     let api_url = format!("http://{}:{}", config.api_host, config.api_port);
     let web_url = format!("http://{}:{}", config.web_host, config.web_port);
     let existing_services_ready = runtime::configured_services_listening(&config);
-    let status = match runtime::start_project_services(state.inner(), &config) {
+    let status = match runtime::start_project_services(state, &config) {
         Ok(()) => {
             if config.open_browser_on_start {
                 let _ = open::that(&web_url);
@@ -112,7 +120,7 @@ fn start_services(
             message: error,
         },
     };
-    let _ = refresh_tray_menu(&app);
+    let _ = refresh_tray_menu(app);
     status
 }
 
@@ -121,10 +129,22 @@ fn stop_services(
     app: tauri::AppHandle,
     state: tauri::State<'_, runtime::ServiceState>,
 ) -> LauncherStatus {
+    stop_services_from_app(&app, state.inner())
+}
+
+fn stop_services_from_app(app: &tauri::AppHandle, state: &runtime::ServiceState) -> LauncherStatus {
     let config = get_config();
+    stop_services_with_config(app, state, &config)
+}
+
+fn stop_services_with_config(
+    app: &tauri::AppHandle,
+    state: &runtime::ServiceState,
+    config: &LauncherConfig,
+) -> LauncherStatus {
     let api_url = format!("http://{}:{}", config.api_host, config.api_port);
     let web_url = format!("http://{}:{}", config.web_host, config.web_port);
-    let status = match runtime::stop_configured_services(state.inner(), &config) {
+    let status = match runtime::stop_configured_services(state, config) {
         Ok(stopped_any) => LauncherStatus {
             state: "stopped".to_string(),
             api_url,
@@ -142,8 +162,22 @@ fn stop_services(
             message: error,
         },
     };
-    let _ = refresh_tray_menu(&app);
+    let _ = refresh_tray_menu(app);
     status
+}
+
+fn service_state_unavailable_status() -> LauncherStatus {
+    let config = get_config();
+    LauncherStatus {
+        state: "failed".to_string(),
+        api_url: format!("http://{}:{}", config.api_host, config.api_port),
+        web_url: format!("http://{}:{}", config.web_host, config.web_port),
+        message: "无法读取启动器服务状态，请打开主窗口重试。".to_string(),
+    }
+}
+
+fn emit_launcher_status(app: &tauri::AppHandle, status: &LauncherStatus) {
+    let _ = app.emit(LAUNCHER_STATUS_EVENT, status);
 }
 
 #[tauri::command]
@@ -221,24 +255,18 @@ pub fn run() {
                             open::that(format!("http://{}:{}", config.web_host, config.web_port));
                     }
                     "start" => {
-                        let (config, _) = start_config_with_available_ports(app);
-                        if let Some(state) = app.try_state::<runtime::ServiceState>() {
-                            let started = runtime::start_project_services(state.inner(), &config);
-                            if started.is_ok() && config.open_browser_on_start {
-                                let _ = open::that(format!(
-                                    "http://{}:{}",
-                                    config.web_host, config.web_port
-                                ));
-                            }
-                        }
-                        let _ = refresh_tray_menu(app);
+                        let status = app
+                            .try_state::<runtime::ServiceState>()
+                            .map(|state| start_services_from_app(app, state.inner()))
+                            .unwrap_or_else(service_state_unavailable_status);
+                        emit_launcher_status(app, &status);
                     }
                     "stop" => {
-                        let config = config::load_config();
-                        if let Some(state) = app.try_state::<runtime::ServiceState>() {
-                            let _ = runtime::stop_configured_services(state.inner(), &config);
-                        }
-                        let _ = refresh_tray_menu(app);
+                        let status = app
+                            .try_state::<runtime::ServiceState>()
+                            .map(|state| stop_services_from_app(app, state.inner()))
+                            .unwrap_or_else(service_state_unavailable_status);
+                        emit_launcher_status(app, &status);
                     }
                     "quit" => {
                         stop_configured_from_app(app);
@@ -258,10 +286,7 @@ pub fn run() {
                     "asr_cache:auto_cleanup" => {
                         let config = config::load_config();
                         let status = asr_cache::load_status(&config);
-                        let _ = asr_cache::set_auto_cleanup(
-                            &config,
-                            !status.auto_cleanup_enabled,
-                        );
+                        let _ = asr_cache::set_auto_cleanup(&config, !status.auto_cleanup_enabled);
                         let _ = refresh_tray_menu(app);
                     }
                     _ => {}
@@ -336,7 +361,7 @@ fn platform_tray_icon() -> Image<'static> {
 fn stop_configured_from_app(app: &tauri::AppHandle) {
     let config = config::load_config();
     if let Some(state) = app.try_state::<runtime::ServiceState>() {
-        let _ = runtime::stop_configured_services(state.inner(), &config);
+        let _ = stop_services_with_config(app, state.inner(), &config);
     }
 }
 
@@ -435,8 +460,7 @@ fn build_asr_auto_cleanup_submenu(
 ) -> tauri::Result<Submenu<tauri::Wry>> {
     let status = asr_cache::load_status(config);
     let cleanup_menu = Submenu::with_id(app, "asr_cache:auto", "自动清理", true)?;
-    let cleanup_now =
-        MenuItem::with_id(app, "asr_cache:cleanup", "立即清理", true, None::<&str>)?;
+    let cleanup_now = MenuItem::with_id(app, "asr_cache:cleanup", "立即清理", true, None::<&str>)?;
     let auto_cleanup = CheckMenuItem::with_id(
         app,
         "asr_cache:auto_cleanup",

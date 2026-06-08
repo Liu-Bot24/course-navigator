@@ -55,9 +55,12 @@ describe("Tauri app shell", () => {
     expect(config.bundle.windows?.nsis?.installerHooks).toBe("windows/installer-hooks.nsh");
   });
 
-  it("lets the Windows installer use Chinese or English instead of falling back to English only", () => {
+  it("always shows the Windows installer language selector for Chinese or English", async () => {
+    const hooks = await readFile(resolve(testDir, "../src-tauri/windows/installer-hooks.nsh"), "utf-8");
+
     expect(config.bundle.windows?.nsis?.languages).toEqual(["English", "SimpChinese", "TradChinese"]);
     expect(config.bundle.windows?.nsis?.displayLanguageSelector).toBe(true);
+    expect(hooks).toContain("MUI_LANGDLL_ALWAYSSHOW");
   });
 
   it("uses the macOS template tray icon only on macOS and the product icon elsewhere", async () => {
@@ -92,11 +95,23 @@ describe("Tauri app shell", () => {
     });
   });
 
+  it("declares the local Whisper runtime dependency used by local ASR", async () => {
+    const pyproject = await readFile(resolve(testDir, "../../pyproject.toml"), "utf-8");
+
+    expect(pyproject).toMatch(/"openai-whisper[>=<~!0-9., ]*"/);
+  });
+
   it("uses a cross-platform runtime source preparation script for app bundles", async () => {
     const packageJson = JSON.parse(await readFile(resolve(testDir, "../package.json"), "utf-8"));
 
     expect(packageJson.scripts["prepare:runtime"]).toBe("node ../scripts/prepare-runtime-source.mjs");
     expect(packageJson.scripts["tauri:build:windows"]).toContain("tauri build --bundles nsis");
+  });
+
+  it("does not keep the deprecated mac-only runtime preparation entry point", async () => {
+    await expect(readFile(resolve(testDir, "../../scripts/prepare-mac-runtime-source.sh"), "utf-8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("keeps Windows releases and spawned runtime commands from opening console windows", async () => {
@@ -118,12 +133,22 @@ describe("Tauri app shell", () => {
     expect(prepareScript).toContain("uv-x86_64-pc-windows-msvc");
     expect(prepareScript).not.toContain("yt-dlp.exe");
     expect(prepareScript).toContain("ffmpeg-release-essentials");
+    expect(prepareScript).toContain("COURSE_NAVIGATOR_WINDOWS_FFMPEG_ARCHIVE");
     expect(prepareScript).toContain("ffprobe.exe");
+    expect(prepareScript).not.toContain("Expand-Archive");
     expect(runtimeSource).toContain("bundled_tool_program");
     expect(runtimeSource).toContain("runtime-tools");
     expect(runtimeSource).toContain("prepend_bundled_tool_paths");
     expect(runtimeSource).not.toContain('"ytdlp"');
     expect(runtimeSource).toContain('"ffmpeg"');
+  });
+
+  it("passes bundled runtime tool paths to spawned backend processes", async () => {
+    const runtimeSource = await import("../src-tauri/src/runtime.rs?raw").then((module) => module.default as string);
+
+    expect(runtimeSource).toContain('const RUNTIME_TOOL_PATHS_ENV: &str = "COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS"');
+    expect(runtimeSource).toContain("runtime_tool_paths_env_value()");
+    expect(runtimeSource).toContain("command.env(RUNTIME_TOOL_PATHS_ENV, tool_paths)");
   });
 
   it("bundles macOS runtime tools for direct DMG installs", async () => {
@@ -147,6 +172,18 @@ describe("Tauri app shell", () => {
     expect(runtimeSource).toContain("Resources");
   });
 
+  it("pins portable runtime tool versions instead of resolving moving latest releases", async () => {
+    const prepareScript = await readFile(resolve(testDir, "../../scripts/prepare-runtime-source.mjs"), "utf-8");
+
+    expect(prepareScript).toContain('const DEFAULT_NODE_VERSION = "v24.16.0"');
+    expect(prepareScript).toContain('const DEFAULT_UV_VERSION = "0.11.19"');
+    expect(prepareScript).toContain("COURSE_NAVIGATOR_WINDOWS_NODE_VERSION || DEFAULT_NODE_VERSION");
+    expect(prepareScript).toContain("COURSE_NAVIGATOR_MAC_NODE_VERSION || DEFAULT_NODE_VERSION");
+    expect(prepareScript).toContain("releases/download/${uvVersion}");
+    expect(prepareScript).not.toContain("releases/latest/download");
+    expect(prepareScript).not.toContain("latestNodeLtsVersion");
+  });
+
   it("sizes the macOS DMG from the built app instead of a fixed capacity", async () => {
     const dmgScript = await readFile(resolve(testDir, "../../scripts/build-mac-dmg.sh"), "utf-8");
 
@@ -154,6 +191,19 @@ describe("Tauri app shell", () => {
     expect(dmgScript).toContain("DMG_SIZE_MB");
     expect(dmgScript).toContain('-size "${DMG_SIZE_MB}m"');
     expect(dmgScript).not.toContain("-size 160m");
+  });
+
+  it("removes local packaging metadata before signing the macOS app", async () => {
+    const dmgScript = await readFile(resolve(testDir, "../../scripts/build-mac-dmg.sh"), "utf-8");
+    const cleanupIndex = dmgScript.indexOf('remove_packaging_junk "$APP_PATH/Contents/Resources"');
+    const codesignIndex = dmgScript.indexOf("codesign --force --deep --sign");
+
+    expect(dmgScript).toContain("remove_packaging_junk()");
+    expect(dmgScript).toContain('-name ".DS_Store"');
+    expect(dmgScript).toContain('-name "._*"');
+    expect(dmgScript).toContain('-name "*.swp"');
+    expect(cleanupIndex).toBeGreaterThanOrEqual(0);
+    expect(codesignIndex).toBeGreaterThan(cleanupIndex);
   });
 
   it("does not force Homebrew formula dependencies for the self-contained macOS app", async () => {
@@ -172,6 +222,11 @@ describe("Tauri app shell", () => {
     expect(prepareScript).toContain('"DEVELOPMENT_LOG.md"');
     expect(prepareScript).toContain('".internal-docs"');
     expect(prepareScript).toContain('"output"');
+    expect(prepareScript).toContain("isLocalPackagingJunk");
+    expect(prepareScript).toContain('name === ".DS_Store"');
+    expect(prepareScript).toContain('name.startsWith("._")');
+    expect(prepareScript).toContain('name.endsWith(".swp")');
+    expect(prepareScript).toContain("purgeLocalPackagingJunk(resourceDir)");
   });
 
   it("uses a compact default main window that can fit the full launcher", () => {
@@ -203,9 +258,24 @@ describe("Tauri app shell", () => {
   it("does not open the browser from the tray when service startup fails", async () => {
     const libSource = await import("../src-tauri/src/lib.rs?raw").then((module) => module.default as string);
 
-    expect(libSource).toContain("let started = runtime::start_project_services");
-    expect(libSource).toContain("if started.is_ok() && config.open_browser_on_start");
+    const startHelperStart = libSource.indexOf("fn start_services_from_app");
+    const startHelperEnd = libSource.indexOf("#[tauri::command]", startHelperStart);
+    const startHelper = libSource.slice(startHelperStart, startHelperEnd);
+    expect(startHelper).toContain("match runtime::start_project_services");
+    expect(startHelper).toContain("Ok(()) =>");
+    expect(startHelper).toContain("if config.open_browser_on_start");
     expect(libSource).not.toContain("let _ = runtime::start_project_services(state.inner(), &config);");
+  });
+
+  it("does not swallow tray stop results", async () => {
+    const libSource = await import("../src-tauri/src/lib.rs?raw").then((module) => module.default as string);
+    const stopHandlerStart = libSource.indexOf('"stop" => {');
+    const stopHandlerEnd = libSource.indexOf('"quit" => {', stopHandlerStart);
+    const stopHandler = libSource.slice(stopHandlerStart, stopHandlerEnd);
+
+    expect(stopHandler).toContain("stop_services_from_app(app, state.inner())");
+    expect(stopHandler).toContain("emit_launcher_status");
+    expect(stopHandler).not.toContain("let _ = runtime::stop_configured_services");
   });
 
   it("keeps ASR correction under LLM models and online ASR as a direct ASR menu", async () => {

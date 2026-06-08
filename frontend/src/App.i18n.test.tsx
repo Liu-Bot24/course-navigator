@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bindVideoSource,
   bindVideoSourceFromPicker,
+  cancelJob,
   cancelStudyJob,
   deleteLocalVideo,
   extractCourse,
@@ -29,6 +30,7 @@ import {
   startExtractJob,
   startDownloadJob,
   startStudyJob,
+  startTranslationJob,
   updateCourseItem,
 } from "./api";
 import { App } from "./App";
@@ -47,6 +49,7 @@ vi.mock("./api", () => ({
   }),
   bindVideoSource: vi.fn(),
   bindVideoSourceFromPicker: vi.fn(),
+  cancelJob: vi.fn(),
   cancelStudyJob: vi.fn(),
   deleteCourse: vi.fn(),
   deleteLocalVideo: vi.fn(),
@@ -925,6 +928,85 @@ describe("App language defaults", () => {
     expect(extractCourse).not.toHaveBeenCalled();
   });
 
+  it("shows a cancel action only after subtitle extraction reaches ASR work", async () => {
+    const localItem = {
+      id: "local-video",
+      source_url: "local-video://local-video",
+      title: "Local Video",
+      duration: 67.5,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: "downloads/local-video.mp4",
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([localItem]);
+    vi.mocked(startExtractJob).mockResolvedValueOnce({
+      job_id: "extract-asr-job",
+      item_id: "local-video",
+      status: "running",
+      progress: 55,
+      phase: "asr",
+      message: "正在本地 ASR 转写音频",
+      error: null,
+    });
+    vi.mocked(cancelJob).mockResolvedValueOnce({
+      job_id: "extract-asr-job",
+      item_id: "local-video",
+      status: "cancelling",
+      progress: 55,
+      phase: "cancelling",
+      message: "正在取消字幕提取",
+      error: null,
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "获取字幕" })).toBeTruthy();
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "字幕来源" }), { target: { value: "asr" } });
+    fireEvent.click(screen.getByRole("button", { name: "获取字幕" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "停止字幕提取" }));
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("extract-asr-job"));
+  });
+
+  it("does not show a cancel action while extraction is only fetching source subtitles", async () => {
+    const localItem = {
+      id: "local-video",
+      source_url: "local-video://local-video",
+      title: "Local Video",
+      duration: 67.5,
+      created_at: new Date().toISOString(),
+      transcript: [],
+      metadata: null,
+      study: null,
+      local_video_path: "downloads/local-video.mp4",
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([localItem]);
+    vi.mocked(startExtractJob).mockResolvedValueOnce({
+      job_id: "extract-subtitles-job",
+      item_id: "local-video",
+      status: "running",
+      progress: 15,
+      phase: "subtitles",
+      message: "正在下载站方字幕",
+      error: null,
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "获取字幕" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "获取字幕" }));
+
+    const statusText = await screen.findByText("正在下载站方字幕 15%");
+    expect(statusText.closest(".status-strip")?.className).toBe("status-strip");
+    expect(screen.queryByRole("button", { name: "停止字幕提取" })).toBeNull();
+  });
+
   it("supports keyboard review shortcuts for ASR suggestions", async () => {
     const item: CourseItem = {
       id: "asr-lesson",
@@ -1018,6 +1100,58 @@ describe("App language defaults", () => {
       expect(screen.getByText("待处理 1 · 已接受 1 · 已拒绝 0")).toBeTruthy();
     });
     expect(screen.getByText("1/1")).toBeTruthy();
+  });
+
+  it("shows a cancel action while ASR correction suggestions are being generated", async () => {
+    const item: CourseItem = {
+      id: "asr-lesson",
+      source_url: "https://example.com/asr-lesson",
+      title: "ASR Lesson",
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [
+        { start: 0, end: 2, text: "我是林毅" },
+        { start: 2, end: 4, text: "Deep Seek V4 很强" },
+      ],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveAsrSearchSettings).mockResolvedValue({
+      enabled: false,
+      provider: "tavily",
+      result_limit: 5,
+      tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
+      firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
+    });
+    vi.mocked(startAsrCorrectionJob).mockResolvedValueOnce({
+      job_id: "asr-job",
+      item_id: "asr-lesson",
+      status: "running",
+      progress: 40,
+      phase: "model",
+      message: "正在生成 ASR 校正建议",
+      error: null,
+    });
+    vi.mocked(cancelJob).mockResolvedValueOnce({
+      job_id: "asr-job",
+      item_id: "asr-lesson",
+      status: "cancelling",
+      progress: 40,
+      phase: "cancelling",
+      message: "正在取消 ASR 校正",
+      error: null,
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getAllByText("ASR Lesson").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "ASR 校正" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成校正建议" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止 ASR 校正" }));
+
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("asr-job"));
   });
 
   it("does not embed Bilibili by default and offers force streaming", async () => {
@@ -1350,6 +1484,86 @@ describe("App language defaults", () => {
         }),
       );
     });
+  });
+
+  it("shows a cancel action while caching video", async () => {
+    const item = {
+      id: "cache-lesson",
+      source_url: "https://example.com/video",
+      title: "Cache Lesson",
+      duration: 120,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "Opening" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(startDownloadJob).mockResolvedValueOnce({
+      job_id: "download-job",
+      item_id: "cache-lesson",
+      status: "running",
+      progress: 42,
+      phase: "download",
+      message: "正在缓存视频",
+      error: null,
+    });
+    vi.mocked(cancelJob).mockResolvedValueOnce({
+      job_id: "download-job",
+      item_id: "cache-lesson",
+      status: "cancelling",
+      progress: 42,
+      phase: "cancelling",
+      message: "正在取消视频缓存",
+      error: null,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "缓存" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止缓存视频" }));
+
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("download-job"));
+  });
+
+  it("shows a cancel action while translating subtitles", async () => {
+    const item = {
+      id: "translation-lesson",
+      source_url: "https://example.com/video",
+      title: "Translation Lesson",
+      duration: 120,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "Opening" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(startTranslationJob).mockResolvedValueOnce({
+      job_id: "translation-job",
+      item_id: "translation-lesson",
+      status: "running",
+      progress: 25,
+      phase: "translation",
+      message: "正在翻译字幕",
+      error: null,
+    });
+    vi.mocked(cancelJob).mockResolvedValueOnce({
+      job_id: "translation-job",
+      item_id: "translation-lesson",
+      status: "cancelling",
+      progress: 25,
+      phase: "cancelling",
+      message: "正在取消字幕翻译",
+      error: null,
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "翻译字幕" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止翻译字幕" }));
+
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("translation-job"));
   });
 
   it("keeps the top-right fullscreen control available after entering shell fullscreen", async () => {
@@ -2232,7 +2446,7 @@ describe("App language defaults", () => {
     vi.mocked(listItems).mockReset();
     vi.mocked(startStudyJob).mockReset();
     vi.mocked(getStudyJob).mockReset();
-    vi.mocked(cancelStudyJob).mockReset();
+    vi.mocked(cancelJob).mockReset();
     const lesson = studyQueueCourse("lesson-a", "Lesson A");
     vi.mocked(listItems).mockResolvedValue([lesson]);
     vi.mocked(startStudyJob).mockResolvedValue({
@@ -2244,7 +2458,7 @@ describe("App language defaults", () => {
       message: "正在生成学习块 1/58",
       error: null,
     });
-    vi.mocked(cancelStudyJob).mockResolvedValue({
+    vi.mocked(cancelJob).mockResolvedValue({
       job_id: "lesson-a-all",
       item_id: "lesson-a",
       status: "cancelled",
@@ -2271,7 +2485,7 @@ describe("App language defaults", () => {
     const stopButton = await screen.findByRole("button", { name: "停止生成学习地图" });
     fireEvent.click(stopButton);
 
-    await waitFor(() => expect(cancelStudyJob).toHaveBeenCalledWith("lesson-a-all"));
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("lesson-a-all"));
   });
 
   it("queues study rebuild clicks across courses and sections in click order", async () => {

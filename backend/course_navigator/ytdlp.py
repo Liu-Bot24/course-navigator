@@ -13,7 +13,7 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .models import DownloadRequest, ExtractRequest, TranscriptSegment, VideoMetadata
-from .processes import popen_hidden, run_hidden
+from .processes import popen_hidden, resolve_tool, run_hidden
 from .subtitles import parse_subtitle_text
 
 try:
@@ -41,7 +41,12 @@ YTDLP_RUNTIME_ARGS = ("--remote-components", "ejs:github", "--no-playlist")
 
 
 def build_runtime_args() -> list[str]:
-    return list(YTDLP_RUNTIME_ARGS)
+    return ["--js-runtimes", _node_js_runtime(), *YTDLP_RUNTIME_ARGS]
+
+
+def _node_js_runtime() -> str:
+    node = resolve_tool("node")
+    return f"node:{node}" if node else "node"
 
 
 def build_auth_args(request: ExtractRequest | DownloadRequest) -> list[str]:
@@ -198,12 +203,16 @@ class YtDlpRunner:
             text=True,
         )
         output_lines: list[str] = []
-        if process.stdout:
-            for line in process.stdout:
-                output_lines.append(line)
-                percent = _download_percent(line)
-                if percent is not None and progress:
-                    progress(max(1, min(95, percent)), "正在缓存视频")
+        try:
+            if process.stdout:
+                for line in process.stdout:
+                    output_lines.append(line)
+                    percent = _download_percent(line)
+                    if percent is not None and progress:
+                        progress(max(1, min(95, percent)), "正在缓存视频")
+        except BaseException:
+            _terminate_process(process)
+            raise
         returncode = process.wait()
         output = "".join(output_lines).strip()
         if returncode != 0:
@@ -731,7 +740,7 @@ def _find_newest_audio(target_dir: Path, item_id: str) -> Path | None:
 
 def _extract_audio_file(video_path: Path, target_dir: Path, item_id: str) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
-    if not shutil.which("ffmpeg"):
+    if not resolve_tool("ffmpeg"):
         raise YtDlpError("本地视频 ASR 需要 ffmpeg 来抽取音频")
     audio_file = target_dir / f"{item_id}.wav"
     cmd = [
@@ -758,13 +767,12 @@ def _run_whisper_asr(
     language: str = "auto",
     progress: Callable[[int, str], None] | None = None,
 ) -> list[TranscriptSegment]:
-    whisper_binary = "whisper"
-    resolved_whisper = shutil.which(whisper_binary)
+    resolved_whisper = _resolve_whisper_binary()
     if not resolved_whisper:
-        raise YtDlpError("Local ASR requires the whisper command, but it was not found in PATH")
+        raise YtDlpError("Local ASR requires openai-whisper, but the whisper command was not found")
 
     asr_cmd = [
-        resolved_whisper,
+        str(resolved_whisper),
         str(audio_file),
         "--model",
         "base",
@@ -786,9 +794,13 @@ def _run_whisper_asr(
             stdout, stderr = asr_process.communicate(timeout=2)
             break
         except subprocess.TimeoutExpired:
-            if progress:
-                elapsed = time.monotonic() - started_at
-                progress(min(88, 40 + int(elapsed * 1.8)), f"本地 ASR 正在转写音频，已用时 {int(elapsed)}s")
+            try:
+                if progress:
+                    elapsed = time.monotonic() - started_at
+                    progress(min(88, 40 + int(elapsed * 1.8)), f"本地 ASR 正在转写音频，已用时 {int(elapsed)}s")
+            except BaseException:
+                _terminate_process(asr_process)
+                raise
     if asr_process.returncode != 0:
         raise YtDlpError(stderr.strip() or stdout.strip() or "Local ASR failed")
     if progress:
@@ -801,6 +813,54 @@ def _run_whisper_asr(
         subtitle_file.read_text(encoding="utf-8", errors="replace"),
         subtitle_file.suffix.lstrip("."),
     ))
+
+
+def _resolve_whisper_binary() -> Path | None:
+    configured = os.getenv("COURSE_NAVIGATOR_WHISPER_BINARY", "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if configured_path.exists():
+            return configured_path
+        resolved_configured = shutil.which(configured)
+        if resolved_configured:
+            return Path(resolved_configured)
+
+    resolved = shutil.which("whisper")
+    if resolved:
+        return Path(resolved)
+
+    for scripts_dir in _python_script_dirs():
+        for executable_name in _whisper_executable_names():
+            candidate = scripts_dir / executable_name
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def _python_script_dirs() -> list[Path]:
+    executable_dir = Path(sys.executable).resolve().parent
+    dirs = [
+        executable_dir,
+        executable_dir.parent / "bin",
+        executable_dir.parent / "Scripts",
+        Path.cwd() / ".venv" / "bin",
+        Path.cwd() / ".venv" / "Scripts",
+    ]
+    unique_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for path in dirs:
+        normalized = path.resolve() if path.exists() else path
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_dirs.append(path)
+    return unique_dirs
+
+
+def _whisper_executable_names() -> tuple[str, ...]:
+    if sys.platform == "win32":
+        return ("whisper.exe", "whisper.cmd", "whisper.bat", "whisper")
+    return ("whisper",)
 
 
 def _media_duration(path: Path) -> float:
@@ -824,6 +884,17 @@ def _media_duration(path: Path) -> float:
         return float(result.stdout.strip())
     except ValueError:
         return 0.0
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def _whisper_language(language: str) -> str:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -12,7 +11,7 @@ import httpx
 
 from .config import OnlineAsrServiceConfig, OnlineAsrSettings
 from .models import DownloadRequest, ExtractRequest, OnlineAsrProvider, TranscriptSegment
-from .processes import run_hidden
+from .processes import resolve_tool, run_hidden
 from .subtitles import parse_subtitle_text
 from .ytdlp import YtDlpError, _friendly_error, _run_with_browser_cookie_retry, build_auth_args, build_runtime_args
 
@@ -93,7 +92,7 @@ def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_d
 
 
 def _extract_audio_from_file(source_video_path: Path, target_dir: Path, item_id: str) -> Path:
-    if not shutil.which("ffmpeg"):
+    if not resolve_tool("ffmpeg"):
         raise YtDlpError("在线 ASR 需要 ffmpeg 来抽取并压缩音频")
     target = target_dir / f"{item_id}.online-source.wav"
     cmd = [
@@ -115,7 +114,7 @@ def _extract_audio_from_file(source_video_path: Path, target_dir: Path, item_id:
 
 
 def _compress_audio(source: Path, target: Path) -> Path:
-    if not shutil.which("ffmpeg"):
+    if not resolve_tool("ffmpeg"):
         raise YtDlpError("在线 ASR 需要 ffmpeg 来抽取并压缩音频")
     cmd = [
         "ffmpeg",
@@ -178,6 +177,8 @@ def _audio_chunks(audio_path: Path, item_id: str, target_dir: Path, limit_bytes:
 
 
 def _audio_duration(audio_path: Path) -> float:
+    if not resolve_tool("ffprobe"):
+        return 0.0
     cmd = [
         "ffprobe",
         "-v",
@@ -188,7 +189,10 @@ def _audio_duration(audio_path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(audio_path),
     ]
-    result = run_hidden(cmd, capture_output=True, text=True, check=False)
+    try:
+        result = run_hidden(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return 0.0
     if result.returncode != 0:
         return 0.0
     try:

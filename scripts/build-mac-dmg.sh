@@ -148,12 +148,29 @@ end tell
 APPLESCRIPT
 }
 
+remove_packaging_junk() {
+  local target="$1"
+  if [[ ! -e "$target" ]]; then
+    return
+  fi
+  find "$target" \( \
+    -name ".DS_Store" -o \
+    -name "._*" -o \
+    -name "*.swp" -o \
+    -name "*.swo" -o \
+    -name "*.swx" \
+  \) -exec rm -rf {} +
+}
+
 npm --prefix "$ROOT_DIR/launcher" run tauri:build
 
 if [[ ! -d "$APP_PATH" ]]; then
   echo "Missing built app: $APP_PATH" >&2
   exit 1
 fi
+
+remove_packaging_junk "$ROOT_DIR/launcher/src-tauri/resources"
+remove_packaging_junk "$APP_PATH/Contents/Resources"
 
 if command -v codesign >/dev/null 2>&1; then
   codesign --force --deep --sign - "$APP_PATH"
