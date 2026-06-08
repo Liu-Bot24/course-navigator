@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from time import sleep
 from typing import Callable, Literal
 
 import httpx
@@ -20,6 +23,16 @@ from .models import (
     TimeRange,
     TranscriptSegment,
     VideoMetadata,
+)
+
+logger = logging.getLogger("course_navigator.ai")
+
+TRANSIENT_LLM_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+TRANSIENT_LLM_EXCEPTIONS = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
 )
 
 
@@ -385,7 +398,7 @@ def _chat_text(
             for message in messages
             if message["role"] != "system"
         ]
-        response = httpx.post(
+        response = _post_llm_with_retries(
             _anthropic_endpoint_url(base_url, "messages"),
             headers={
                 "x-api-key": provider.api_key,
@@ -400,8 +413,9 @@ def _chat_text(
                 "max_tokens": effective_max_tokens,
             },
             timeout=timeout,
+            provider=provider,
+            task_key=task_key,
         )
-        response.raise_for_status()
         parts = response.json().get("content") or []
         if isinstance(parts, list):
             return "".join(
@@ -411,7 +425,7 @@ def _chat_text(
             )
         return ""
 
-    response = httpx.post(
+    response = _post_llm_with_retries(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {provider.api_key}"},
         json={
@@ -422,9 +436,168 @@ def _chat_text(
             "response_format": {"type": "json_object"},
         },
         timeout=timeout,
+        provider=provider,
+        task_key=task_key,
     )
-    response.raise_for_status()
     return str(response.json()["choices"][0]["message"]["content"])
+
+
+def _post_llm_with_retries(
+    url: str,
+    *,
+    headers: dict[str, str],
+    json: dict,
+    timeout: float,
+    provider: LlmProvider,
+    task_key: TaskParameterKey | None,
+) -> httpx.Response:
+    max_attempts = _llm_retry_attempts()
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = httpx.post(
+                url,
+                headers=headers,
+                json=json,
+                timeout=_llm_http_timeout(timeout),
+            )
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts or not _is_transient_llm_error(exc):
+                raise
+            delay = _llm_retry_delay(attempt, exc)
+            logger.warning(
+                "Transient LLM request failure; retrying: model=%s task=%s attempt=%s/%s delay=%.1fs error=%s",
+                provider.model,
+                task_key or "default",
+                attempt,
+                max_attempts,
+                delay,
+                exc,
+            )
+            sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
+def _llm_http_timeout(timeout: float) -> httpx.Timeout:
+    bounded = max(1.0, float(timeout))
+    return httpx.Timeout(
+        timeout=bounded,
+        connect=min(30.0, bounded),
+        read=min(120.0, bounded),
+        write=min(30.0, bounded),
+        pool=min(30.0, bounded),
+    )
+
+
+def _llm_retry_attempts() -> int:
+    raw = os.getenv("COURSE_NAVIGATOR_LLM_RETRY_ATTEMPTS", "3")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, min(value, 6))
+
+
+def _llm_retry_delay(attempt: int, exc: Exception) -> float:
+    if isinstance(exc, httpx.HTTPStatusError):
+        retry_after = exc.response.headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(0.0, min(float(retry_after), 20.0))
+            except ValueError:
+                pass
+    return min(1.5 * attempt, 6.0)
+
+
+def _is_transient_llm_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in TRANSIENT_LLM_STATUS_CODES
+    return isinstance(exc, TRANSIENT_LLM_EXCEPTIONS)
+
+
+def _learning_block_worker_count() -> int:
+    raw = os.getenv("COURSE_NAVIGATOR_LEARNING_BLOCK_WORKERS", "3")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, min(value, 3))
+
+
+LearningBlockTask = tuple[int, TimeRange, list[TranscriptSegment], list[TranscriptSegment]]
+LearningBlockFactory = Callable[[int, TimeRange, list[TranscriptSegment], list[TranscriptSegment]], dict]
+
+
+def _generate_learning_block_tasks_adaptively(
+    tasks: list[LearningBlockTask],
+    make_block: LearningBlockFactory,
+    progress: ProgressCallback | None,
+    progress_start: int,
+    progress_span: int,
+    progress_message: str,
+) -> dict[int, dict]:
+    pending = {task[0]: task for task in tasks}
+    blocks_by_index: dict[int, dict] = {}
+    if not pending:
+        return blocks_by_index
+
+    worker_count = min(_learning_block_worker_count(), len(pending))
+    completed = 0
+    total = len(pending)
+    while pending:
+        current_workers = max(1, min(worker_count, len(pending)))
+        should_retry_with_lower_concurrency = False
+        executor = ThreadPoolExecutor(max_workers=current_workers)
+        try:
+            futures = {
+                executor.submit(make_block, index, time_range, source_chunk, translated_chunk): (
+                    index,
+                    time_range,
+                )
+                for index, time_range, source_chunk, translated_chunk in pending.values()
+            }
+            for future in as_completed(futures):
+                index, time_range = futures[future]
+                try:
+                    block = future.result()
+                except Exception as exc:
+                    if current_workers > 1 and _is_transient_llm_error(exc):
+                        worker_count = current_workers - 1
+                        should_retry_with_lower_concurrency = True
+                        logger.warning(
+                            "Learning block generation hit a transient error; retrying with fewer workers: "
+                            "workers=%s next_workers=%s remaining=%s error=%s",
+                            current_workers,
+                            worker_count,
+                            len(pending),
+                            exc,
+                        )
+                        break
+                    raise
+
+                block["id"] = f"block-{index + 1}"
+                block["start"] = time_range.start
+                block["end"] = time_range.end
+                blocks_by_index[index] = block
+                pending.pop(index, None)
+                completed += 1
+                _report(
+                    progress,
+                    "learning_blocks",
+                    progress_start + round((completed / total) * progress_span),
+                    f"{progress_message} {completed}/{total}",
+                )
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        if should_retry_with_lower_concurrency:
+            continue
+
+    return blocks_by_index
 
 
 def _effective_task_parameters(
@@ -1732,6 +1905,7 @@ def _generate_learning_blocks_with_provider(
         )
         _report(progress, "segmentation", 78, f"已完成语义分块，共 {len(ranges)} 个学习块")
     except Exception:
+        logger.exception("Semantic segmentation failed; falling back to local time ranges")
         ranges = _fallback_time_ranges_from_transcript(source_transcript, output_language, strategy)
         _report(progress, "segmentation", 78, f"语义分块失败，已使用本地分块，共 {len(ranges)} 个学习块")
 
@@ -1782,59 +1956,57 @@ def _generate_learning_blocks_for_ranges_with_provider(
 
     translated_by_start = {round(segment.start, 2): segment for segment in translated_transcript}
     blocks_by_index: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {}
-        for index, time_range in enumerate(ranges):
+    tasks: list[LearningBlockTask] = []
+    for index, time_range in enumerate(ranges):
+        source_chunk = [
+            segment
+            for segment in source_transcript
+            if _segment_overlaps_range(segment, time_range.start, time_range.end)
+        ]
+        if not source_chunk:
             source_chunk = [
                 segment
                 for segment in source_transcript
-                if _segment_overlaps_range(segment, time_range.start, time_range.end)
-            ]
-            if not source_chunk:
-                source_chunk = [
-                    segment
-                    for segment in source_transcript
-                    if time_range.start <= segment.start <= time_range.end
-                ][:1]
-            if not source_chunk:
-                blocks_by_index[index] = _block_from_time_range(index, time_range)
-                continue
-            translated_chunk = [
-                translated_by_start.get(round(segment.start, 2))
-                or TranscriptSegment(start=segment.start, end=segment.end, text=segment.text)
-                for segment in source_chunk
-            ]
-            futures[
-                executor.submit(
-                    _generate_learning_block_with_provider,
-                    title,
-                    index,
-                    source_chunk,
-                    translated_chunk,
-                    context_summary,
-                    provider,
-                    output_language,
-                    detail_level,
-                    _neighbor_context(ranges, index),
-                )
-            ] = (index, time_range, source_chunk, translated_chunk)
+                if time_range.start <= segment.start <= time_range.end
+            ][:1]
+        if not source_chunk:
+            blocks_by_index[index] = _block_from_time_range(index, time_range)
+            continue
+        translated_chunk = [
+            translated_by_start.get(round(segment.start, 2))
+            or TranscriptSegment(start=segment.start, end=segment.end, text=segment.text)
+            for segment in source_chunk
+        ]
+        tasks.append((index, time_range, source_chunk, translated_chunk))
 
-        completed = 0
-        total = max(len(futures), 1)
-        for future in as_completed(futures):
-            index, time_range, source_chunk, translated_chunk = futures[future]
-            block = future.result()
-            block["id"] = f"block-{index + 1}"
-            block["start"] = time_range.start
-            block["end"] = time_range.end
-            blocks_by_index[index] = block
-            completed += 1
-            _report(
-                progress,
-                "learning_blocks",
-                progress_start + round((completed / total) * progress_span),
-                f"{progress_message} {completed}/{total}",
-            )
+    def make_block(
+        index: int,
+        time_range: TimeRange,
+        source_chunk: list[TranscriptSegment],
+        translated_chunk: list[TranscriptSegment],
+    ) -> dict:
+        return _generate_learning_block_with_provider(
+            title,
+            index,
+            source_chunk,
+            translated_chunk,
+            context_summary,
+            provider,
+            output_language,
+            detail_level,
+            _neighbor_context(ranges, index),
+        )
+
+    blocks_by_index.update(
+        _generate_learning_block_tasks_adaptively(
+            tasks,
+            make_block,
+            progress,
+            progress_start,
+            progress_span,
+            progress_message,
+        )
+    )
 
     return [
         blocks_by_index.get(index) or _block_from_time_range(index, time_range)
@@ -1911,53 +2083,51 @@ def _generate_existing_range_blocks_with_provider(
 ) -> list[dict]:
     translated_by_start = {round(segment.start, 2): segment for segment in translated_transcript}
     blocks_by_index: dict[int, dict] = {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {}
-        for index, time_range in enumerate(ranges):
-            source_chunk, translated_chunk = _chunks_for_time_range(
-                source_transcript,
-                translated_by_start,
-                time_range,
-            )
-            if not source_chunk:
-                block = _existing_structure_for_range(existing_study, index, time_range)
-                if section == "high":
-                    block["detailed_notes"] = _existing_detailed_notes_for_range(existing_study, index, time_range)
-                blocks_by_index[index] = block
-                continue
-            futures[
-                executor.submit(
-                    _generate_existing_range_block_with_provider,
-                    title=title,
-                    index=index,
-                    time_range=time_range,
-                    source_chunk=source_chunk,
-                    translated_chunk=translated_chunk,
-                    existing_study=existing_study,
-                    context_summary=context_summary,
-                    provider=provider,
-                    output_language=output_language,
-                    detail_level=detail_level,
-                    section=section,
-                )
-            ] = (index, time_range)
-
-        completed = 0
-        total = max(len(futures), 1)
-        for future in as_completed(futures):
-            index, time_range = futures[future]
-            block = future.result()
-            block["id"] = f"block-{index + 1}"
-            block["start"] = time_range.start
-            block["end"] = time_range.end
+    tasks: list[LearningBlockTask] = []
+    for index, time_range in enumerate(ranges):
+        source_chunk, translated_chunk = _chunks_for_time_range(
+            source_transcript,
+            translated_by_start,
+            time_range,
+        )
+        if not source_chunk:
+            block = _existing_structure_for_range(existing_study, index, time_range)
+            if section == "high":
+                block["detailed_notes"] = _existing_detailed_notes_for_range(existing_study, index, time_range)
             blocks_by_index[index] = block
-            completed += 1
-            _report(
-                progress,
-                "learning_blocks",
-                20 + round((completed / total) * 65),
-                f"正在重新生成{_section_label(section)} {completed}/{total}",
-            )
+            continue
+        tasks.append((index, time_range, source_chunk, translated_chunk))
+
+    def make_block(
+        index: int,
+        time_range: TimeRange,
+        source_chunk: list[TranscriptSegment],
+        translated_chunk: list[TranscriptSegment],
+    ) -> dict:
+        return _generate_existing_range_block_with_provider(
+            title=title,
+            index=index,
+            time_range=time_range,
+            source_chunk=source_chunk,
+            translated_chunk=translated_chunk,
+            existing_study=existing_study,
+            context_summary=context_summary,
+            provider=provider,
+            output_language=output_language,
+            detail_level=detail_level,
+            section=section,
+        )
+
+    blocks_by_index.update(
+        _generate_learning_block_tasks_adaptively(
+            tasks,
+            make_block,
+            progress,
+            20,
+            65,
+            f"正在重新生成{_section_label(section)}",
+        )
+    )
 
     return [
         blocks_by_index.get(index) or _block_from_time_range(index, time_range)

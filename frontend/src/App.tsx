@@ -44,12 +44,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   bindVideoSource,
   bindVideoSourceFromPicker,
+  cancelStudyJob,
   cleanupAsrCache,
   deleteCourse,
   deleteLocalVideo,
   extractCourse,
   getAsrCacheSettings,
   getAsrCorrectionResult,
+  getItem,
   getLibraryState,
   getAsrSearchSettings,
   getModelSettings,
@@ -535,6 +537,9 @@ const COPY = {
     expandStudyQueue: "展开学习地图生成队列",
     collapseStudyQueue: "收起学习地图生成队列",
     cancelQueuedStudyTask: "取消排队任务",
+    cancelStudyJob: "停止生成学习地图",
+    cancelStudyJobButton: "停止",
+    cancellingStudyJob: "正在停止学习地图生成",
     retryStudyTask: "重试失败任务",
     dismissStudyTask: "清除失败任务",
     studyMapDetailLevel: "详细程度",
@@ -899,6 +904,9 @@ const COPY = {
     expandStudyQueue: "Expand study map generation queue",
     collapseStudyQueue: "Collapse study map generation queue",
     cancelQueuedStudyTask: "Cancel queued task",
+    cancelStudyJob: "Stop study map generation",
+    cancelStudyJobButton: "Stop",
+    cancellingStudyJob: "Stopping study map generation",
     retryStudyTask: "Retry failed task",
     dismissStudyTask: "Dismiss failed task",
     studyMapDetailLevel: "Detail level",
@@ -1314,6 +1322,12 @@ export function App() {
   const studyQueueTaskCount = studyQueueWaitingTasks.length;
   const studyQueueAriaLabel = studyQueueTaskCount ? `${copy.studyQueueStatus} ${studyQueueTaskCount}` : copy.studyQueueStatus;
   const studyActionBusy = Boolean(busy && activeJobKind !== "study");
+  const canCancelActiveStudyJob = Boolean(
+    activeJobKind === "study" &&
+      jobStatus &&
+      (jobStatus.status === "queued" || jobStatus.status === "running" || jobStatus.status === "cancelling"),
+  );
+  const activeStudyJobCancelling = jobStatus?.status === "cancelling";
   const rightRailClassName = [
     "right-rail",
     selectedHasStudy ? "" : "no-study-actions",
@@ -1384,6 +1398,16 @@ export function App() {
     setSelected((current) => (current ? loaded.find((item) => item.id === current.id) ?? current : current));
   }
 
+  async function refreshItemInList(itemId: string) {
+    const updated = await getItem(itemId);
+    if (!updated) return;
+    setItems((current) => {
+      const exists = current.some((item) => item.id === updated.id);
+      return exists ? current.map((item) => (item.id === updated.id ? updated : item)) : [updated, ...current];
+    });
+    setSelected((current) => (current?.id === updated.id ? updated : current));
+  }
+
   function updateStudyQueueTasks(updater: (current: StudyQueueTask[]) => StudyQueueTask[]) {
     const next = updater(studyQueueTasksRef.current);
     studyQueueTasksRef.current = next;
@@ -1433,6 +1457,23 @@ export function App() {
 
   function cancelQueuedStudyTask(taskId: string) {
     updateStudyQueueTasks((current) => current.filter((task) => task.id !== taskId || task.status !== "queued"));
+  }
+
+  async function cancelActiveStudyJob() {
+    if (activeJobKind !== "study" || !jobStatus || activeStudyJobCancelling) return;
+    try {
+      const nextStatus = await cancelStudyJob(jobStatus.job_id);
+      if (!appMountedRef.current) return;
+      setJobStatus(nextStatus);
+      setBusy(nextStatus.message || copy.cancellingStudyJob);
+      updateStudyQueueTasks((current) =>
+        current.map((task) =>
+          task.jobId === nextStatus.job_id ? { ...task, message: nextStatus.message, jobId: nextStatus.job_id } : task,
+        ),
+      );
+    } catch (err) {
+      setError(errorMessage(err, copy.unknownError));
+    }
   }
 
   async function processStudyQueue() {
@@ -1907,7 +1948,7 @@ export function App() {
     );
     setJobStatus(firstStatus);
     let current = firstStatus;
-    while (current.status === "queued" || current.status === "running") {
+    while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
       await delay(1000);
       if (!appMountedRef.current) return;
       current = await getStudyJob(firstStatus.job_id);
@@ -1918,13 +1959,16 @@ export function App() {
       setJobStatus(current);
       setBusy(`${task.itemTitle} · ${label}: ${current.message} ${current.progress}%`);
       if (current.status === "running") {
-        await refreshItemsPreservingSelection();
+        await refreshItemInList(task.itemId);
       }
     }
     if (current.status === "failed") {
       throw new Error(current.error ?? current.message);
     }
-    await refreshItemsPreservingSelection();
+    if (current.status === "cancelled") {
+      return;
+    }
+    await refreshItemInList(task.itemId);
   }
 
   async function runTranslationJob(itemId: string) {
@@ -3404,7 +3448,30 @@ export function App() {
       {busy ? (
         <div className="status-strip">
           <span>{busy}</span>
-          {jobStatus ? <progress max={100} value={jobStatus.progress} /> : null}
+          {jobStatus ? (
+            <div
+              className="status-strip-progress"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(jobStatus.progress)}
+            >
+              <span style={{ width: `${Math.min(100, Math.max(0, jobStatus.progress))}%` }} />
+            </div>
+          ) : null}
+          {canCancelActiveStudyJob ? (
+            <button
+              className="status-strip-cancel"
+              type="button"
+              aria-label={copy.cancelStudyJob}
+              title={copy.cancelStudyJob}
+              disabled={activeStudyJobCancelling}
+              onClick={() => void cancelActiveStudyJob()}
+            >
+              {activeStudyJobCancelling ? <Loader2 className="spin" size={14} /> : <X size={14} />}
+              <span>{activeStudyJobCancelling ? copy.cancellingStudyJob : copy.cancelStudyJobButton}</span>
+            </button>
+          ) : null}
         </div>
       ) : null}
       {visibleStudyQueueTasks.length ? (

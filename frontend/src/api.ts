@@ -37,6 +37,10 @@ export async function listItems(): Promise<CourseItem[]> {
   return requestJson<CourseItem[]>("/items");
 }
 
+export async function getItem(itemId: string): Promise<CourseItem> {
+  return requestJson<CourseItem>(`/items/${itemId}`);
+}
+
 export async function getLibraryState(): Promise<LibraryState> {
   return requestJson<LibraryState>("/library-state");
 }
@@ -176,6 +180,12 @@ export async function startTranslationJob(itemId: string, outputLanguage: Output
 
 export async function getStudyJob(jobId: string): Promise<StudyJobStatus> {
   return requestJson<StudyJobStatus>(`/jobs/${jobId}`);
+}
+
+export async function cancelStudyJob(jobId: string): Promise<StudyJobStatus> {
+  return requestJson<StudyJobStatus>(`/jobs/${jobId}/cancel`, {
+    method: "POST",
+  });
 }
 
 export async function saveTranscript(itemId: string, transcript: TranscriptSegment[]): Promise<CourseItem> {

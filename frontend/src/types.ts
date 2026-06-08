@@ -72,7 +72,7 @@ export type TaskParameterOverride = {
   max_tokens?: number | null;
 };
 
-export type JobStatusValue = "queued" | "running" | "succeeded" | "failed";
+export type JobStatusValue = "queued" | "running" | "cancelling" | "cancelled" | "succeeded" | "failed";
 
 export type StudyJobStatus = {
   job_id: string;

@@ -5,7 +5,7 @@ from typing import Literal
 
 
 OutputLanguage = Literal["zh-CN", "en", "ja"]
-JobStatusValue = Literal["queued", "running", "succeeded", "failed"]
+JobStatusValue = Literal["queued", "running", "cancelling", "cancelled", "succeeded", "failed"]
 StudySection = Literal["all", "guide", "outline", "detailed", "high"]
 ModelProviderType = Literal["openai", "anthropic"]
 StudyDetailLevel = Literal["fast", "standard", "detailed", "faithful"]
