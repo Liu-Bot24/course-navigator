@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-const styles = readFileSync("frontend/src/styles.css", "utf8");
+const styles = readFileSync("frontend/src/styles.css", "utf8").replace(/\r\n/g, "\n");
 
 function cssBlock(selector: string): string {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
