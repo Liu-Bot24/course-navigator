@@ -1,5 +1,10 @@
 import re
+from threading import Event
 
+import pytest
+
+import course_navigator.ai as ai
+import course_navigator.asr as asr
 from course_navigator.ai import LlmProvider
 from course_navigator.asr import suggest_asr_corrections
 from course_navigator.models import AsrCorrectionSearchConfig, TranscriptSegment
@@ -49,6 +54,62 @@ def test_direct_asr_correction_uses_few_scan_batches_and_final_patch_review(monk
     assert all(timeout == 240 for timeout in timeouts)
     assert suggestions[0].original_text == "noba dek"
     assert suggestions[0].corrected_text == "NovaDeck"
+
+
+def test_asr_correction_honors_cancel_before_model_request(monkeypatch):
+    chat_calls = []
+
+    def fake_chat_text(provider, messages, **kwargs):
+        chat_calls.append(messages)
+        raise AssertionError("ASR correction model request should not start after cancellation")
+
+    monkeypatch.setattr("course_navigator.asr._chat_text", fake_chat_text)
+    provider = LlmProvider(base_url="https://api.example.com/v1", api_key="sk-test", model="model")
+
+    with pytest.raises(ai.LlmCancelled):
+        suggest_asr_corrections(
+            title="NovaDeck interview",
+            transcript=[TranscriptSegment(start=0, end=1, text="noba dek")],
+            provider=provider,
+            search_config=AsrCorrectionSearchConfig(enabled=False),
+            should_cancel=lambda: True,
+        )
+
+    assert chat_calls == []
+
+
+def test_asr_search_closes_active_request_when_cancelled(monkeypatch):
+    started = Event()
+    closed = Event()
+
+    class BlockingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def close(self):
+            closed.set()
+
+        def post(self, *args, **kwargs):
+            started.set()
+            assert closed.wait(2)
+            raise asr.httpx.ReadError("closed")
+
+    monkeypatch.setattr("course_navigator.asr.httpx.Client", BlockingClient)
+
+    with pytest.raises(ai.LlmCancelled):
+        asr._search(
+            "NovaDeck",
+            AsrCorrectionSearchConfig(enabled=True, provider="firecrawl", base_url="http://127.0.0.1:3002"),
+            should_cancel=lambda: started.is_set(),
+        )
+
+    assert closed.is_set()
 
 
 def test_asr_correction_prompt_preserves_valid_spoken_abbreviations(monkeypatch):
@@ -138,7 +199,7 @@ def test_search_correction_deduplicates_queries_and_uses_search_as_background(mo
             "]}"
         )
 
-    def fake_search(query, config):
+    def fake_search(query, config, should_cancel=None):
         search_calls.append(query)
         return [
             {
@@ -202,7 +263,7 @@ def test_search_results_are_summarized_into_background_cards_before_patch_review
             "]}"
         )
 
-    def fake_search(query, config):
+    def fake_search(query, config, should_cancel=None):
         search_calls.append(query)
         return [
             {

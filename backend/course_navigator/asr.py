@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from .ai import LlmProvider, _chat_text, _loads_json_content
+from .ai import CancelCallback, LlmCancelled, LlmProvider, _chat_text, _loads_json_content
 from .models import (
     AsrCorrectionSearchConfig,
     AsrCorrectionSuggestion,
@@ -42,7 +42,9 @@ def suggest_asr_corrections(
     context: dict[str, object] | None = None,
     output_language: OutputLanguage = "zh-CN",
     progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> list[AsrCorrectionSuggestion]:
+    _raise_if_cancelled(should_cancel)
     if not transcript:
         return []
 
@@ -54,13 +56,16 @@ def suggest_asr_corrections(
         context,
         progress,
         search_enabled=search_config.enabled,
+        should_cancel=should_cancel,
     )
+    _raise_if_cancelled(should_cancel)
     if not candidates:
         return []
 
     if search_config.enabled:
         _report(progress, "search", 32, "正在搜索校验证据")
-        evidence = _collect_search_evidence(candidates, search_config, progress)
+        evidence = _collect_search_evidence(candidates, search_config, progress, should_cancel=should_cancel)
+        _raise_if_cancelled(should_cancel)
         _report(progress, "background", 64, "正在归纳搜索背景信息")
         background_cards = _synthesize_search_background_cards(
             title,
@@ -70,7 +75,9 @@ def suggest_asr_corrections(
             context,
             output_language,
             progress,
+            should_cancel=should_cancel,
         )
+        _raise_if_cancelled(should_cancel)
         _report(progress, "review", 68, "正在统一审核候选错误和搜索背景")
         raw_patches = _review_candidate_patches(
             title,
@@ -82,6 +89,7 @@ def suggest_asr_corrections(
             output_language,
             progress,
             source="search",
+            should_cancel=should_cancel,
         )
         return _normalize_patch_payload(raw_patches, transcript, source="search")
 
@@ -96,6 +104,7 @@ def suggest_asr_corrections(
         output_language,
         progress,
         source="model",
+        should_cancel=should_cancel,
     )
     return _normalize_patch_payload(raw_patches, transcript, source="model")
 
@@ -108,11 +117,13 @@ def _extract_candidate_items(
     progress: ProgressCallback | None,
     *,
     search_enabled: bool,
+    should_cancel: CancelCallback | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     chunks = _scan_chunks(transcript)
     total = len(chunks)
     for chunk_number, (chunk_start, chunk) in enumerate(chunks, start=1):
+        _raise_if_cancelled(should_cancel)
         base_progress = _scaled_progress(8, 32 if search_enabled else 45, chunk_number - 1, total)
         done_progress = _scaled_progress(8, 32 if search_enabled else 45, chunk_number, total)
         _report(progress, "candidate", base_progress, f"正在扫描第 {chunk_number}/{total} 批字幕候选错误")
@@ -134,7 +145,9 @@ def _extract_candidate_items(
             base_progress=base_progress,
             max_progress=done_progress,
             message=f"正在等待大模型返回第 {chunk_number}/{total} 批候选错误",
+            should_cancel=should_cancel,
         )
+        _raise_if_cancelled(should_cancel)
         _report(progress, "model_parse", done_progress, f"正在整理第 {chunk_number}/{total} 批候选错误")
         for item in _payload_list(payload, "candidates"):
             if isinstance(item, dict):
@@ -146,6 +159,7 @@ def _collect_search_evidence(
     candidates: list[dict[str, Any]],
     config: AsrCorrectionSearchConfig,
     progress: ProgressCallback | None,
+    should_cancel: CancelCallback | None = None,
 ) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
     query_plans = _search_query_plans(candidates)
@@ -165,8 +179,10 @@ def _collect_search_evidence(
     )
     total_queries = max(1, len(selected_plans))
     for query_index, plan in enumerate(selected_plans, start=1):
+        _raise_if_cancelled(should_cancel)
         _report(progress, "search", _scaled_progress(32, 64, query_index - 1, total_queries), f"正在搜索第 {query_index}/{total_queries} 个唯一术语背景")
-        results = _search(str(plan["query"]), config)
+        results = _search(str(plan["query"]), config, should_cancel=should_cancel)
+        _raise_if_cancelled(should_cancel)
         _report(progress, "search", _scaled_progress(32, 64, query_index, total_queries), f"已获取第 {query_index}/{total_queries} 个唯一术语背景")
         evidence.append(
             {
@@ -271,6 +287,7 @@ def _review_candidate_patches(
     progress: ProgressCallback | None,
     *,
     source: str,
+    should_cancel: CancelCallback | None = None,
 ) -> object:
     patches: list[Any] = []
     groups = _candidate_groups(candidates)
@@ -278,6 +295,7 @@ def _review_candidate_patches(
     start_progress = 70 if source == "search" else 50
     end_progress = 94
     for group_number, group in enumerate(groups, start=1):
+        _raise_if_cancelled(should_cancel)
         base_progress = _scaled_progress(start_progress, end_progress, group_number - 1, total)
         done_progress = _scaled_progress(start_progress, end_progress, group_number, total)
         _report(progress, "model_request", base_progress, f"正在发送第 {group_number}/{total} 组候选错误给审核模型")
@@ -301,7 +319,9 @@ def _review_candidate_patches(
             base_progress=base_progress,
             max_progress=done_progress,
             message=f"正在等待审核模型返回第 {group_number}/{total} 组补丁",
+            should_cancel=should_cancel,
         )
+        _raise_if_cancelled(should_cancel)
         _report(progress, "model_parse", done_progress, f"正在解析第 {group_number}/{total} 组补丁")
         patches.extend(_payload_list(payload, "patches"))
     return {"patches": patches}
@@ -315,7 +335,9 @@ def _synthesize_search_background_cards(
     context: dict[str, object] | None,
     output_language: OutputLanguage,
     progress: ProgressCallback | None,
+    should_cancel: CancelCallback | None = None,
 ) -> list[dict[str, Any]]:
+    _raise_if_cancelled(should_cancel)
     if not evidence:
         return []
     payload = _chat_json_with_progress(
@@ -336,7 +358,9 @@ def _synthesize_search_background_cards(
         base_progress=64,
         max_progress=68,
         message="正在等待大模型归纳搜索背景信息",
+        should_cancel=should_cancel,
     )
+    _raise_if_cancelled(should_cancel)
     cards = [card for card in _payload_list(payload, "background") if isinstance(card, dict)]
     return _normalize_search_background_cards(cards)[:SEARCH_BACKGROUND_MAX_CARDS]
 
@@ -555,17 +579,24 @@ def _short_string_list(value: object, *, limit: int, item_limit: int) -> list[st
     return items
 
 
-def _search(query: str, config: AsrCorrectionSearchConfig) -> list[dict[str, Any]]:
+def _search(
+    query: str,
+    config: AsrCorrectionSearchConfig,
+    should_cancel: CancelCallback | None = None,
+) -> list[dict[str, Any]]:
+    _raise_if_cancelled(should_cancel)
     if config.provider == "tavily":
         if not config.api_key:
             raise ValueError("Tavily API key is required when search calibration is enabled")
-        response = httpx.post(
+        response = _post_search_request(
             "https://api.tavily.com/search",
             headers={"Authorization": f"Bearer {config.api_key}"},
-            json={"query": query, "max_results": config.result_limit},
+            payload={"query": query, "max_results": config.result_limit},
             timeout=30,
+            should_cancel=should_cancel,
         )
         response.raise_for_status()
+        _raise_if_cancelled(should_cancel)
         payload = response.json()
         return _normalize_search_results(payload.get("results"), "tavily")
 
@@ -580,15 +611,50 @@ def _search(query: str, config: AsrCorrectionSearchConfig) -> list[dict[str, Any
     headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
-    response = httpx.post(
+    response = _post_search_request(
         endpoint,
         headers=headers,
-        json={"query": query, "limit": config.result_limit},
+        payload={"query": query, "limit": config.result_limit},
         timeout=30,
+        should_cancel=should_cancel,
     )
     response.raise_for_status()
+    _raise_if_cancelled(should_cancel)
     payload = response.json()
     return _normalize_search_results(payload.get("data") or payload.get("results"), "firecrawl")
+
+
+def _post_search_request(
+    url: str,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+    should_cancel: CancelCallback | None,
+) -> httpx.Response:
+    _raise_if_cancelled(should_cancel)
+    if should_cancel is None:
+        return httpx.post(url, headers=headers, json=payload, timeout=timeout)
+
+    with httpx.Client(timeout=timeout) as client:
+        stop = Event()
+
+        def close_on_cancel() -> None:
+            while not stop.wait(0.25):
+                if should_cancel():
+                    client.close()
+                    return
+
+        Thread(target=close_on_cancel, name="course-navigator-asr-search-cancel", daemon=True).start()
+        try:
+            response = client.post(url, headers=headers, json=payload)
+        except httpx.RequestError:
+            _raise_if_cancelled(should_cancel)
+            raise
+        finally:
+            stop.set()
+    _raise_if_cancelled(should_cancel)
+    return response
 
 
 def _normalize_search_results(raw_results: object, source: str) -> list[dict[str, Any]]:
@@ -767,12 +833,16 @@ def _chat_json_with_progress(
     base_progress: int,
     max_progress: int,
     message: str,
+    should_cancel: CancelCallback | None = None,
 ) -> object:
+    _raise_if_cancelled(should_cancel)
     stop = Event()
 
     def heartbeat() -> None:
         started = monotonic()
         while not stop.wait(6):
+            if should_cancel and should_cancel():
+                return
             elapsed = int(monotonic() - started)
             step = min(max_progress - 1, base_progress + max(1, elapsed // 8))
             _report(progress, phase, step, f"{message}，已等待 {elapsed}s")
@@ -788,7 +858,9 @@ def _chat_json_with_progress(
             max_tokens=max_tokens,
             timeout=timeout,
             task_key=task_key,
+            should_cancel=should_cancel,
         )
+        _raise_if_cancelled(should_cancel)
         try:
             return _loads_json_content(content)
         except json.JSONDecodeError as exc:
@@ -800,6 +872,7 @@ def _chat_json_with_progress(
                 expected_key=_expected_payload_key(messages),
                 timeout=timeout,
                 task_key=task_key,
+                should_cancel=should_cancel,
             )
     finally:
         stop.set()
@@ -813,7 +886,9 @@ def _repair_json_content(
     expected_key: str,
     timeout: float,
     task_key: TaskParameterKey,
+    should_cancel: CancelCallback | None = None,
 ) -> object:
+    _raise_if_cancelled(should_cancel)
     repaired = _chat_text(
         provider,
         [
@@ -838,7 +913,9 @@ def _repair_json_content(
         max_tokens=5000,
         timeout=timeout,
         task_key=task_key,
+        should_cancel=should_cancel,
     )
+    _raise_if_cancelled(should_cancel)
     try:
         return _loads_json_content(repaired)
     except json.JSONDecodeError as repair_exc:
@@ -995,3 +1072,8 @@ def _output_language_name(output_language: OutputLanguage) -> str:
 def _report(progress: ProgressCallback | None, phase: str, value: int, message: str) -> None:
     if progress:
         progress(phase, value, message)
+
+
+def _raise_if_cancelled(should_cancel: CancelCallback | None) -> None:
+    if should_cancel and should_cancel():
+        raise LlmCancelled("ASR correction was cancelled")

@@ -1,3 +1,6 @@
+; Always show the language selector because older installers can cache English in HKCU.
+!define MUI_LANGDLL_ALWAYSSHOW
+
 !macro NSIS_HOOK_PREINSTALL
   DetailPrint "Stopping running Course Navigator services..."
   nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$$self=$$PID;$$roots=@(''$INSTDIR'',$$env:LOCALAPPDATA+''\Course Navigator'',$$env:APPDATA+''\Course Navigator'');Get-Process course-navigator-launcher -ErrorAction SilentlyContinue|%{Stop-Process -Id $$_.Id -Force -ErrorAction SilentlyContinue;Wait-Process -Id $$_.Id -Timeout 5 -ErrorAction SilentlyContinue};Get-CimInstance Win32_Process|?{if($$_.ProcessId -eq $$self){$$false}else{$$p=$$_.ExecutablePath;$$c=$$_.CommandLine;$$m=$$false;foreach($$r in $$roots){if([string]::IsNullOrWhiteSpace($$r)){continue};if(($$p -and $$p.StartsWith($$r,[StringComparison]::OrdinalIgnoreCase))-or($$c -and $$c.IndexOf($$r,[StringComparison]::OrdinalIgnoreCase)-ge 0)){$$m=$$true;break}};$$m}}|%{$$target=$$_.ProcessId;Stop-Process -Id $$target -Force -ErrorAction SilentlyContinue;Wait-Process -Id $$target -Timeout 5 -ErrorAction SilentlyContinue}"'

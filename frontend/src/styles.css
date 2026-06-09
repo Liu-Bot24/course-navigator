@@ -345,12 +345,21 @@ button:disabled {
 
 .status-strip {
   display: grid;
-  grid-template-columns: 1fr minmax(180px, 240px) 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
   gap: 8px;
   align-items: center;
   border-color: #cbd8ff;
   background: #eef3ff;
   color: #234087;
+}
+
+.status-strip.has-cancel {
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 240px) 16px;
+}
+
+.status-strip > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .status-strip-progress {
@@ -2036,6 +2045,13 @@ button:disabled {
 
 .asr-progress-topline b {
   font-size: 13px;
+}
+
+.asr-progress-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
 }
 
 .asr-progress-card p {

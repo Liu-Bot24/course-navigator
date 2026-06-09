@@ -182,10 +182,14 @@ export async function getStudyJob(jobId: string): Promise<StudyJobStatus> {
   return requestJson<StudyJobStatus>(`/jobs/${jobId}`);
 }
 
-export async function cancelStudyJob(jobId: string): Promise<StudyJobStatus> {
+export async function cancelJob(jobId: string): Promise<StudyJobStatus> {
   return requestJson<StudyJobStatus>(`/jobs/${jobId}/cancel`, {
     method: "POST",
   });
+}
+
+export async function cancelStudyJob(jobId: string): Promise<StudyJobStatus> {
+  return cancelJob(jobId);
 }
 
 export async function saveTranscript(itemId: string, transcript: TranscriptSegment[]): Promise<CourseItem> {

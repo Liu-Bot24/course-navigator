@@ -1,20 +1,31 @@
 from __future__ import annotations
 
 import math
-import shutil
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
 import httpx
 
 from .config import OnlineAsrServiceConfig, OnlineAsrSettings
 from .models import DownloadRequest, ExtractRequest, OnlineAsrProvider, TranscriptSegment
-from .processes import run_hidden
+from .processes import popen_hidden, resolve_tool, run_hidden
 from .subtitles import parse_subtitle_text
-from .ytdlp import YtDlpError, _friendly_error, _run_with_browser_cookie_retry, build_auth_args, build_runtime_args
+from .ytdlp import (
+    YtDlpCancelled,
+    YtDlpError,
+    _friendly_error,
+    _run_cancellable_with_browser_cookie_snapshot,
+    _run_with_browser_cookie_retry,
+    _should_cancel,
+    _start_cancellation_monitor,
+    _terminate_process,
+    build_auth_args,
+    build_runtime_args,
+)
 
 
 DEFAULT_CHUNK_LIMIT_BYTES = 20 * 1024 * 1024
@@ -30,6 +41,7 @@ def extract_online_asr_transcript(
     settings: OnlineAsrSettings,
     source_video_path: Path | None = None,
     progress: Callable[[int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[TranscriptSegment]:
     if settings.provider == "none":
         raise YtDlpError("请先选择在线 ASR 服务，或把字幕来源改为原字幕优先/本地 ASR。")
@@ -40,23 +52,29 @@ def extract_online_asr_transcript(
         raise YtDlpError("自定义在线 ASR 需要填写接口地址和模型名称")
 
     target_dir.mkdir(parents=True, exist_ok=True)
+    _raise_if_cancelled(should_cancel)
     _report(progress, 5, "正在为在线 ASR 抽取音频")
     source_audio = (
-        _extract_audio_from_file(source_video_path, target_dir, item_id)
+        _extract_audio_from_file(source_video_path, target_dir, item_id, should_cancel=should_cancel)
         if source_video_path
-        else _extract_audio(request, target_dir, item_id, yt_dlp_binary)
+        else _extract_audio(request, target_dir, item_id, yt_dlp_binary, should_cancel=should_cancel)
     )
+    _raise_if_cancelled(should_cancel)
     _report(progress, 28, "音频已抽取，正在压缩为在线 ASR 音频")
-    compressed_audio = _compress_audio(source_audio, target_dir / f"{item_id}.online-asr.mp3")
+    compressed_audio = _compress_audio(source_audio, target_dir / f"{item_id}.online-asr.mp3", should_cancel=should_cancel)
+    _raise_if_cancelled(should_cancel)
     _report(progress, 38, "正在检查在线 ASR 音频分块")
-    chunks = _audio_chunks(compressed_audio, item_id, target_dir, DEFAULT_CHUNK_LIMIT_BYTES)
+    chunks = _audio_chunks(compressed_audio, item_id, target_dir, DEFAULT_CHUNK_LIMIT_BYTES, should_cancel=should_cancel)
     segments: list[TranscriptSegment] = []
     total = max(len(chunks), 1)
     for index, (chunk_path, offset) in enumerate(chunks, start=1):
+        _raise_if_cancelled(should_cancel)
         _report(progress, _scaled_progress(42, 88, index - 1, total), f"正在请求在线 ASR 第 {index}/{total} 段")
-        payload = _transcribe_chunk(settings.provider, service, chunk_path, request.language)
+        payload = _transcribe_chunk(settings.provider, service, chunk_path, request.language, should_cancel=should_cancel)
+        _raise_if_cancelled(should_cancel)
         segments.extend(_segments_from_payload(payload, offset=offset))
         _report(progress, _scaled_progress(42, 88, index, total), f"已完成在线 ASR 第 {index}/{total} 段")
+    _raise_if_cancelled(should_cancel)
     _report(progress, 94, "在线 ASR 已返回，正在合并字幕")
     return _merge_segments(segments)
 
@@ -67,7 +85,14 @@ def _yt_dlp_command_prefix(yt_dlp_binary: str | None) -> list[str]:
     return [sys.executable, "-m", "yt_dlp"]
 
 
-def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_dlp_binary: str | None) -> Path:
+def _extract_audio(
+    request: ExtractRequest,
+    target_dir: Path,
+    item_id: str,
+    yt_dlp_binary: str | None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    _raise_if_cancelled(should_cancel)
     output_template = str(target_dir / f"{item_id}.online-source.%(ext)s")
 
     def audio_command(active_request: ExtractRequest | DownloadRequest) -> list[str]:
@@ -83,7 +108,13 @@ def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_d
             str(active_request.url),
         ]
 
-    result, active_request = _run_with_browser_cookie_retry(audio_command, request)
+    run_command = (
+        (lambda builder, active_request: _run_cancellable_with_browser_cookie_snapshot(builder, active_request, should_cancel))
+        if should_cancel is not None
+        else None
+    )
+    result, active_request = _run_with_browser_cookie_retry(audio_command, request, run_command=run_command)
+    _raise_if_cancelled(should_cancel)
     if result.returncode != 0:
         raise YtDlpError(_friendly_error(result.stderr.strip(), active_request, "yt-dlp audio extraction failed"))
     candidates = sorted(target_dir.glob(f"{item_id}.online-source.*"), key=lambda path: path.stat().st_mtime)
@@ -92,9 +123,15 @@ def _extract_audio(request: ExtractRequest, target_dir: Path, item_id: str, yt_d
     return candidates[-1]
 
 
-def _extract_audio_from_file(source_video_path: Path, target_dir: Path, item_id: str) -> Path:
-    if not shutil.which("ffmpeg"):
+def _extract_audio_from_file(
+    source_video_path: Path,
+    target_dir: Path,
+    item_id: str,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    if not resolve_tool("ffmpeg"):
         raise YtDlpError("在线 ASR 需要 ffmpeg 来抽取并压缩音频")
+    _raise_if_cancelled(should_cancel)
     target = target_dir / f"{item_id}.online-source.wav"
     cmd = [
         "ffmpeg",
@@ -108,15 +145,16 @@ def _extract_audio_from_file(source_video_path: Path, target_dir: Path, item_id:
         "16000",
         str(target),
     ]
-    result = run_hidden(cmd, capture_output=True, text=True, check=False)
+    result = _run_media_command(cmd, should_cancel)
     if result.returncode != 0 or not target.exists():
         raise YtDlpError(result.stderr.strip() or "ffmpeg failed to extract audio from local video")
     return target
 
 
-def _compress_audio(source: Path, target: Path) -> Path:
-    if not shutil.which("ffmpeg"):
+def _compress_audio(source: Path, target: Path, should_cancel: Callable[[], bool] | None = None) -> Path:
+    if not resolve_tool("ffmpeg"):
         raise YtDlpError("在线 ASR 需要 ffmpeg 来抽取并压缩音频")
+    _raise_if_cancelled(should_cancel)
     cmd = [
         "ffmpeg",
         "-y",
@@ -131,13 +169,20 @@ def _compress_audio(source: Path, target: Path) -> Path:
         TARGET_AUDIO_BITRATE,
         str(target),
     ]
-    result = run_hidden(cmd, capture_output=True, text=True, check=False)
+    result = _run_media_command(cmd, should_cancel)
     if result.returncode != 0 or not target.exists():
         raise YtDlpError(result.stderr.strip() or "ffmpeg failed to compress audio for online ASR")
     return target
 
 
-def _audio_chunks(audio_path: Path, item_id: str, target_dir: Path, limit_bytes: int) -> list[tuple[Path, float]]:
+def _audio_chunks(
+    audio_path: Path,
+    item_id: str,
+    target_dir: Path,
+    limit_bytes: int,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[tuple[Path, float]]:
+    _raise_if_cancelled(should_cancel)
     if audio_path.stat().st_size <= limit_bytes:
         return [(audio_path, 0.0)]
     duration = _audio_duration(audio_path)
@@ -147,6 +192,7 @@ def _audio_chunks(audio_path: Path, item_id: str, target_dir: Path, limit_bytes:
     chunk_length = duration / chunk_count
     chunks: list[tuple[Path, float]] = []
     for index in range(chunk_count):
+        _raise_if_cancelled(should_cancel)
         start = max(0.0, index * chunk_length - (CHUNK_OVERLAP_SECONDS if index else 0))
         end = min(duration, (index + 1) * chunk_length + (CHUNK_OVERLAP_SECONDS if index < chunk_count - 1 else 0))
         if end <= start:
@@ -170,7 +216,7 @@ def _audio_chunks(audio_path: Path, item_id: str, target_dir: Path, limit_bytes:
             TARGET_AUDIO_BITRATE,
             str(chunk_path),
         ]
-        result = run_hidden(cmd, capture_output=True, text=True, check=False)
+        result = _run_media_command(cmd, should_cancel)
         if result.returncode != 0 or not chunk_path.exists():
             raise YtDlpError(result.stderr.strip() or "ffmpeg failed to split audio for online ASR")
         chunks.append((chunk_path, start))
@@ -178,6 +224,8 @@ def _audio_chunks(audio_path: Path, item_id: str, target_dir: Path, limit_bytes:
 
 
 def _audio_duration(audio_path: Path) -> float:
+    if not resolve_tool("ffprobe"):
+        return 0.0
     cmd = [
         "ffprobe",
         "-v",
@@ -188,7 +236,10 @@ def _audio_duration(audio_path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(audio_path),
     ]
-    result = run_hidden(cmd, capture_output=True, text=True, check=False)
+    try:
+        result = run_hidden(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return 0.0
     if result.returncode != 0:
         return 0.0
     try:
@@ -197,12 +248,75 @@ def _audio_duration(audio_path: Path) -> float:
         return 0.0
 
 
+def _run_media_command(cmd: list[str], should_cancel: Callable[[], bool] | None) -> subprocess.CompletedProcess[str]:
+    _raise_if_cancelled(should_cancel)
+    if should_cancel is None:
+        return run_hidden(cmd, capture_output=True, text=True, check=False)
+
+    process = popen_hidden(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stop_monitor = _start_cancellation_monitor(process, should_cancel)
+    try:
+        stdout, stderr = process.communicate()
+    except BaseException:
+        _terminate_process(process)
+        if stop_monitor is not None:
+            stop_monitor.set()
+        raise
+    finally:
+        if stop_monitor is not None:
+            stop_monitor.set()
+    _raise_if_cancelled(should_cancel)
+    return subprocess.CompletedProcess(cmd, process.returncode or 0, stdout, stderr)
+
+
+def _post_transcription_request(
+    endpoint: str,
+    api_key: str,
+    data: dict[str, str],
+    files: dict[str, tuple[str, Any, str]],
+    should_cancel: Callable[[], bool] | None,
+) -> httpx.Response:
+    _raise_if_cancelled(should_cancel)
+    if should_cancel is None:
+        return httpx.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {api_key}"},
+            data=data,
+            files=files,
+            timeout=300,
+        )
+
+    with httpx.Client(timeout=300) as client:
+        stop = Event()
+
+        def close_on_cancel() -> None:
+            while not stop.wait(0.25):
+                if _should_cancel(should_cancel):
+                    client.close()
+                    return
+
+        Thread(target=close_on_cancel, name="course-navigator-online-asr-cancel", daemon=True).start()
+        try:
+            response = client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}"},
+                data=data,
+                files=files,
+            )
+        finally:
+            stop.set()
+    _raise_if_cancelled(should_cancel)
+    return response
+
+
 def _transcribe_chunk(
     provider: OnlineAsrProvider,
     service: OnlineAsrServiceConfig,
     audio_path: Path,
     language: str,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> object:
+    _raise_if_cancelled(should_cancel)
     base_url = (service.base_url or _default_base_url(provider)).rstrip("/")
     endpoint = _transcription_endpoint(provider, base_url)
     with audio_path.open("rb") as audio_file:
@@ -222,17 +336,20 @@ def _transcribe_chunk(
         elif normalized_language:
             data["language"] = normalized_language
         try:
-            response = httpx.post(
+            response = _post_transcription_request(
                 endpoint,
-                headers={"Authorization": f"Bearer {service.api_key}"},
-                data=data,
-                files=files,
-                timeout=300,
+                service.api_key,
+                data,
+                files,
+                should_cancel,
             )
         except httpx.TimeoutException as exc:
+            _raise_if_cancelled(should_cancel)
             raise YtDlpError(f"{_provider_label(provider)} 在线 ASR 请求超时，请稍后重试或换用更短的视频。") from exc
         except httpx.RequestError as exc:
+            _raise_if_cancelled(should_cancel)
             raise YtDlpError(f"{_provider_label(provider)} 在线 ASR 请求失败：{exc}") from exc
+    _raise_if_cancelled(should_cancel)
     if response.status_code >= 400:
         raise YtDlpError(
             f"{_provider_label(provider)} 在线 ASR 请求失败（HTTP {response.status_code}）：{_response_error_detail(response)}"
@@ -468,6 +585,11 @@ def _scaled_progress(start: int, end: int, index: int, total: int) -> int:
 def _report(progress: Callable[[int, str], None] | None, value: int, message: str) -> None:
     if progress:
         progress(max(1, min(99, value)), message)
+
+
+def _raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if _should_cancel(should_cancel):
+        raise YtDlpCancelled("ASR was cancelled")
 
 
 def _float_value(value: object) -> float | None:

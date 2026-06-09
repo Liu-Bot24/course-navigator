@@ -44,7 +44,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   bindVideoSource,
   bindVideoSourceFromPicker,
-  cancelStudyJob,
+  cancelJob,
   cleanupAsrCache,
   deleteCourse,
   deleteLocalVideo,
@@ -138,6 +138,7 @@ type LayoutDragKind = "left" | "right" | "player";
 type AsrSuggestionDirection = -1 | 1;
 type SubtitleSourceChoice = TranscriptSource | "local_upload";
 type StudyMapDetailMode = Extract<StudyDetailLevel, "standard" | "faithful">;
+type ActiveJobKind = "study" | "translation" | "download" | "extract";
 type StudyQueueTaskStatus = "queued" | "running" | "failed";
 type StudyQueueTask = {
   id: string;
@@ -540,6 +541,11 @@ const COPY = {
     cancelStudyJob: "停止生成学习地图",
     cancelStudyJobButton: "停止",
     cancellingStudyJob: "正在停止学习地图生成",
+    cancelExtractJob: "停止字幕提取",
+    cancelTranslationJob: "停止翻译字幕",
+    cancelDownloadJob: "停止缓存视频",
+    cancelAsrCorrectionJob: "停止 ASR 校正",
+    cancellingCurrentJob: "正在停止当前任务",
     retryStudyTask: "重试失败任务",
     dismissStudyTask: "清除失败任务",
     studyMapDetailLevel: "详细程度",
@@ -907,6 +913,11 @@ const COPY = {
     cancelStudyJob: "Stop study map generation",
     cancelStudyJobButton: "Stop",
     cancellingStudyJob: "Stopping study map generation",
+    cancelExtractJob: "Stop subtitle extraction",
+    cancelTranslationJob: "Stop subtitle translation",
+    cancelDownloadJob: "Stop video cache",
+    cancelAsrCorrectionJob: "Stop ASR correction",
+    cancellingCurrentJob: "Stopping current task",
     retryStudyTask: "Retry failed task",
     dismissStudyTask: "Dismiss failed task",
     studyMapDetailLevel: "Detail level",
@@ -1053,9 +1064,26 @@ const EMPTY_ONLINE_ASR_DRAFT: OnlineAsrDraft = {
   custom_api_key_preview: null,
 };
 
+function isPendingJob(status: StudyJobStatus | null): boolean {
+  return Boolean(status && (status.status === "queued" || status.status === "running" || status.status === "cancelling"));
+}
+
+function isCancellableActiveJob(kind: ActiveJobKind | null, status: StudyJobStatus | null): boolean {
+  if (!kind || !isPendingJob(status)) return false;
+  if (kind === "study" || kind === "translation" || kind === "download") return true;
+  return status?.status === "cancelling" || status?.phase === "asr" || status?.phase === "online_asr";
+}
+
+function activeJobCancelTitle(kind: ActiveJobKind | null, copy: (typeof COPY)[UiLanguage]): string {
+  if (kind === "translation") return copy.cancelTranslationJob;
+  if (kind === "download") return copy.cancelDownloadJob;
+  if (kind === "extract") return copy.cancelExtractJob;
+  return copy.cancelStudyJob;
+}
+
 export function App() {
   const [url, setUrl] = useState("");
-  const [mode, setMode] = useState<ExtractMode>("browser");
+  const [mode, setMode] = useState<ExtractMode>("normal");
   const [browser, setBrowser] = useState("chrome");
   const [cookiesPath, setCookiesPath] = useState("");
   const [cookieTextModalOpen, setCookieTextModalOpen] = useState(false);
@@ -1145,7 +1173,7 @@ export function App() {
   const [savingCollectionGroupKey, setSavingCollectionGroupKey] = useState<string | null>(null);
   const [libraryCreateMenuOpen, setLibraryCreateMenuOpen] = useState(false);
   const [savingTitleId, setSavingTitleId] = useState<string | null>(null);
-  const [activeJobKind, setActiveJobKind] = useState<"study" | "translation" | "download" | "extract" | null>(null);
+  const [activeJobKind, setActiveJobKind] = useState<ActiveJobKind | null>(null);
   const appMountedRef = useRef(true);
   const studyQueueTasksRef = useRef<StudyQueueTask[]>([]);
   const studyQueueProcessingRef = useRef(false);
@@ -1322,12 +1350,9 @@ export function App() {
   const studyQueueTaskCount = studyQueueWaitingTasks.length;
   const studyQueueAriaLabel = studyQueueTaskCount ? `${copy.studyQueueStatus} ${studyQueueTaskCount}` : copy.studyQueueStatus;
   const studyActionBusy = Boolean(busy && activeJobKind !== "study");
-  const canCancelActiveStudyJob = Boolean(
-    activeJobKind === "study" &&
-      jobStatus &&
-      (jobStatus.status === "queued" || jobStatus.status === "running" || jobStatus.status === "cancelling"),
-  );
-  const activeStudyJobCancelling = jobStatus?.status === "cancelling";
+  const canCancelActiveJob = isCancellableActiveJob(activeJobKind, jobStatus);
+  const activeJobCancelling = jobStatus?.status === "cancelling";
+  const activeJobCancelLabel = activeJobCancelTitle(activeJobKind, copy);
   const rightRailClassName = [
     "right-rail",
     selectedHasStudy ? "" : "no-study-actions",
@@ -1459,18 +1484,20 @@ export function App() {
     updateStudyQueueTasks((current) => current.filter((task) => task.id !== taskId || task.status !== "queued"));
   }
 
-  async function cancelActiveStudyJob() {
-    if (activeJobKind !== "study" || !jobStatus || activeStudyJobCancelling) return;
+  async function cancelActiveJob() {
+    if (!canCancelActiveJob || !jobStatus || activeJobCancelling) return;
     try {
-      const nextStatus = await cancelStudyJob(jobStatus.job_id);
+      const nextStatus = await cancelJob(jobStatus.job_id);
       if (!appMountedRef.current) return;
       setJobStatus(nextStatus);
-      setBusy(nextStatus.message || copy.cancellingStudyJob);
-      updateStudyQueueTasks((current) =>
-        current.map((task) =>
-          task.jobId === nextStatus.job_id ? { ...task, message: nextStatus.message, jobId: nextStatus.job_id } : task,
-        ),
-      );
+      setBusy(nextStatus.message || copy.cancellingCurrentJob);
+      if (activeJobKind === "study") {
+        updateStudyQueueTasks((current) =>
+          current.map((task) =>
+            task.jobId === nextStatus.job_id ? { ...task, message: nextStatus.message, jobId: nextStatus.job_id } : task,
+          ),
+        );
+      }
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
     }
@@ -1564,12 +1591,16 @@ export function App() {
     }
     if (shouldBlockOnlineAsrSource()) return;
     const existing = findExistingItemForUrl(items, normalizedUrl);
+    const selectedMatchesUrl = selected ? canonicalSourceKey(selected.source_url) === canonicalSourceKey(normalizedUrl) : false;
     const nextSourceMode = preferredSourceModeForSource(normalizedUrl, existing);
     setError(null);
     setJobStatus(null);
     setSourceMode(nextSourceMode);
     setSeekTime(0);
     setPlayheadTime(0);
+    if (!existing && !selectedMatchesUrl) {
+      setSelected(null);
+    }
     if (existing?.transcript.length) {
       selectCourse(existing);
       return;
@@ -1619,6 +1650,9 @@ export function App() {
     setSourceMode(nextSourceMode);
     setSeekTime(0);
     setPlayheadTime(0);
+    if (!targetItem) {
+      setSelected(null);
+    }
     try {
       if (usesBackgroundSubtitleExtraction(subtitleSource)) {
         await runExtractJob(normalizedUrl, nextSourceMode);
@@ -1976,8 +2010,9 @@ export function App() {
     setBusy(copy.translateSubtitles);
     const firstStatus = await startTranslationJob(itemId, outputLanguage);
     setJobStatus(firstStatus);
+    setBusy(`${firstStatus.message} ${firstStatus.progress}%`);
     let current = firstStatus;
-    while (current.status === "queued" || current.status === "running") {
+    while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
       await delay(1000);
       current = await getStudyJob(firstStatus.job_id);
       setJobStatus(current);
@@ -1988,6 +2023,9 @@ export function App() {
     }
     if (current.status === "failed") {
       throw new Error(current.error ?? current.message);
+    }
+    if (current.status === "cancelled") {
+      return;
     }
     await refreshItemsPreservingSelection();
   }
@@ -2005,8 +2043,9 @@ export function App() {
       cookies_path: mode === "cookies" ? cookiesPath : undefined,
     });
     setJobStatus(firstStatus);
+    setBusy(`${firstStatus.message} ${firstStatus.progress}%`);
     let current = firstStatus;
-    while (current.status === "queued" || current.status === "running") {
+    while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
       await delay(1000);
       current = await getStudyJob(firstStatus.job_id);
       setJobStatus(current);
@@ -2014,6 +2053,9 @@ export function App() {
     }
     if (current.status === "failed") {
       throw new Error(current.error ?? current.message);
+    }
+    if (current.status === "cancelled") {
+      return;
     }
     await refreshItems(itemId);
     setSourceMode("local");
@@ -2030,8 +2072,9 @@ export function App() {
       subtitle_source: requestTranscriptSource(subtitleSource),
     });
     setJobStatus(firstStatus);
+    setBusy(`${firstStatus.message} ${firstStatus.progress}%`);
     let current = firstStatus;
-    while (current.status === "queued" || current.status === "running") {
+    while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
       await delay(1000);
       current = await getStudyJob(firstStatus.job_id);
       setJobStatus(current);
@@ -2039,6 +2082,9 @@ export function App() {
     }
     if (current.status === "failed") {
       throw new Error(current.error ?? current.message);
+    }
+    if (current.status === "cancelled") {
+      return;
     }
     await refreshItems(current.item_id || undefined);
     if (nextSourceMode) {
@@ -3446,7 +3492,7 @@ export function App() {
 
       {error ? <div className="error-strip" role="alert" aria-live="polite">{error}</div> : null}
       {busy ? (
-        <div className="status-strip">
+        <div className={canCancelActiveJob ? "status-strip has-cancel" : "status-strip"}>
           <span>{busy}</span>
           {jobStatus ? (
             <div
@@ -3459,17 +3505,17 @@ export function App() {
               <span style={{ width: `${Math.min(100, Math.max(0, jobStatus.progress))}%` }} />
             </div>
           ) : null}
-          {canCancelActiveStudyJob ? (
+          {canCancelActiveJob ? (
             <button
               className="status-strip-cancel"
               type="button"
-              aria-label={copy.cancelStudyJob}
-              title={copy.cancelStudyJob}
-              disabled={activeStudyJobCancelling}
-              onClick={() => void cancelActiveStudyJob()}
+              aria-label={activeJobCancelLabel}
+              title={activeJobCancelLabel}
+              disabled={activeJobCancelling}
+              onClick={() => void cancelActiveJob()}
             >
-              {activeStudyJobCancelling ? <Loader2 className="spin" size={14} /> : <X size={14} />}
-              <span>{activeStudyJobCancelling ? copy.cancellingStudyJob : copy.cancelStudyJobButton}</span>
+              {activeJobCancelling ? <Loader2 className="spin" size={14} /> : <X size={14} />}
+              <span>{activeJobCancelling ? copy.cancellingCurrentJob : copy.cancelStudyJobButton}</span>
             </button>
           ) : null}
         </div>
@@ -4766,6 +4812,8 @@ function AsrWorkbench({
   const displaySuggestionIndex = activeSuggestion ? Math.max(0, activeSuggestionIndex) + 1 : 0;
   const hoverSuggestion = hoverCard ? suggestionById.get(hoverCard.suggestionId) ?? null : null;
   const progressInfo = jobStatus && busy ? asrProgressInfo(jobStatus, copy) : null;
+  const canCancelCorrectionJob = isPendingJob(jobStatus);
+  const correctionJobCancelling = jobStatus?.status === "cancelling";
   const confidenceThresholdPercent = normalizedConfidenceThreshold(confidenceThreshold);
   const thresholdAcceptCount = useMemo(
     () => filterAsrSuggestionsByConfidence(pendingSuggestions, confidenceThresholdPercent).length,
@@ -4861,7 +4909,7 @@ function AsrWorkbench({
       });
       setJobStatus(firstStatus);
       let current = firstStatus;
-      while (current.status === "queued" || current.status === "running") {
+      while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
         await delay(1000);
         current = await getStudyJob(firstStatus.job_id);
         setJobStatus(current);
@@ -4869,6 +4917,10 @@ function AsrWorkbench({
       }
       if (current.status === "failed") {
         throw new Error(current.error ?? current.message);
+      }
+      if (current.status === "cancelled") {
+        setMessage(current.message);
+        return;
       }
       const result = await getAsrCorrectionResult(firstStatus.job_id);
       setSuggestions(result.suggestions);
@@ -4878,6 +4930,17 @@ function AsrWorkbench({
       setError(asrCorrectionErrorMessage(err, copy));
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function cancelCorrectionJob() {
+    if (!jobStatus || !canCancelCorrectionJob || correctionJobCancelling) return;
+    try {
+      const nextStatus = await cancelJob(jobStatus.job_id);
+      setJobStatus(nextStatus);
+      setBusy(nextStatus.message || copy.cancellingCurrentJob);
+    } catch (err) {
+      setError(asrCorrectionErrorMessage(err, copy));
     }
   }
 
@@ -5204,7 +5267,22 @@ function AsrWorkbench({
               <span>{copy.asrProgressTitle}</span>
               <strong>{progressInfo.phaseLabel}</strong>
             </div>
-            <b>{jobStatus?.progress ?? 0}%</b>
+            <div className="asr-progress-actions">
+              <b>{jobStatus?.progress ?? 0}%</b>
+              {canCancelCorrectionJob ? (
+                <button
+                  className="status-strip-cancel"
+                  type="button"
+                  aria-label={copy.cancelAsrCorrectionJob}
+                  title={copy.cancelAsrCorrectionJob}
+                  disabled={correctionJobCancelling}
+                  onClick={() => void cancelCorrectionJob()}
+                >
+                  {correctionJobCancelling ? <Loader2 className="spin" size={14} /> : <X size={14} />}
+                  <span>{correctionJobCancelling ? copy.cancellingCurrentJob : copy.cancelStudyJobButton}</span>
+                </button>
+              ) : null}
+            </div>
           </div>
           {jobStatus ? <progress max={100} value={jobStatus.progress} /> : null}
           <p>{jobStatus?.message ?? busy}</p>

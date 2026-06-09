@@ -1,4 +1,4 @@
-from threading import Lock
+from threading import Event, Lock
 from time import sleep
 
 import httpx
@@ -378,6 +378,65 @@ def test_chat_text_retries_transient_rate_limit(monkeypatch):
 
     assert text == "ok"
     assert len(calls) == 2
+
+
+def test_chat_text_honors_cancel_before_request(monkeypatch):
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("LLM request should not start after cancellation")
+
+    monkeypatch.setattr("course_navigator.ai.httpx.post", fake_post)
+
+    with pytest.raises(ai.LlmCancelled):
+        _chat_text(
+            LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+            [{"role": "user", "content": "Health check"}],
+            temperature=0,
+            max_tokens=16,
+            timeout=30,
+            should_cancel=lambda: True,
+        )
+
+    assert calls == []
+
+
+def test_chat_text_closes_active_request_when_cancelled(monkeypatch):
+    started = Event()
+    closed = Event()
+
+    class BlockingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def close(self):
+            closed.set()
+
+        def post(self, *args, **kwargs):
+            started.set()
+            assert closed.wait(2)
+            raise httpx.ReadError("closed")
+
+    monkeypatch.setattr("course_navigator.ai.httpx.Client", BlockingClient)
+
+    with pytest.raises(ai.LlmCancelled):
+        _chat_text(
+            LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+            [{"role": "user", "content": "Health check"}],
+            temperature=0,
+            max_tokens=16,
+            timeout=30,
+            should_cancel=lambda: started.is_set(),
+        )
+
+    assert closed.is_set()
 
 
 def test_learning_block_generation_uses_three_workers_by_default(monkeypatch):
