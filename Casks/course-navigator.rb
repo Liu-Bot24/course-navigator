@@ -1,6 +1,6 @@
 cask "course-navigator" do
   version "0.1.6"
-  sha256 "1ab98eef38446c915a32873e347a085eac8ff23149fc44fdfe64a38d4344c6a7"
+  sha256 "7ebc2976de5b88e04c539cf3f8da99be1dca6881db91001b4ebdaffc1766a36c"
 
   url "https://github.com/Liu-Bot24/course-navigator/releases/download/v#{version}/Course.Navigator-#{version}-macos-arm64.dmg"
   name "Course Navigator"

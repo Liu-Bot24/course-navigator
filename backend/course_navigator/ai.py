@@ -5,9 +5,12 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
+from threading import Event, Thread
 from time import sleep
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
 
 import httpx
 
@@ -42,6 +45,56 @@ PartialStudyCallback = Callable[[StudyMaterial], None]
 PartialRangesCallback = Callable[[list[TimeRange]], None]
 TitleTranslationCallback = Callable[[str | None], None]
 ContextSummaryCallback = Callable[[str], None]
+CancelCallback = Callable[[], bool]
+
+
+class LlmCancelled(Exception):
+    """Raised when a cancellable AI task is stopped by the user."""
+
+
+_CURRENT_CANCEL_CALLBACK: ContextVar[CancelCallback | None] = ContextVar("course_navigator_ai_cancel", default=None)
+
+
+@contextmanager
+def _cancellation_scope(should_cancel: CancelCallback | None) -> Iterator[None]:
+    if should_cancel is None:
+        yield
+        return
+    token = _CURRENT_CANCEL_CALLBACK.set(should_cancel)
+    try:
+        yield
+    finally:
+        _CURRENT_CANCEL_CALLBACK.reset(token)
+
+
+def _active_cancel_callback(should_cancel: CancelCallback | None = None) -> CancelCallback | None:
+    return should_cancel or _CURRENT_CANCEL_CALLBACK.get()
+
+
+def _should_cancel(should_cancel: CancelCallback | None = None) -> bool:
+    active = _active_cancel_callback(should_cancel)
+    return bool(active and active())
+
+
+def _raise_if_cancelled(should_cancel: CancelCallback | None = None) -> None:
+    if _should_cancel(should_cancel):
+        raise LlmCancelled("AI task was cancelled")
+
+
+def _sleep_with_cancel(delay: float, should_cancel: CancelCallback | None = None) -> None:
+    end = max(0.0, delay)
+    remaining = end
+    while remaining > 0:
+        _raise_if_cancelled(should_cancel)
+        step = min(0.25, remaining)
+        sleep(step)
+        remaining -= step
+    _raise_if_cancelled(should_cancel)
+
+
+def _submit_with_current_context(executor: ThreadPoolExecutor, fn: Callable, *args: object):
+    context = copy_context()
+    return executor.submit(context.run, fn, *args)
 
 GUIDANCE_LIST_KEYS = (
     "prerequisites",
@@ -135,6 +188,40 @@ def generate_study_material(
     existing_translated_title: str | None = None,
     source_language: str | None = None,
     metadata: VideoMetadata | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> StudyMaterial:
+    with _cancellation_scope(should_cancel):
+        return _generate_study_material_impl(
+            title,
+            transcript,
+            provider,
+            output_language,
+            detail_level,
+            progress,
+            partial_translation,
+            partial_study,
+            existing_translation,
+            existing_context_summary,
+            existing_translated_title,
+            source_language,
+            metadata,
+        )
+
+
+def _generate_study_material_impl(
+    title: str,
+    transcript: list[TranscriptSegment],
+    provider: LlmProvider | LlmProviderSet | None,
+    output_language: OutputLanguage = "en",
+    detail_level: StudyDetailLevel = "standard",
+    progress: ProgressCallback | None = None,
+    partial_translation: TranslationProgressCallback | None = None,
+    partial_study: PartialStudyCallback | None = None,
+    existing_translation: list[TranscriptSegment] | None = None,
+    existing_context_summary: str | None = None,
+    existing_translated_title: str | None = None,
+    source_language: str | None = None,
+    metadata: VideoMetadata | None = None,
 ) -> StudyMaterial:
     _report(progress, "preparing", 1, "正在准备字幕与课程信息")
     if not transcript:
@@ -179,6 +266,34 @@ def generate_study_material(
 
 
 def regenerate_study_section(
+    title: str,
+    transcript: list[TranscriptSegment],
+    existing_study: StudyMaterial | None,
+    provider: LlmProvider | LlmProviderSet | None,
+    output_language: OutputLanguage,
+    section: StudySection,
+    detail_level: StudyDetailLevel = "standard",
+    progress: ProgressCallback | None = None,
+    source_language: str | None = None,
+    metadata: VideoMetadata | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> StudyMaterial:
+    with _cancellation_scope(should_cancel):
+        return _regenerate_study_section_impl(
+            title,
+            transcript,
+            existing_study,
+            provider,
+            output_language,
+            section,
+            detail_level,
+            progress,
+            source_language,
+            metadata,
+        )
+
+
+def _regenerate_study_section_impl(
     title: str,
     transcript: list[TranscriptSegment],
     existing_study: StudyMaterial | None,
@@ -350,6 +465,7 @@ def _chat_json(
     max_tokens: int,
     timeout: float,
     task_key: TaskParameterKey | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> object:
     content = _chat_text(
         provider,
@@ -358,6 +474,7 @@ def _chat_json(
         max_tokens=max_tokens,
         timeout=timeout,
         task_key=task_key,
+        should_cancel=should_cancel,
     )
     try:
         return _loads_json_content(content)
@@ -369,6 +486,7 @@ def _chat_json(
             error=exc,
             timeout=timeout,
             task_key=task_key,
+            should_cancel=should_cancel,
         )
 
 
@@ -380,7 +498,9 @@ def _chat_text(
     max_tokens: int,
     timeout: float,
     task_key: TaskParameterKey | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> str:
+    _raise_if_cancelled(should_cancel)
     base_url = provider.base_url.rstrip("/")
     effective_temperature, effective_max_tokens = _effective_task_parameters(
         provider,
@@ -415,6 +535,7 @@ def _chat_text(
             timeout=timeout,
             provider=provider,
             task_key=task_key,
+            should_cancel=should_cancel,
         )
         parts = response.json().get("content") or []
         if isinstance(parts, list):
@@ -438,7 +559,9 @@ def _chat_text(
         timeout=timeout,
         provider=provider,
         task_key=task_key,
+        should_cancel=should_cancel,
     )
+    _raise_if_cancelled(should_cancel)
     return str(response.json()["choices"][0]["message"]["content"])
 
 
@@ -450,19 +573,25 @@ def _post_llm_with_retries(
     timeout: float,
     provider: LlmProvider,
     task_key: TaskParameterKey | None,
+    should_cancel: CancelCallback | None = None,
 ) -> httpx.Response:
     max_attempts = _llm_retry_attempts()
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            response = httpx.post(
+            _raise_if_cancelled(should_cancel)
+            response = _post_llm_request(
                 url,
                 headers=headers,
-                json=json,
+                payload=json,
                 timeout=_llm_http_timeout(timeout),
+                should_cancel=should_cancel,
             )
             response.raise_for_status()
+            _raise_if_cancelled(should_cancel)
             return response
+        except LlmCancelled:
+            raise
         except Exception as exc:
             last_error = exc
             if attempt >= max_attempts or not _is_transient_llm_error(exc):
@@ -477,9 +606,42 @@ def _post_llm_with_retries(
                 delay,
                 exc,
             )
-            sleep(delay)
+            _sleep_with_cancel(delay, should_cancel)
     assert last_error is not None
     raise last_error
+
+
+def _post_llm_request(
+    url: str,
+    *,
+    headers: dict[str, str],
+    payload: dict,
+    timeout: httpx.Timeout,
+    should_cancel: CancelCallback | None,
+) -> httpx.Response:
+    _raise_if_cancelled(should_cancel)
+    if _active_cancel_callback(should_cancel) is None:
+        return httpx.post(url, headers=headers, json=payload, timeout=timeout)
+
+    with httpx.Client(timeout=timeout) as client:
+        stop = Event()
+
+        def close_on_cancel() -> None:
+            while not stop.wait(0.25):
+                if _should_cancel(should_cancel):
+                    client.close()
+                    return
+
+        Thread(target=close_on_cancel, name="course-navigator-ai-cancel", daemon=True).start()
+        try:
+            response = client.post(url, headers=headers, json=payload)
+        except httpx.RequestError:
+            _raise_if_cancelled(should_cancel)
+            raise
+        finally:
+            stop.set()
+    _raise_if_cancelled(should_cancel)
+    return response
 
 
 def _llm_http_timeout(timeout: float) -> httpx.Timeout:
@@ -554,7 +716,7 @@ def _generate_learning_block_tasks_adaptively(
         executor = ThreadPoolExecutor(max_workers=current_workers)
         try:
             futures = {
-                executor.submit(make_block, index, time_range, source_chunk, translated_chunk): (
+                _submit_with_current_context(executor, make_block, index, time_range, source_chunk, translated_chunk): (
                     index,
                     time_range,
                 )
@@ -564,6 +726,8 @@ def _generate_learning_block_tasks_adaptively(
                 index, time_range = futures[future]
                 try:
                     block = future.result()
+                except LlmCancelled:
+                    raise
                 except Exception as exc:
                     if current_workers > 1 and _is_transient_llm_error(exc):
                         worker_count = current_workers - 1
@@ -871,6 +1035,8 @@ def _generate_long_translated_with_provider(
             global_provider,
             output_language,
         )
+    except LlmCancelled:
+        raise
     except Exception:
         guidance = {}
     if partial_study:
@@ -988,6 +1154,8 @@ def _generate_long_translated_with_provider(
     _send_partial_study(partial_study, study)
     try:
         study.outline = _generate_outline_with_provider(title, blocks, prompt_context_summary, global_provider, output_language)
+    except LlmCancelled:
+        raise
     except Exception:
         study.outline = _outline_from_blocks(blocks)
     _send_partial_study(partial_study, study)
@@ -996,6 +1164,34 @@ def _generate_long_translated_with_provider(
 
 
 def translate_transcript_material(
+    title: str,
+    transcript: list[TranscriptSegment],
+    provider: LlmProvider | LlmProviderSet | None,
+    output_language: OutputLanguage,
+    progress: ProgressCallback | None = None,
+    partial_translation: TranslationProgressCallback | None = None,
+    title_translation: TitleTranslationCallback | None = None,
+    context_summary_created: ContextSummaryCallback | None = None,
+    source_language: str | None = None,
+    metadata: VideoMetadata | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> list[TranscriptSegment]:
+    with _cancellation_scope(should_cancel):
+        return _translate_transcript_material_impl(
+            title,
+            transcript,
+            provider,
+            output_language,
+            progress,
+            partial_translation,
+            title_translation,
+            context_summary_created,
+            source_language,
+            metadata,
+        )
+
+
+def _translate_transcript_material_impl(
     title: str,
     transcript: list[TranscriptSegment],
     provider: LlmProvider | LlmProviderSet | None,
@@ -1076,6 +1272,8 @@ def _translate_title_with_provider(
         if isinstance(payload, dict) and isinstance(payload.get("translated_title"), str):
             translated = payload["translated_title"].strip()
             return translated if translated and translated != title else None
+    except LlmCancelled:
+        raise
     except Exception:
         return None
     return None
@@ -1094,7 +1292,8 @@ def _translate_transcript_with_provider(
     translated_by_index: dict[int, list[TranscriptSegment]] = {}
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(
+            _submit_with_current_context(
+                executor,
                 _translate_chunk_with_provider,
                 title,
                 chunk,
@@ -1110,6 +1309,8 @@ def _translate_transcript_with_provider(
             source_chunk = chunks[index]
             try:
                 translated_by_index[index] = future.result()
+            except LlmCancelled:
+                raise
             except Exception:
                 translated_by_index[index] = [
                     TranscriptSegment(start=source.start, end=source.end, text=source.text)
@@ -1179,6 +1380,8 @@ def _repair_untranslated_segments(
                     context_summary,
                     output_language,
                 )
+            except LlmCancelled:
+                raise
             except Exception:
                 continue
             aligned = _align_translated_chunk(source_chunk, translated_chunk)
@@ -1611,6 +1814,8 @@ def _generate_semantic_ranges_with_provider(
                 task_key="semantic_segmentation",
             )
             return _validate_semantic_ranges(payload, transcript, output_language, strategy)
+        except LlmCancelled:
+            raise
         except Exception as exc:
             last_error = exc
     raise last_error or ValueError("Semantic segmentation failed")
@@ -1904,6 +2109,8 @@ def _generate_learning_blocks_with_provider(
             strategy=strategy,
         )
         _report(progress, "segmentation", 78, f"已完成语义分块，共 {len(ranges)} 个学习块")
+    except LlmCancelled:
+        raise
     except Exception:
         logger.exception("Semantic segmentation failed; falling back to local time ranges")
         ranges = _fallback_time_ranges_from_transcript(source_transcript, output_language, strategy)
@@ -2214,6 +2421,8 @@ def _generate_learning_block_with_provider(
             detail_level=detail_level,
             neighbor_context=neighbor_context,
         )
+    except LlmCancelled:
+        raise
     except Exception:
         structure = {
             "title": fallback["title"],
@@ -2380,6 +2589,8 @@ def _repair_learning_block_structure_language_if_needed(
             timeout=90,
             task_key="interpretation",
         )
+    except LlmCancelled:
+        raise
     except Exception:
         return structure
     if not isinstance(payload, dict):
@@ -3070,8 +3281,10 @@ def _report(
     value: int,
     message: str,
 ) -> None:
+    _raise_if_cancelled()
     if progress:
         progress(phase, max(0, min(100, value)), message)
+    _raise_if_cancelled()
 
 
 def _format_time(seconds: float) -> str:
@@ -3108,6 +3321,7 @@ def _repair_json_content(
     error: json.JSONDecodeError,
     timeout: float,
     task_key: TaskParameterKey | None,
+    should_cancel: CancelCallback | None = None,
 ) -> object:
     instruction_reference = "\n\n".join(
         f"{message['role'].upper()}:\n{message['content']}"
@@ -3138,6 +3352,7 @@ def _repair_json_content(
         max_tokens=max(1000, min(max(provider.max_tokens or 5000, 3000), 8000)),
         timeout=timeout,
         task_key=task_key,
+        should_cancel=should_cancel,
     )
     try:
         return _loads_json_content(repaired)

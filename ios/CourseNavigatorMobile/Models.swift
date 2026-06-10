@@ -271,7 +271,7 @@ enum LocalVideoImportMode: String, Codable, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
-        case .external: "externaldrive"
+        case .external: "folder"
         case .workspace: "tray.and.arrow.down"
         }
     }

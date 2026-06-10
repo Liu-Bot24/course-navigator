@@ -111,7 +111,7 @@ enum SourceKind: String, CaseIterable, Identifiable {
     var placeholder: String {
         switch self {
         case .remote: "https://..."
-        case .path: "/Volumes/NAS/course/video.mp4 或 D:\\\\course\\\\video.mp4"
+        case .path: "/path/to/course/video.mp4 或 D:\\\\course\\\\video.mp4"
         }
     }
 

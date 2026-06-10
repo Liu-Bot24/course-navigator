@@ -1,8 +1,16 @@
-# Course Navigator
+# Course Navigator iOS 分支
 
 [English README](README.en.md)
 
 ![Course Navigator 项目横幅](docs/images/course-navigator-banner.jpg)
+
+这是 Course Navigator 的 iOS / iPadOS 客户端分支。
+
+主分支里的网页端、电脑后端和课程处理能力都还在。这个分支只是多了一个原生 iPhone / iPad App，可以连到电脑上的 Course Navigator 后端，用来浏览课程、播放视频、查看字幕和学习材料，也可以把视频缓存到当前设备。
+
+iOS App 本身不打包 Python、Node、yt-dlp 或 ffmpeg。下载、转码、字幕、ASR 和 AI 学习地图仍然由电脑后端完成；iPhone / iPad 主要负责学习界面、播放和本机缓存。
+
+如果要装到自己的 iPhone 或 iPad 上，看 [iPhone / iPad 真机安装说明](docs/ios-local-install.md)。
 
 Course Navigator 是一个视频课程学习工作台。你可以粘贴视频链接或导入本地视频，提取字幕，在视频旁校阅逐字稿，把课程整理成专辑，并用 AI 完成字幕翻译、课程分析和 ASR 字幕校正。
 

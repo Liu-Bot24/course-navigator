@@ -1083,7 +1083,7 @@ function activeJobCancelTitle(kind: ActiveJobKind | null, copy: (typeof COPY)[Ui
 
 export function App() {
   const [url, setUrl] = useState("");
-  const [mode, setMode] = useState<ExtractMode>("browser");
+  const [mode, setMode] = useState<ExtractMode>("normal");
   const [browser, setBrowser] = useState("chrome");
   const [cookiesPath, setCookiesPath] = useState("");
   const [cookieTextModalOpen, setCookieTextModalOpen] = useState(false);
@@ -1591,12 +1591,16 @@ export function App() {
     }
     if (shouldBlockOnlineAsrSource()) return;
     const existing = findExistingItemForUrl(items, normalizedUrl);
+    const selectedMatchesUrl = selected ? canonicalSourceKey(selected.source_url) === canonicalSourceKey(normalizedUrl) : false;
     const nextSourceMode = preferredSourceModeForSource(normalizedUrl, existing);
     setError(null);
     setJobStatus(null);
     setSourceMode(nextSourceMode);
     setSeekTime(0);
     setPlayheadTime(0);
+    if (!existing && !selectedMatchesUrl) {
+      setSelected(null);
+    }
     if (existing?.transcript.length) {
       selectCourse(existing);
       return;
@@ -1646,6 +1650,9 @@ export function App() {
     setSourceMode(nextSourceMode);
     setSeekTime(0);
     setPlayheadTime(0);
+    if (!targetItem) {
+      setSelected(null);
+    }
     try {
       if (usesBackgroundSubtitleExtraction(subtitleSource)) {
         await runExtractJob(normalizedUrl, nextSourceMode);

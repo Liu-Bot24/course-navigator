@@ -254,7 +254,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.liuqi.coursenavigator.mobile;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.coursenavigator.mobile;
 				PRODUCT_NAME = "Course Navigator";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -339,7 +339,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.liuqi.coursenavigator.mobile;
+				PRODUCT_BUNDLE_IDENTIFIER = com.example.coursenavigator.mobile;
 				PRODUCT_NAME = "Course Navigator";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";

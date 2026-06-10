@@ -169,7 +169,8 @@ describe("App language defaults", () => {
     expect(screen.queryByRole("button", { name: "分析" })).toBeNull();
     expect(screen.queryByDisplayValue("https://www.youtube.com/watch?v=JPcx9qHzzgk&t=13s")).toBeNull();
     expect(screen.getByText("提取登录")).toBeTruthy();
-    expect(screen.getByText("Cookie 来源")).toBeTruthy();
+    expect((screen.getByRole("combobox", { name: "提取登录" }) as HTMLSelectElement).value).toBe("normal");
+    expect(screen.queryByText("Cookie 来源")).toBeNull();
     expect((screen.getByRole("combobox", { name: "字幕来源" }) as HTMLSelectElement).value).toBe("subtitles");
     expect(screen.queryByRole("button", { name: "时间地图双语" })).toBeNull();
     expect(screen.getByRole("button", { name: "字幕列表双语" })).toBeTruthy();
@@ -959,6 +960,15 @@ describe("App language defaults", () => {
       message: "正在取消字幕提取",
       error: null,
     });
+    vi.mocked(getStudyJob).mockResolvedValueOnce({
+      job_id: "extract-asr-job",
+      item_id: "local-video",
+      status: "cancelled",
+      progress: 100,
+      phase: "cancelled",
+      message: "字幕提取已取消",
+      error: null,
+    });
 
     render(<App />);
 
@@ -970,6 +980,11 @@ describe("App language defaults", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "停止字幕提取" }));
     await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("extract-asr-job"));
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledWith("extract-asr-job"), { timeout: 3500 });
+    await waitFor(() => {
+      expect(screen.queryByText(/正在取消字幕提取|字幕提取已取消/)).toBeNull();
+      expect(screen.queryByRole("button", { name: "停止字幕提取" })).toBeNull();
+    });
   });
 
   it("does not show a cancel action while extraction is only fetching source subtitles", async () => {
@@ -1143,6 +1158,15 @@ describe("App language defaults", () => {
       message: "正在取消 ASR 校正",
       error: null,
     });
+    vi.mocked(getStudyJob).mockResolvedValue({
+      job_id: "asr-job",
+      item_id: "asr-lesson",
+      status: "cancelled",
+      progress: 100,
+      phase: "cancelled",
+      message: "ASR 校正已取消",
+      error: null,
+    });
 
     render(<App />);
 
@@ -1152,6 +1176,12 @@ describe("App language defaults", () => {
     fireEvent.click(await screen.findByRole("button", { name: "停止 ASR 校正" }));
 
     await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("asr-job"));
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledWith("asr-job"), { timeout: 3500 });
+    await waitFor(() => {
+      expect(screen.queryByText("ASR 校正进行中")).toBeNull();
+      expect(screen.queryByRole("button", { name: "停止 ASR 校正" })).toBeNull();
+    });
+    await waitFor(() => expect(screen.getByText("ASR 校正已取消")).toBeTruthy());
   });
 
   it("does not embed Bilibili by default and offers force streaming", async () => {
@@ -1188,6 +1218,76 @@ describe("App language defaults", () => {
     fireEvent.click(screen.getByRole("button", { name: "强制在线播放" }));
 
     expect(await screen.findByTitle("Bilibili lesson")).toBeTruthy();
+  });
+
+  it("clears a stale Bilibili player gate while a pasted YouTube URL is loading", async () => {
+    let resolvePreview!: (item: CourseItem) => void;
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "bili-lesson",
+        source_url: "https://www.bilibili.com/video/BV1iVoVBgERD/",
+        title: "Bilibili lesson",
+        duration: 120,
+        created_at: new Date().toISOString(),
+        transcript: [{ start: 0, end: 2, text: "Hello" }],
+        metadata: {
+          id: "BV1iVoVBgERD",
+          title: "Bilibili lesson",
+          duration: 120,
+          webpage_url: "https://www.bilibili.com/video/BV1iVoVBgERD/",
+          extractor: "BiliBili",
+          stream_url: null,
+          hls_manifest_url: null,
+          language: "zh-CN",
+          subtitles: [],
+          automatic_captions: [],
+        },
+        study: null,
+        local_video_path: null,
+      },
+    ]);
+    vi.mocked(previewCourse).mockReturnValueOnce(new Promise((resolve) => {
+      resolvePreview = resolve;
+    }));
+
+    render(<App />);
+
+    expect(await screen.findAllByText("bilibili站外播放不提供字幕时间轴功能，建议缓存后观看。")).not.toHaveLength(0);
+
+    const input = screen.getByPlaceholderText("粘贴课程或视频 URL");
+    fireEvent.change(input, { target: { value: "https://www.youtube.com/watch?v=L8twqy2ua_I" } });
+    fireEvent.submit(input.closest("form") as HTMLFormElement);
+
+    await waitFor(() => expect(previewCourse).toHaveBeenCalledWith(expect.objectContaining({
+      url: "https://www.youtube.com/watch?v=L8twqy2ua_I",
+    })));
+    expect(screen.queryByText("bilibili站外播放不提供字幕时间轴功能，建议缓存后观看。")).toBeNull();
+    expect(screen.getByText("还没有加载视频")).toBeTruthy();
+
+    await act(async () => {
+      resolvePreview({
+        id: "yt-lesson",
+        source_url: "https://www.youtube.com/watch?v=L8twqy2ua_I",
+        title: "YouTube lesson",
+        duration: 120,
+        created_at: new Date().toISOString(),
+        transcript: [{ start: 0, end: 2, text: "YouTube line" }],
+        metadata: {
+          id: "L8twqy2ua_I",
+          title: "YouTube lesson",
+          duration: 120,
+          webpage_url: "https://www.youtube.com/watch?v=L8twqy2ua_I",
+          extractor: "youtube",
+          stream_url: null,
+          hls_manifest_url: null,
+          language: "zh-CN",
+          subtitles: [],
+          automatic_captions: [],
+        },
+        study: null,
+        local_video_path: null,
+      });
+    });
   });
 
   it("uses the local player by default for cached videos and keeps native fullscreen available", async () => {
@@ -1517,6 +1617,15 @@ describe("App language defaults", () => {
       message: "正在取消视频缓存",
       error: null,
     });
+    vi.mocked(getStudyJob).mockResolvedValueOnce({
+      job_id: "download-job",
+      item_id: "cache-lesson",
+      status: "cancelled",
+      progress: 100,
+      phase: "cancelled",
+      message: "视频缓存已取消",
+      error: null,
+    });
 
     render(<App />);
 
@@ -1524,6 +1633,11 @@ describe("App language defaults", () => {
     fireEvent.click(await screen.findByRole("button", { name: "停止缓存视频" }));
 
     await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("download-job"));
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledWith("download-job"), { timeout: 3500 });
+    await waitFor(() => {
+      expect(screen.queryByText(/正在取消视频缓存|视频缓存已取消/)).toBeNull();
+      expect(screen.queryByRole("button", { name: "停止缓存视频" })).toBeNull();
+    });
   });
 
   it("shows a cancel action while translating subtitles", async () => {
@@ -1557,6 +1671,15 @@ describe("App language defaults", () => {
       message: "正在取消字幕翻译",
       error: null,
     });
+    vi.mocked(getStudyJob).mockResolvedValueOnce({
+      job_id: "translation-job",
+      item_id: "translation-lesson",
+      status: "cancelled",
+      progress: 100,
+      phase: "cancelled",
+      message: "字幕翻译已取消",
+      error: null,
+    });
 
     render(<App />);
 
@@ -1564,6 +1687,11 @@ describe("App language defaults", () => {
     fireEvent.click(await screen.findByRole("button", { name: "停止翻译字幕" }));
 
     await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("translation-job"));
+    await waitFor(() => expect(getStudyJob).toHaveBeenCalledWith("translation-job"), { timeout: 3500 });
+    await waitFor(() => {
+      expect(screen.queryByText(/正在取消字幕翻译|字幕翻译已取消/)).toBeNull();
+      expect(screen.queryByRole("button", { name: "停止翻译字幕" })).toBeNull();
+    });
   });
 
   it("keeps the top-right fullscreen control available after entering shell fullscreen", async () => {

@@ -4,15 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-EXTERNAL_SSD="/Volumes/Acer SSD N5000"
-DEFAULT_DERIVED_DATA_DIR="$EXTERNAL_SSD/CodexBuilds/course-navigator-ios-device-install"
-DERIVED_DATA_DIR="${COURSE_NAVIGATOR_IOS_DERIVED_DATA:-$DEFAULT_DERIVED_DATA_DIR}"
-ALLOW_LOCAL_DERIVED_DATA="${COURSE_NAVIGATOR_ALLOW_LOCAL_DERIVED_DATA:-0}"
+DEFAULT_DERIVED_DATA_DIR="$ROOT_DIR/ios/.build/xcode-derived-data/device-install"
+CUSTOM_DERIVED_DATA_DIR="${COURSE_NAVIGATOR_IOS_DERIVED_DATA:-}"
+DERIVED_DATA_DIR="${CUSTOM_DERIVED_DATA_DIR:-$DEFAULT_DERIVED_DATA_DIR}"
 MIN_DERIVED_DATA_FREE_GIB="${COURSE_NAVIGATOR_IOS_MIN_DERIVED_DATA_FREE_GIB:-8}"
 PROJECT_PATH="ios/CourseNavigatorMobile.xcodeproj"
 SCHEME="CourseNavigatorMobile"
 CONFIGURATION="${COURSE_NAVIGATOR_IOS_CONFIGURATION:-Debug}"
-DEFAULT_BUNDLE_ID="com.liuqi.coursenavigator.mobile"
+DEFAULT_BUNDLE_ID="com.example.coursenavigator.mobile"
 BUNDLE_ID="${COURSE_NAVIGATOR_IOS_BUNDLE_ID:-$DEFAULT_BUNDLE_ID}"
 APP_NAME="${COURSE_NAVIGATOR_IOS_APP_NAME:-Course Navigator}"
 DEVICE_ID="${COURSE_NAVIGATOR_IOS_DEVICE_ID:-}"
@@ -26,31 +25,25 @@ section() {
   printf '\n== %s ==\n' "$1"
 }
 
-volume_root_for_path() {
+display_path() {
   local path="$1"
-  local relative_volume_path volume_name
-  relative_volume_path="${path#/Volumes/}"
-  volume_name="${relative_volume_path%%/*}"
-  if [[ -n "$volume_name" && "$path" == /Volumes/* ]]; then
-    printf '/Volumes/%s' "$volume_name"
+  if [[ "$path" == "$ROOT_DIR/"* ]]; then
+    printf '%s' "${path#$ROOT_DIR/}"
+  else
+    printf 'custom path'
   fi
 }
 
-is_mounted_volume_root() {
-  local volume_root="$1"
-  [[ -n "$volume_root" ]] && mount | grep -F " on $volume_root (" >/dev/null 2>&1
-}
-
-require_external_derived_data() {
-  if [[ "$DERIVED_DATA_DIR" != /Volumes/* ]]; then
+check_derived_data_location() {
+  if [[ -z "$CUSTOM_DERIVED_DATA_DIR" ]]; then
     return
   fi
 
-  local volume_root
-  volume_root="$(volume_root_for_path "$DERIVED_DATA_DIR")"
-  if ! is_mounted_volume_root "$volume_root"; then
-    printf 'DerivedData external volume is not mounted: %s\n' "$volume_root" >&2
-    printf 'No build was started. Mount the external volume or set COURSE_NAVIGATOR_IOS_DERIVED_DATA to another safe path.\n' >&2
+  local parent_dir
+  parent_dir="$(dirname "$DERIVED_DATA_DIR")"
+  if [[ ! -d "$parent_dir" ]]; then
+    printf 'DerivedData override parent directory does not exist.\n' >&2
+    printf 'No build was started. Set COURSE_NAVIGATOR_IOS_DERIVED_DATA to another path or clear it to use the project build cache.\n' >&2
     exit 1
   fi
 }
@@ -61,19 +54,13 @@ check_derived_data_disk() {
     min_free_gib=8
   fi
 
-  if [[ "$DERIVED_DATA_DIR" != /Volumes/* && "$ALLOW_LOCAL_DERIVED_DATA" != "1" ]]; then
-    printf 'DerivedData is not on an external volume: %s\n' "$DERIVED_DATA_DIR" >&2
-    printf 'No build was started. Use the external SSD, or set COURSE_NAVIGATOR_ALLOW_LOCAL_DERIVED_DATA=1 intentionally.\n' >&2
-    exit 1
-  fi
-
   mkdir -p "$DERIVED_DATA_DIR"
 
   local available_gib
   available_gib="$(df -g "$DERIVED_DATA_DIR" | awk 'NR == 2 {print $4}')"
   if [[ -n "$available_gib" && "$available_gib" -lt "$min_free_gib" ]]; then
-    printf 'DerivedData volume has only %s GiB free: %s\n' "$available_gib" "$DERIVED_DATA_DIR" >&2
-    printf 'No build was started. Free space on that volume or choose a larger external SSD path.\n' >&2
+    printf 'DerivedData location has only %s GiB free.\n' "$available_gib" >&2
+    printf 'No build was started. Free space or set COURSE_NAVIGATOR_IOS_DERIVED_DATA to another path.\n' >&2
     exit 1
   fi
 }
@@ -83,7 +70,7 @@ check_local_disk() {
   available_gib="$(df -g / | awk 'NR == 2 {print $4}')"
   if [[ -n "$available_gib" && "$available_gib" -lt 8 ]]; then
     printf 'Local disk has only %s GiB free. No build was started.\n' "$available_gib" >&2
-    printf 'Free local disk space first, even though DerivedData is on the external SSD.\n' >&2
+    printf 'Free local disk space before retrying.\n' >&2
     exit 1
   fi
 }
@@ -190,7 +177,7 @@ build_for_device() {
   local device_name="$2"
   mkdir -p "$DERIVED_DATA_DIR"
   section "Build: $device_name"
-  printf 'DerivedData: %s\n' "$DERIVED_DATA_DIR"
+  printf 'DerivedData: %s\n' "$(display_path "$DERIVED_DATA_DIR")"
 
   local build_args=(
     -project "$PROJECT_PATH"
@@ -276,13 +263,8 @@ find_built_app_path() {
   return 1
 }
 
-section "Disk"
-df -h / || true
-if [[ -d "$EXTERNAL_SSD" ]]; then
-  df -h "$EXTERNAL_SSD" || true
-fi
-
-require_external_derived_data
+section "Build Cache"
+check_derived_data_location
 check_local_disk
 check_derived_data_disk
 prepare_xcode

@@ -1,9 +1,11 @@
 import json
+import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 import course_navigator.ytdlp as ytdlp_module
@@ -19,9 +21,11 @@ from course_navigator.online_asr import (
     extract_online_asr_transcript,
 )
 from course_navigator.ytdlp import (
+    YtDlpCancelled,
     YtDlpError,
     YtDlpRunner,
     _extract_audio_file,
+    _run_whisper_asr,
     build_auth_args,
     build_runtime_args,
     choose_source_subtitle_language,
@@ -33,6 +37,16 @@ def _fake_executable(path: Path) -> Path:
     path.write_text("", encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _fake_ios_compatible_probe(_path: Path) -> dict[str, object]:
+    return {
+        "format_names": set(ytdlp_module.IOS_MP4_FORMAT_NAMES),
+        "video_codec": "h264",
+        "audio_codecs": {"aac"},
+        "width": 1280,
+        "height": 720,
+    }
 
 
 def test_build_auth_args_for_normal_mode():
@@ -291,7 +305,7 @@ def test_ytdlp_commands_enable_youtube_challenge_solver_and_single_video_mode(mo
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
     monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/whisper" if name == "whisper" else None)
-    monkeypatch.setattr(ytdlp_module, "_probe_video_file", lambda path: {"streams": [{"codec_type": "video"}]})
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", _fake_ios_compatible_probe)
     monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
     runner = YtDlpRunner(binary="yt-dlp")
     extract_request = ExtractRequest(
@@ -480,6 +494,43 @@ def test_fetch_metadata_retries_without_browser_cookies_when_cookie_database_is_
     assert "--cookies-from-browser" not in calls[1]
 
 
+def test_fetch_metadata_retries_without_browser_cookies_when_dpapi_decryption_fails(monkeypatch):
+    calls = []
+
+    class FailedCookieResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: Failed to decrypt with DPAPI. See https://github.com/yt-dlp/yt-dlp/issues/10927"
+
+    class MetadataResult:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Public Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {"en": [{"ext": "vtt"}]},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        return FailedCookieResult() if len(calls) == 1 else MetadataResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    metadata = runner.fetch_metadata(request)
+
+    assert metadata.id == "abc123"
+    assert "--cookies-from-browser" in calls[0]
+    assert "--cookies-from-browser" not in calls[1]
+
+
 def test_fetch_metadata_saves_browser_cookie_cache_when_configured(monkeypatch, tmp_path):
     calls = []
 
@@ -514,6 +565,100 @@ def test_fetch_metadata_saves_browser_cookie_cache_when_configured(monkeypatch, 
     assert "--cookies" in calls[0]
     assert calls[0][calls[0].index("--cookies") + 1] == str(cache_file)
     assert calls[0][calls[0].index("--cookies-from-browser") + 1] == "chrome"
+
+
+def test_fetch_metadata_snapshots_windows_chrome_cookies_before_ytdlp(monkeypatch, tmp_path):
+    user_data = tmp_path / "Google" / "Chrome" / "User Data"
+    network_dir = user_data / "Default" / "Network"
+    network_dir.mkdir(parents=True)
+    (user_data / "Local State").write_text("{}", encoding="utf-8")
+    (network_dir / "Cookies").write_text("sqlite", encoding="utf-8")
+    copied_sources: list[Path] = []
+    browser_sources: list[str] = []
+    snapshot_paths: list[Path] = []
+
+    class MetadataResult:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Cookie Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {"en": [{"ext": "vtt"}]},
+            }
+        )
+        stderr = ""
+
+    real_copy2 = ytdlp_module.shutil.copy2
+
+    def fake_copy2(src, dst, *args, **kwargs):
+        copied_sources.append(Path(src))
+        return real_copy2(src, dst, *args, **kwargs)
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        browser_source = cmd[cmd.index("--cookies-from-browser") + 1]
+        browser_sources.append(browser_source)
+        assert browser_source.startswith("chrome:")
+        snapshot_profile = Path(browser_source.split(":", 1)[1])
+        snapshot_paths.append(snapshot_profile)
+        assert (snapshot_profile.parent / "Local State").exists()
+        assert (snapshot_profile / "Network" / "Cookies").exists()
+        return MetadataResult()
+
+    monkeypatch.setattr(ytdlp_module.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(ytdlp_module.shutil, "copy2", fake_copy2)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp")
+
+    metadata = runner.fetch_metadata(
+        ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+    )
+
+    assert metadata.id == "abc123"
+    assert user_data / "Local State" in copied_sources
+    assert network_dir / "Cookies" in copied_sources
+    assert browser_sources and browser_sources[0] != "chrome"
+    assert snapshot_paths and not snapshot_paths[0].exists()
+
+
+def test_fetch_metadata_leaves_windows_firefox_cookies_to_ytdlp(monkeypatch):
+    browser_sources: list[str] = []
+
+    class MetadataResult:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "id": "abc123",
+                "title": "A Firefox Cookie Lesson",
+                "webpage_url": "https://www.youtube.com/watch?v=abc",
+                "extractor": "youtube",
+                "subtitles": {},
+                "automatic_captions": {"en": [{"ext": "vtt"}]},
+            }
+        )
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        browser_sources.append(cmd[cmd.index("--cookies-from-browser") + 1])
+        return MetadataResult()
+
+    monkeypatch.setattr(ytdlp_module.sys, "platform", "win32")
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp")
+
+    metadata = runner.fetch_metadata(
+        ExtractRequest(
+            url="https://www.youtube.com/watch?v=abc",
+            mode="browser",
+            browser="firefox:abc.default-release::Work",
+        )
+    )
+
+    assert metadata.id == "abc123"
+    assert browser_sources == ["firefox:abc.default-release::Work"]
 
 
 def test_fetch_metadata_uses_cached_browser_cookies_when_browser_database_is_locked(monkeypatch, tmp_path):
@@ -581,7 +726,35 @@ def test_fetch_metadata_preserves_cookie_copy_error_when_normal_retry_still_requ
     runner = YtDlpRunner(binary="yt-dlp")
     request = ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
 
-    with pytest.raises(YtDlpError, match="无法读取浏览器 Cookie 来源 chrome"):
+    with pytest.raises(YtDlpError, match="浏览器正在运行或 Cookie 数据库被锁定"):
+        runner.fetch_metadata(request)
+
+    assert "--cookies-from-browser" in calls[0]
+    assert "--cookies-from-browser" not in calls[1]
+
+
+def test_fetch_metadata_preserves_dpapi_error_when_normal_retry_still_requires_login(monkeypatch):
+    calls = []
+
+    class FailedCookieResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: Failed to decrypt with DPAPI. See https://github.com/yt-dlp/yt-dlp/issues/10927"
+
+    class FailedLoginResult:
+        returncode = 1
+        stdout = ""
+        stderr = "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        return FailedCookieResult() if len(calls) == 1 else FailedLoginResult()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = ExtractRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    with pytest.raises(YtDlpError, match="DPAPI/App-Bound"):
         runner.fetch_metadata(request)
 
     assert "--cookies-from-browser" in calls[0]
@@ -819,13 +992,7 @@ def test_download_video_returns_generated_video(monkeypatch, tmp_path):
             return self.returncode
 
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
-    monkeypatch.setattr(ytdlp_module, "_probe_video_file", lambda path: {
-        "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
-        "video_codec": "h264",
-        "audio_codecs": {"aac"},
-        "width": 1280,
-        "height": 720,
-    })
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", _fake_ios_compatible_probe)
     monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
     runner = YtDlpRunner(binary="yt-dlp")
     request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
@@ -851,13 +1018,7 @@ def test_download_video_reports_percentage_progress(monkeypatch, tmp_path):
             return self.returncode
 
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
-    monkeypatch.setattr(ytdlp_module, "_probe_video_file", lambda path: {
-        "format_names": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
-        "video_codec": "h264",
-        "audio_codecs": {"aac"},
-        "width": 1280,
-        "height": 720,
-    })
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", _fake_ios_compatible_probe)
     monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
     runner = YtDlpRunner(binary="yt-dlp")
     request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
@@ -870,6 +1031,221 @@ def test_download_video_reports_percentage_progress(monkeypatch, tmp_path):
     assert 95 in progress or 100 in progress
 
 
+def test_download_video_snapshots_windows_chrome_cookies_before_ytdlp(monkeypatch, tmp_path):
+    user_data = tmp_path / "Google" / "Chrome" / "User Data"
+    network_dir = user_data / "Default" / "Network"
+    network_dir.mkdir(parents=True)
+    (user_data / "Local State").write_text("{}", encoding="utf-8")
+    (network_dir / "Cookies").write_text("sqlite", encoding="utf-8")
+    browser_sources: list[str] = []
+    snapshot_paths: list[Path] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            browser_source = cmd[cmd.index("--cookies-from-browser") + 1]
+            browser_sources.append(browser_source)
+            assert browser_source.startswith("chrome:")
+            snapshot_profile = Path(browser_source.split(":", 1)[1])
+            snapshot_paths.append(snapshot_profile)
+            assert (snapshot_profile.parent / "Local State").exists()
+            assert (snapshot_profile / "Network" / "Cookies").exists()
+            self.stdout = iter([])
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            Path(tmp_path, "abc.mp4").write_text("video", encoding="utf-8")
+            return self.returncode
+
+    monkeypatch.setattr(ytdlp_module.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", _fake_ios_compatible_probe)
+    monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    path = runner.download_video(request, tmp_path, "abc")
+
+    assert path.name == "abc.mp4"
+    assert browser_sources and browser_sources[0] != "chrome"
+    assert snapshot_paths and not snapshot_paths[0].exists()
+
+
+def test_download_video_retries_without_browser_cookies_when_dpapi_decryption_fails(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProcess:
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            self.cmd = cmd
+            calls.append(cmd)
+            if len(calls) == 1:
+                self.stdout = iter([
+                    "ERROR: Failed to decrypt with DPAPI. See https://github.com/yt-dlp/yt-dlp/issues/10927\n"
+                ])
+                self.returncode = 1
+            else:
+                self.stdout = iter([])
+                self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            if self.returncode == 0:
+                Path(tmp_path, "abc.mp4").write_text("video", encoding="utf-8")
+            return self.returncode
+
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", _fake_ios_compatible_probe)
+    monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    path = runner.download_video(request, tmp_path, "abc")
+
+    assert path.name == "abc.mp4"
+    assert "--cookies-from-browser" in calls[0]
+    assert "--cookies-from-browser" not in calls[1]
+
+
+def test_download_video_cleans_partial_files_before_public_retry_after_browser_cookie_failure(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeProcess:
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            self.cmd = cmd
+            calls.append(cmd)
+            if len(calls) == 1:
+                self.stdout = iter([
+                    "[download]   3.0% of 100.00MiB\n",
+                    "ERROR: Failed to decrypt with DPAPI. See https://github.com/yt-dlp/yt-dlp/issues/10927\n",
+                ])
+                self.returncode = 1
+            else:
+                self.stdout = iter([])
+                self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            if len(calls) == 1:
+                (tmp_path / "abc.f399.mp4").write_text("partial video", encoding="utf-8")
+                (tmp_path / "abc.mp4.part").write_text("partial merge", encoding="utf-8")
+                (tmp_path / "abc4.mp4").write_text("other item", encoding="utf-8")
+            else:
+                assert not (tmp_path / "abc.f399.mp4").exists()
+                assert not (tmp_path / "abc.mp4.part").exists()
+                Path(tmp_path, "abc.mp4").write_text("video", encoding="utf-8")
+            return self.returncode
+
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(ytdlp_module, "_probe_video_file", _fake_ios_compatible_probe)
+    monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.youtube.com/watch?v=abc", mode="browser", browser="chrome")
+
+    path = runner.download_video(request, tmp_path, "abc")
+
+    assert path.name == "abc.mp4"
+    assert "--cookies-from-browser" in calls[0]
+    assert "--cookies-from-browser" not in calls[1]
+    assert not (tmp_path / "abc.f399.mp4").exists()
+    assert not (tmp_path / "abc.mp4.part").exists()
+    assert (tmp_path / "abc4.mp4").exists()
+
+
+def test_download_video_failure_preserves_existing_cached_video_and_cleans_new_partial_files(monkeypatch, tmp_path):
+    existing = tmp_path / "abc.mp4"
+    existing.write_text("existing video", encoding="utf-8")
+
+    class FakeProcess:
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            self.stdout = iter(["ERROR: ffmpeg not found. Please install or provide --ffmpeg-location\n"])
+
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            (tmp_path / "abc.f399.mp4").write_text("partial video", encoding="utf-8")
+            return 1
+
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(ytdlp_module, "_ensure_ios_compatible_video", lambda path, progress=None: path)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
+
+    with pytest.raises(YtDlpError, match="缺少 ffmpeg"):
+        runner.download_video(request, tmp_path, "abc")
+
+    assert existing.read_text(encoding="utf-8") == "existing video"
+    assert not (tmp_path / "abc.f399.mp4").exists()
+
+
+def test_download_video_terminates_process_when_cancel_requested(monkeypatch, tmp_path):
+    spawned = Event()
+    terminated = Event()
+    processes = []
+
+    class BlockingStdout:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not terminated.wait(2):
+                raise AssertionError("download process was not terminated after cancellation")
+            raise StopIteration
+
+    class FakeProcess:
+        returncode = 1
+
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            self.cmd = cmd
+            self.stdout = BlockingStdout()
+            self.terminate_called = False
+            processes.append(self)
+            spawned.set()
+
+        def poll(self):
+            return self.returncode if terminated.is_set() else None
+
+        def terminate(self):
+            self.terminate_called = True
+            terminated.set()
+
+        def kill(self):
+            terminated.set()
+
+        def wait(self, timeout=None):
+            terminated.wait(timeout or 2)
+            return self.returncode
+
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
+
+    with pytest.raises(YtDlpCancelled):
+        runner.download_video(request, tmp_path, "abc", should_cancel=lambda: spawned.is_set())
+
+    assert processes[0].terminate_called
+
+
 def test_download_video_merges_newer_bilibili_audio_fragment(monkeypatch, tmp_path):
     class FakeProcess:
         returncode = 0
@@ -877,7 +1253,10 @@ def test_download_video_merges_newer_bilibili_audio_fragment(monkeypatch, tmp_pa
         def __init__(self, cmd, stdout, stderr, text, **_kwargs):
             self.stdout = iter([])
 
-        def wait(self):
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
             video = tmp_path / "abc.f30120.mp4"
             audio = tmp_path / "abc.f30280.m4a"
             video.write_bytes(b"video")
@@ -934,7 +1313,10 @@ def test_download_video_prefers_complete_video_over_newer_audio(monkeypatch, tmp
         def __init__(self, cmd, stdout, stderr, text, **_kwargs):
             self.stdout = iter([])
 
-        def wait(self):
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
             complete = tmp_path / "abc.mp4"
             audio = tmp_path / "abc.f30280.m4a"
             complete.write_bytes(b"complete")
@@ -963,6 +1345,34 @@ def test_download_video_prefers_complete_video_over_newer_audio(monkeypatch, tmp
 
     assert path == tmp_path / "abc.mp4"
     assert path.read_bytes() == b"complete"
+
+
+def test_download_video_explains_missing_ffmpeg(monkeypatch, tmp_path):
+    class FakeProcess:
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            self.stdout = iter(["ERROR: ffmpeg not found. Please install or provide --ffmpeg-location\n"])
+
+        def wait(self):
+            return 1
+
+    monkeypatch.setattr("subprocess.Popen", FakeProcess)
+    runner = YtDlpRunner(binary="yt-dlp")
+    request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
+
+    with pytest.raises(YtDlpError, match="缺少 ffmpeg"):
+        runner.download_video(request, tmp_path, "abc")
+
+
+def test_probe_local_video_duration_returns_none_when_ffprobe_is_missing(monkeypatch, tmp_path):
+    source = tmp_path / "Lesson.mp4"
+    source.write_bytes(b"video")
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert YtDlpRunner().probe_local_video_duration(source) is None
 
 
 def test_ensure_ios_compatible_video_remuxes_mpegts_h264_aac(monkeypatch, tmp_path):
@@ -1241,34 +1651,6 @@ def test_target_h264_bitrate_keeps_device_cache_reasonable_for_course_video():
     assert ytdlp_module._target_h264_bitrate({"width": 640, "height": 360}) == "900k"
 
 
-def test_download_video_explains_missing_ffmpeg(monkeypatch, tmp_path):
-    class FakeProcess:
-        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
-            self.stdout = iter(["ERROR: ffmpeg not found. Please install or provide --ffmpeg-location\n"])
-
-        def wait(self):
-            return 1
-
-    monkeypatch.setattr("subprocess.Popen", FakeProcess)
-    runner = YtDlpRunner(binary="yt-dlp")
-    request = DownloadRequest(url="https://www.youtube.com/watch?v=abc")
-
-    with pytest.raises(YtDlpError, match="缺少 ffmpeg"):
-        runner.download_video(request, tmp_path, "abc")
-
-
-def test_probe_local_video_duration_returns_none_when_ffprobe_is_missing(monkeypatch, tmp_path):
-    source = tmp_path / "Lesson.mp4"
-    source.write_bytes(b"video")
-
-    def fake_run(cmd, capture_output, text, check, **_kwargs):
-        raise FileNotFoundError("ffprobe")
-
-    monkeypatch.setattr("subprocess.run", fake_run)
-
-    assert YtDlpRunner().probe_local_video_duration(source) is None
-
-
 def test_extract_audio_file_uses_runtime_tool_paths_for_ffmpeg(monkeypatch, tmp_path):
     runtime_ffmpeg_dir = tmp_path / "runtime-tools" / "ffmpeg"
     executable_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
@@ -1332,6 +1714,92 @@ def test_extract_asr_reports_progress_and_simplifies_chinese(monkeypatch, tmp_pa
     assert max(progress) >= 90
 
 
+def test_run_whisper_asr_terminates_process_when_cancel_requested(monkeypatch, tmp_path):
+    audio = tmp_path / "abc.wav"
+    audio.write_text("audio", encoding="utf-8")
+    spawned = Event()
+    terminated = Event()
+
+    class BlockingWhisperProcess:
+        returncode = None
+
+        def __init__(self, cmd, stdout, stderr, text, **_kwargs):
+            spawned.set()
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(["whisper"], timeout)
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            terminated.set()
+
+        def kill(self):
+            self.returncode = -9
+            terminated.set()
+
+        def wait(self, timeout=None):
+            self.returncode = self.returncode if self.returncode is not None else -15
+            return self.returncode
+
+    monkeypatch.setattr("subprocess.Popen", BlockingWhisperProcess)
+    monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/whisper" if name == "whisper" else None)
+
+    with pytest.raises(YtDlpCancelled):
+        _run_whisper_asr(audio, tmp_path, should_cancel=lambda: spawned.is_set())
+
+    assert terminated.is_set()
+
+
+def test_extract_asr_terminates_audio_extraction_when_cancel_requested(monkeypatch, tmp_path):
+    spawned = Event()
+    terminated = Event()
+
+    class BlockingAudioProcess:
+        returncode = None
+
+        def __init__(self, cmd, stdout=None, stderr=None, text=None, **_kwargs):
+            spawned.set()
+
+        def communicate(self):
+            assert terminated.wait(2)
+            return "", ""
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            terminated.set()
+
+        def kill(self):
+            self.returncode = -9
+            terminated.set()
+
+        def wait(self, timeout=None):
+            self.returncode = self.returncode if self.returncode is not None else -15
+            return self.returncode
+
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("ASR audio extraction should use a cancellable process")
+
+    monkeypatch.setattr("subprocess.run", unexpected_run)
+    monkeypatch.setattr("subprocess.Popen", BlockingAudioProcess)
+    runner = YtDlpRunner(binary="yt-dlp")
+
+    with pytest.raises(YtDlpCancelled):
+        runner.extract_asr(
+            ExtractRequest(url="https://www.youtube.com/watch?v=abc", subtitle_source="asr"),
+            tmp_path,
+            "abc",
+            should_cancel=lambda: spawned.is_set(),
+        )
+
+    assert terminated.is_set()
+
+
 def test_extract_asr_finds_whisper_from_current_virtualenv_when_path_is_missing(monkeypatch, tmp_path):
     calls = []
     script_dir = tmp_path / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
@@ -1388,7 +1856,7 @@ def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypat
     monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
     monkeypatch.setattr(
         "course_navigator.online_asr._transcribe_chunk",
-        lambda provider, service, audio_path, language: {
+        lambda provider, service, audio_path, language, should_cancel=None: {
             "segments": [{"start": 0.0, "end": 1.5, "text": "online transcript"}]
         },
     )
@@ -1409,6 +1877,18 @@ def test_online_asr_extracts_and_compresses_audio_before_transcription(monkeypat
     assert "-b:a" in ffmpeg_cmd
     assert ffmpeg_cmd[ffmpeg_cmd.index("-b:a") + 1] == "64k"
     assert result[0].text == "online transcript"
+
+
+def test_online_asr_stops_before_audio_work_when_cancel_requested(tmp_path):
+    with pytest.raises(YtDlpCancelled, match="ASR was cancelled"):
+        extract_online_asr_transcript(
+            ExtractRequest(url="https://www.youtube.com/watch?v=abc", subtitle_source="online_asr"),
+            tmp_path,
+            "abc",
+            "yt-dlp",
+            OnlineAsrSettings(provider="xai", xai={"api_key": "xai-test"}),
+            should_cancel=lambda: True,
+        )
 
 
 def test_online_asr_compress_audio_uses_runtime_tool_paths_for_ffmpeg(monkeypatch, tmp_path):
@@ -1472,7 +1952,7 @@ def test_online_asr_retries_plain_browser_with_profile_when_login_required(monke
     monkeypatch.setattr(ytdlp_module, "_browser_cookie_profile_sources", lambda browser: [f"{browser}:Default"])
     monkeypatch.setattr(
         "course_navigator.online_asr._transcribe_chunk",
-        lambda provider, service, audio_path, language: {
+        lambda provider, service, audio_path, language, should_cancel=None: {
             "segments": [{"start": 0.0, "end": 1.5, "text": "online transcript"}]
         },
     )
@@ -1511,7 +1991,7 @@ def test_online_asr_defaults_to_current_python_ytdlp_module(monkeypatch, tmp_pat
     monkeypatch.setattr("shutil.which", lambda name, **_kwargs: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
     monkeypatch.setattr(
         "course_navigator.online_asr._transcribe_chunk",
-        lambda provider, service, audio_path, language: {
+        lambda provider, service, audio_path, language, should_cancel=None: {
             "segments": [{"start": 0.0, "end": 1.5, "text": "online transcript"}]
         },
     )

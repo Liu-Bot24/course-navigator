@@ -6,10 +6,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager, suppress
 from pathlib import Path
+from threading import Event, Thread
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
@@ -27,6 +30,10 @@ class YtDlpError(RuntimeError):
     pass
 
 
+class YtDlpCancelled(YtDlpError):
+    pass
+
+
 NON_AUXILIARY_SUBTITLE_SELECTOR = "all,-danmaku,-live_chat,-comments,-rechat"
 DEFAULT_SUBTITLE_LANGUAGE_PRIORITY = (
     "zh-Hans",
@@ -39,6 +46,9 @@ DEFAULT_SUBTITLE_LANGUAGE_PRIORITY = (
     "ja",
 )
 YTDLP_RUNTIME_ARGS = ("--remote-components", "ejs:github", "--no-playlist")
+CHROMIUM_COOKIE_BROWSERS = {"brave", "chrome", "chromium", "edge", "opera", "vivaldi", "whale"}
+CHROMIUM_BROWSERS_WITHOUT_PROFILES = {"opera"}
+COOKIE_SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
 IOS_COMPATIBLE_DOWNLOAD_FORMAT = (
     "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/"
     "b[ext=mp4][vcodec^=avc1]/"
@@ -194,47 +204,73 @@ class YtDlpRunner:
         target_dir: Path,
         item_id: str,
         progress: Callable[[int, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
         output_template = str(target_dir / f"{item_id}.%(ext)s")
-        cmd = [
-            *self.command_prefix(),
-            "--newline",
-            "--format",
-            IOS_COMPATIBLE_DOWNLOAD_FORMAT,
-            "--merge-output-format",
-            "mp4",
-            "--remux-video",
-            "mp4",
-            "--force-overwrites",
-            "--output",
-            output_template,
-            *build_runtime_args(),
-            *build_auth_args(request),
-            str(request.url),
-        ]
+        existing_download_files = _item_download_files(target_dir, item_id)
         if progress:
             progress(1, "正在准备缓存视频")
-        process = popen_hidden(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        output_lines: list[str] = []
-        try:
-            if process.stdout:
-                for line in process.stdout:
-                    output_lines.append(line)
-                    percent = _download_percent(line)
-                    if percent is not None and progress:
-                        progress(max(1, min(95, percent)), "正在缓存视频")
-        except BaseException:
-            _terminate_process(process)
-            raise
-        returncode = process.wait()
+        with _browser_cookie_snapshot_request(request) as command_request:
+            cmd = [
+                *self.command_prefix(),
+                "--newline",
+                "--format",
+                IOS_COMPATIBLE_DOWNLOAD_FORMAT,
+                "--merge-output-format",
+                "mp4",
+                "--remux-video",
+                "mp4",
+                "--force-overwrites",
+                "--output",
+                output_template,
+                *build_runtime_args(),
+                *build_auth_args(command_request),
+                str(command_request.url),
+            ]
+            process = popen_hidden(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            stop_monitor = _start_cancellation_monitor(process, should_cancel)
+            output_lines: list[str] = []
+            try:
+                if process.stdout:
+                    for line in process.stdout:
+                        if _should_cancel(should_cancel):
+                            raise YtDlpCancelled("Download was cancelled")
+                        output_lines.append(line)
+                        percent = _download_percent(line)
+                        if percent is not None and progress:
+                            progress(max(1, min(95, percent)), "正在缓存视频")
+            except BaseException:
+                _terminate_process(process)
+                if stop_monitor is not None:
+                    stop_monitor.set()
+                raise
+            try:
+                returncode = process.wait()
+            finally:
+                if stop_monitor is not None:
+                    stop_monitor.set()
         output = "".join(output_lines).strip()
+        if _should_cancel(should_cancel):
+            _delete_new_item_download_files(target_dir, item_id, existing_download_files)
+            raise YtDlpCancelled("Download was cancelled")
         if returncode != 0:
+            if request.mode == "browser" and _looks_like_browser_cookie_access_error(output):
+                _delete_new_item_download_files(target_dir, item_id, existing_download_files)
+                retry_request = request.model_copy(update={"mode": "normal"})
+                return self.download_video(
+                    retry_request,
+                    target_dir,
+                    item_id,
+                    progress=progress,
+                    should_cancel=should_cancel,
+                )
+            _delete_new_item_download_files(target_dir, item_id, existing_download_files)
             raise YtDlpError(_friendly_error(output, request, "yt-dlp video download failed"))
         if progress:
             progress(96, "正在校验缓存视频")
@@ -247,8 +283,11 @@ class YtDlpRunner:
         target_dir: Path,
         item_id: str,
         progress: Callable[[int, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[TranscriptSegment]:
         target_dir.mkdir(parents=True, exist_ok=True)
+        if _should_cancel(should_cancel):
+            raise YtDlpCancelled("ASR was cancelled")
         if progress:
             progress(3, "正在准备本地 ASR 音频")
         audio_template = str(target_dir / f"{item_id}.%(ext)s")
@@ -265,7 +304,19 @@ class YtDlpRunner:
                 str(active_request.url),
             ]
 
-        audio_result, active_request = _run_with_browser_cookie_retry(audio_command, request, self.cookie_cache_dir)
+        run_audio_command = (
+            (lambda builder, active_request: _run_cancellable_with_browser_cookie_snapshot(builder, active_request, should_cancel))
+            if should_cancel is not None
+            else _run_hidden_with_browser_cookie_snapshot
+        )
+        audio_result, active_request = _run_with_browser_cookie_retry(
+            audio_command,
+            request,
+            self.cookie_cache_dir,
+            run_command=run_audio_command,
+        )
+        if _should_cancel(should_cancel):
+            raise YtDlpCancelled("ASR was cancelled")
         if audio_result.returncode != 0:
             raise YtDlpError(_friendly_error(audio_result.stderr.strip(), active_request, "yt-dlp audio extraction failed"))
         if progress:
@@ -275,7 +326,7 @@ class YtDlpRunner:
         if not audio_file:
             raise YtDlpError("yt-dlp did not produce an audio file for ASR")
 
-        return _run_whisper_asr(audio_file, target_dir, request.language, progress)
+        return _run_whisper_asr(audio_file, target_dir, request.language, progress, should_cancel=should_cancel)
 
     def extract_asr_from_file(
         self,
@@ -284,13 +335,18 @@ class YtDlpRunner:
         item_id: str,
         language: str = "auto",
         progress: Callable[[int, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[TranscriptSegment]:
+        if _should_cancel(should_cancel):
+            raise YtDlpCancelled("ASR was cancelled")
         if progress:
             progress(3, "正在准备本地视频 ASR 音频")
-        audio_file = _extract_audio_file(video_path, target_dir, item_id)
+        audio_file = _extract_audio_file(video_path, target_dir, item_id, should_cancel=should_cancel)
+        if _should_cancel(should_cancel):
+            raise YtDlpCancelled("ASR was cancelled")
         if progress:
             progress(32, "音频已抽取，正在启动本地 ASR")
-        return _run_whisper_asr(audio_file, target_dir, language, progress)
+        return _run_whisper_asr(audio_file, target_dir, language, progress, should_cancel=should_cancel)
 
     def probe_local_video_duration(self, path: Path) -> float | None:
         duration = _media_duration(path)
@@ -312,9 +368,14 @@ def _run_with_browser_cookie_retry(
     command_builder: Callable[[ExtractRequest | DownloadRequest], list[str]],
     request: ExtractRequest | DownloadRequest,
     cookie_cache_dir: Path | None = None,
+    run_command: Callable[
+        [Callable[[ExtractRequest | DownloadRequest], list[str]], ExtractRequest | DownloadRequest],
+        subprocess.CompletedProcess[str],
+    ] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], ExtractRequest | DownloadRequest]:
+    active_run_command = run_command or _run_hidden_with_browser_cookie_snapshot
     active_request = _request_with_browser_cookie_cache(request, cookie_cache_dir)
-    result = run_hidden(command_builder(active_request), capture_output=True, text=True, check=False)
+    result = active_run_command(command_builder, active_request)
     if request.mode != "browser" or result.returncode == 0:
         return result, active_request
 
@@ -323,12 +384,7 @@ def _run_with_browser_cookie_retry(
     if _looks_like_login_required(result.stderr):
         for profile_request in _browser_cookie_profile_retry_requests(request):
             profile_request = _request_with_browser_cookie_cache(profile_request, cookie_cache_dir)
-            profile_result = run_hidden(
-                command_builder(profile_request),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            profile_result = active_run_command(command_builder, profile_request)
             if profile_result.returncode == 0:
                 return profile_result, profile_request
             if _looks_like_cookie_database_copy_error(profile_result.stderr) and cookie_error_result is None:
@@ -336,12 +392,7 @@ def _run_with_browser_cookie_retry(
                 cookie_error_request = profile_request
 
     for cached_request in _cached_cookie_retry_requests(request, cookie_cache_dir):
-        cached_result = run_hidden(
-            command_builder(cached_request),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        cached_result = active_run_command(command_builder, cached_request)
         if cached_result.returncode == 0:
             return cached_result, cached_request
 
@@ -349,12 +400,186 @@ def _run_with_browser_cookie_retry(
         return result, active_request
 
     retry_request = request.model_copy(update={"mode": "normal"})
-    retry_result = run_hidden(command_builder(retry_request), capture_output=True, text=True, check=False)
+    retry_result = active_run_command(command_builder, retry_request)
     if retry_result.returncode == 0:
         return retry_result, retry_request
     if cookie_error_result is not None and cookie_error_request is not None:
         return cookie_error_result, cookie_error_request
     return result, active_request
+
+
+def _run_hidden_with_browser_cookie_snapshot(
+    command_builder: Callable[[ExtractRequest | DownloadRequest], list[str]],
+    request: ExtractRequest | DownloadRequest,
+) -> subprocess.CompletedProcess[str]:
+    with _browser_cookie_snapshot_request(request) as command_request:
+        return run_hidden(command_builder(command_request), capture_output=True, text=True, check=False)
+
+
+def _run_cancellable_with_browser_cookie_snapshot(
+    command_builder: Callable[[ExtractRequest | DownloadRequest], list[str]],
+    request: ExtractRequest | DownloadRequest,
+    should_cancel: Callable[[], bool] | None,
+) -> subprocess.CompletedProcess[str]:
+    if _should_cancel(should_cancel):
+        raise YtDlpCancelled("ASR was cancelled")
+    with _browser_cookie_snapshot_request(request) as command_request:
+        cmd = command_builder(command_request)
+        process = popen_hidden(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stop_monitor = _start_cancellation_monitor(process, should_cancel)
+        try:
+            stdout, stderr = process.communicate()
+        except BaseException:
+            _terminate_process(process)
+            if stop_monitor is not None:
+                stop_monitor.set()
+            raise
+        finally:
+            if stop_monitor is not None:
+                stop_monitor.set()
+        if _should_cancel(should_cancel):
+            raise YtDlpCancelled("ASR was cancelled")
+        return subprocess.CompletedProcess(cmd, process.returncode or 0, stdout, stderr)
+
+
+@contextmanager
+def _browser_cookie_snapshot_request(request: ExtractRequest | DownloadRequest):
+    if request.mode != "browser" or sys.platform != "win32":
+        yield request
+        return
+    snapshot_dir = tempfile.TemporaryDirectory(prefix="course-nav-browser-cookies-")
+    try:
+        browser_source = _windows_browser_cookie_snapshot_source(request, Path(snapshot_dir.name))
+        if browser_source is None:
+            yield request
+            return
+        yield request.model_copy(update={"browser": browser_source})
+    finally:
+        snapshot_dir.cleanup()
+
+
+def _windows_browser_cookie_snapshot_source(
+    request: ExtractRequest | DownloadRequest,
+    tmpdir: Path,
+) -> str | None:
+    source = _parse_browser_cookie_source((request.browser or "chrome").strip() or "chrome")
+    if source is None:
+        return None
+    browser_name, _browser_prefix, _profile, _container = source
+    if browser_name in CHROMIUM_COOKIE_BROWSERS:
+        return _windows_chromium_cookie_snapshot_source(request, tmpdir)
+    return None
+
+
+def _parse_browser_cookie_source(browser_source: str) -> tuple[str, str, str | None, str | None] | None:
+    match = re.fullmatch(
+        r"""(?x)
+        \s*(?P<name>[^+:]+)
+        (?:\s*\+\s*(?P<keyring>[^:]+))?
+        (?:\s*:\s*(?!:)(?P<profile>.+?))?
+        (?:\s*::\s*(?P<container>.+))?
+        \s*
+        """,
+        browser_source,
+    )
+    if not match:
+        return None
+    browser_name = match.group("name").strip().lower()
+    keyring = (match.group("keyring") or "").strip()
+    profile = (match.group("profile") or "").strip() or None
+    container = (match.group("container") or "").strip() or None
+    browser_prefix = browser_name + (f"+{keyring}" if keyring else "")
+    return browser_name, browser_prefix, profile, container
+
+
+def _windows_chromium_cookie_snapshot_source(
+    request: ExtractRequest | DownloadRequest,
+    tmpdir: Path,
+) -> str | None:
+    if sys.platform != "win32":
+        return None
+    source = _parse_browser_cookie_source((request.browser or "chrome").strip() or "chrome")
+    if source is None:
+        return None
+    browser_name, browser_prefix, profile_name, _container = source
+    if browser_name not in CHROMIUM_COOKIE_BROWSERS:
+        return None
+    supports_profiles = browser_name not in CHROMIUM_BROWSERS_WITHOUT_PROFILES
+    browser_root = _browser_cookie_profile_root(browser_name)
+    if profile_name and _looks_like_cookie_profile_path(profile_name):
+        source_profile = Path(profile_name).expanduser()
+        source_local_state = source_profile.parent / "Local State" if supports_profiles else source_profile / "Local State"
+        snapshot_profile_name = source_profile.name or "Profile"
+    elif browser_root is not None:
+        if supports_profiles:
+            profile_name = profile_name or "Default"
+            source_profile = browser_root / profile_name
+            source_local_state = browser_root / "Local State"
+            snapshot_profile_name = profile_name
+        else:
+            source_profile = browser_root
+            source_local_state = browser_root / "Local State"
+            snapshot_profile_name = ""
+    else:
+        return None
+    source_cookie_db = _chromium_cookie_database_for_profile(source_profile)
+    if not source_local_state.exists() or source_cookie_db is None:
+        return None
+
+    snapshot_root = tmpdir / "User Data"
+    snapshot_profile = snapshot_root / snapshot_profile_name if snapshot_profile_name else snapshot_root
+    snapshot_network = snapshot_profile / "Network"
+    snapshot_network.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(source_local_state, snapshot_root / "Local State")
+        _copy_cookie_database_files(source_cookie_db, snapshot_network / "Cookies")
+    except OSError:
+        return None
+    return f"{browser_prefix}:{snapshot_profile}"
+
+
+def _chromium_cookie_database_for_profile(profile_dir: Path) -> Path | None:
+    preferred = profile_dir / "Network" / "Cookies"
+    if preferred.exists():
+        return preferred
+    legacy = profile_dir / "Cookies"
+    if legacy.exists():
+        return legacy
+    return None
+
+
+def _copy_cookie_database_files(source_cookie_db: Path, target_cookie_db: Path) -> None:
+    shutil.copy2(source_cookie_db, target_cookie_db)
+    for suffix in COOKIE_SQLITE_SIDECARS:
+        source_sidecar = source_cookie_db.with_name(f"{source_cookie_db.name}{suffix}")
+        if source_sidecar.exists():
+            shutil.copy2(source_sidecar, target_cookie_db.with_name(f"{target_cookie_db.name}{suffix}"))
+
+
+def _looks_like_cookie_profile_path(profile: str) -> bool:
+    return any(separator in profile for separator in ("/", "\\")) or Path(profile).expanduser().is_absolute()
+
+
+def _item_download_files(target_dir: Path, item_id: str) -> set[Path]:
+    if not target_dir.exists():
+        return set()
+    prefix = f"{item_id}."
+    return {
+        path.resolve()
+        for path in target_dir.iterdir()
+        if path.is_file() and (path.name == item_id or path.name.startswith(prefix))
+    }
+
+
+def _delete_new_item_download_files(target_dir: Path, item_id: str, existing_files: set[Path]) -> None:
+    prefix = f"{item_id}."
+    for path in target_dir.iterdir():
+        if not path.is_file() or (path.name != item_id and not path.name.startswith(prefix)):
+            continue
+        if path.resolve() in existing_files:
+            continue
+        with suppress(OSError):
+            path.unlink()
 
 
 def _request_with_browser_cookie_cache(
@@ -414,9 +639,29 @@ def _has_cookie_rows(cache_path: Path) -> bool:
         return False
 
 
-def _looks_like_cookie_database_copy_error(message: str) -> bool:
+def _looks_like_browser_cookie_access_error(message: str) -> bool:
+    return _looks_like_cookie_database_lock_error(message) or _looks_like_dpapi_decryption_error(message)
+
+
+def _looks_like_cookie_database_lock_error(message: str) -> bool:
     normalized = message.lower()
-    return "could not copy" in normalized and "cookie database" in normalized
+    return (
+        "cookie database" in normalized
+        and (
+            "could not copy" in normalized
+            or "database is locked" in normalized
+            or "file is locked" in normalized
+            or "fileaccessdenied" in normalized
+        )
+    )
+
+
+def _looks_like_dpapi_decryption_error(message: str) -> bool:
+    return "failed to decrypt with dpapi" in message.lower()
+
+
+def _looks_like_cookie_database_copy_error(message: str) -> bool:
+    return _looks_like_browser_cookie_access_error(message)
 
 
 def _looks_like_login_required(message: str) -> bool:
@@ -446,7 +691,7 @@ def _browser_cookie_profile_sources(browser: str) -> list[str]:
             for child in profile_root.iterdir()
             if child.is_dir() and (child.name == "Default" or child.name.startswith("Profile "))
         ]
-    if not discovered and browser_name in {"chrome", "edge"}:
+    if not discovered and browser_name in CHROMIUM_COOKIE_BROWSERS - CHROMIUM_BROWSERS_WITHOUT_PROFILES:
         discovered = ["Default", "Profile 1", "Profile 2", "Profile 3"]
     return [f"{browser}:{profile}" for profile in sorted(discovered, key=_profile_sort_key)]
 
@@ -454,23 +699,38 @@ def _browser_cookie_profile_sources(browser: str) -> list[str]:
 def _browser_cookie_profile_root(browser_name: str) -> Path | None:
     if sys.platform == "win32":
         local_app_data = os.environ.get("LOCALAPPDATA")
-        if not local_app_data:
-            return None
+        app_data = os.environ.get("APPDATA")
         roots = {
-            "chrome": Path(local_app_data) / "Google" / "Chrome" / "User Data",
-            "edge": Path(local_app_data) / "Microsoft" / "Edge" / "User Data",
+            "brave": Path(local_app_data) / "BraveSoftware" / "Brave-Browser" / "User Data" if local_app_data else None,
+            "chrome": Path(local_app_data) / "Google" / "Chrome" / "User Data" if local_app_data else None,
+            "chromium": Path(local_app_data) / "Chromium" / "User Data" if local_app_data else None,
+            "edge": Path(local_app_data) / "Microsoft" / "Edge" / "User Data" if local_app_data else None,
+            "opera": Path(app_data) / "Opera Software" / "Opera Stable" if app_data else None,
+            "vivaldi": Path(local_app_data) / "Vivaldi" / "User Data" if local_app_data else None,
+            "whale": Path(local_app_data) / "Naver" / "Naver Whale" / "User Data" if local_app_data else None,
         }
         return roots.get(browser_name)
     if sys.platform == "darwin":
+        app_data = Path.home() / "Library" / "Application Support"
         roots = {
-            "chrome": Path.home() / "Library" / "Application Support" / "Google" / "Chrome",
-            "edge": Path.home() / "Library" / "Application Support" / "Microsoft Edge",
+            "brave": app_data / "BraveSoftware" / "Brave-Browser",
+            "chrome": app_data / "Google" / "Chrome",
+            "chromium": app_data / "Chromium",
+            "edge": app_data / "Microsoft Edge",
+            "opera": app_data / "com.operasoftware.Opera",
+            "vivaldi": app_data / "Vivaldi",
+            "whale": app_data / "Naver" / "Whale",
         }
         return roots.get(browser_name)
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     roots = {
-        "chrome": Path.home() / ".config" / "google-chrome",
-        "edge": Path.home() / ".config" / "microsoft-edge",
-        "chromium": Path.home() / ".config" / "chromium",
+        "brave": config_home / "BraveSoftware" / "Brave-Browser",
+        "chrome": config_home / "google-chrome",
+        "chromium": config_home / "chromium",
+        "edge": config_home / "microsoft-edge",
+        "opera": config_home / "opera",
+        "vivaldi": config_home / "vivaldi",
+        "whale": config_home / "naver-whale",
     }
     return roots.get(browser_name)
 
@@ -876,10 +1136,17 @@ def _merge_downloaded_video_audio_fragments(
         raise
 
 
-def _extract_audio_file(video_path: Path, target_dir: Path, item_id: str) -> Path:
+def _extract_audio_file(
+    video_path: Path,
+    target_dir: Path,
+    item_id: str,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     if not resolve_tool("ffmpeg"):
         raise YtDlpError("本地视频 ASR 需要 ffmpeg 来抽取音频")
+    if _should_cancel(should_cancel):
+        raise YtDlpCancelled("ASR was cancelled")
     audio_file = target_dir / f"{item_id}.wav"
     cmd = [
         "ffmpeg",
@@ -893,9 +1160,28 @@ def _extract_audio_file(video_path: Path, target_dir: Path, item_id: str) -> Pat
         "16000",
         str(audio_file),
     ]
-    result = run_hidden(cmd, capture_output=True, text=True, check=False)
-    if result.returncode != 0 or not audio_file.exists():
-        raise YtDlpError(result.stderr.strip() or "ffmpeg failed to extract local video audio")
+    if should_cancel is None:
+        result = run_hidden(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0 or not audio_file.exists():
+            raise YtDlpError(result.stderr.strip() or "ffmpeg failed to extract local video audio")
+        return audio_file
+
+    process = popen_hidden(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stop_monitor = _start_cancellation_monitor(process, should_cancel)
+    try:
+        stdout, stderr = process.communicate()
+    except BaseException:
+        _terminate_process(process)
+        if stop_monitor is not None:
+            stop_monitor.set()
+        raise
+    finally:
+        if stop_monitor is not None:
+            stop_monitor.set()
+    if _should_cancel(should_cancel):
+        raise YtDlpCancelled("ASR was cancelled")
+    if process.returncode != 0 or not audio_file.exists():
+        raise YtDlpError(stderr.strip() or stdout.strip() or "ffmpeg failed to extract local video audio")
     return audio_file
 
 
@@ -904,10 +1190,13 @@ def _run_whisper_asr(
     target_dir: Path,
     language: str = "auto",
     progress: Callable[[int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[TranscriptSegment]:
     resolved_whisper = _resolve_whisper_binary()
     if not resolved_whisper:
         raise YtDlpError("Local ASR requires openai-whisper, but the whisper command was not found")
+    if _should_cancel(should_cancel):
+        raise YtDlpCancelled("ASR was cancelled")
 
     asr_cmd = [
         str(resolved_whisper),
@@ -924,21 +1213,35 @@ def _run_whisper_asr(
     if progress:
         progress(40, "本地 ASR 正在转写音频")
     asr_process = popen_hidden(asr_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stop_monitor = _start_cancellation_monitor(asr_process, should_cancel)
     started_at = time.monotonic()
     stdout = ""
     stderr = ""
-    while True:
-        try:
-            stdout, stderr = asr_process.communicate(timeout=2)
-            break
-        except subprocess.TimeoutExpired:
+    try:
+        while True:
+            if _should_cancel(should_cancel):
+                raise YtDlpCancelled("ASR was cancelled")
             try:
-                if progress:
-                    elapsed = time.monotonic() - started_at
-                    progress(min(88, 40 + int(elapsed * 1.8)), f"本地 ASR 正在转写音频，已用时 {int(elapsed)}s")
-            except BaseException:
-                _terminate_process(asr_process)
-                raise
+                stdout, stderr = asr_process.communicate(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                try:
+                    if _should_cancel(should_cancel):
+                        raise YtDlpCancelled("ASR was cancelled")
+                    if progress:
+                        elapsed = time.monotonic() - started_at
+                        progress(min(88, 40 + int(elapsed * 1.8)), f"本地 ASR 正在转写音频，已用时 {int(elapsed)}s")
+                except BaseException:
+                    _terminate_process(asr_process)
+                    raise
+    except BaseException:
+        _terminate_process(asr_process)
+        raise
+    finally:
+        if stop_monitor is not None:
+            stop_monitor.set()
+    if _should_cancel(should_cancel):
+        raise YtDlpCancelled("ASR was cancelled")
     if asr_process.returncode != 0:
         raise YtDlpError(stderr.strip() or stdout.strip() or "Local ASR failed")
     if progress:
@@ -1113,8 +1416,7 @@ def _write_ios_compatible_video(
                 source.unlink()
             return output_path
         except Exception:
-            if temporary_path.exists():
-                temporary_path.unlink()
+            temporary_path.unlink(missing_ok=True)
             raise
 
 
@@ -1271,6 +1573,30 @@ def _media_tool(name: str) -> str:
     return name
 
 
+def _should_cancel(should_cancel: Callable[[], bool] | None) -> bool:
+    return bool(should_cancel and should_cancel())
+
+
+def _start_cancellation_monitor(
+    process: subprocess.Popen[str],
+    should_cancel: Callable[[], bool] | None,
+) -> Event | None:
+    if should_cancel is None:
+        return None
+    stop = Event()
+
+    def monitor() -> None:
+        while not stop.wait(0.25):
+            if process.poll() is not None:
+                return
+            if _should_cancel(should_cancel):
+                _terminate_process(process)
+                return
+
+    Thread(target=monitor, name="course-navigator-ytdlp-cancel", daemon=True).start()
+    return stop
+
+
 def _terminate_process(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -1310,11 +1636,26 @@ def _friendly_error(
     fallback: str,
 ) -> str:
     message = stderr or fallback
-    if _looks_like_cookie_database_copy_error(message):
+    if _looks_like_browser_cookie_access_error(message):
         browser = (request.browser or "chrome").strip() or "chrome"
+        if _looks_like_cookie_database_lock_error(message):
+            reason = (
+                "浏览器正在运行或 Cookie 数据库被锁定，Windows 不允许复制当前 Cookie 数据库。"
+                "请先关闭对应浏览器后重试，或改用公开访问 / Cookies 文件模式。"
+            )
+        elif _looks_like_dpapi_decryption_error(message):
+            reason = (
+                "Windows 浏览器 Cookie 解密失败（DPAPI/App-Bound）。"
+                "这通常表示当前浏览器 Cookie 不能被 yt-dlp 直接解密；"
+                "请改用公开访问，或使用浏览器扩展导出的 cookies.txt。"
+            )
+        else:
+            reason = (
+                "浏览器 Cookie 当前无法复制或解密。"
+                "请先关闭对应浏览器后重试，或改用公开访问 / Cookies 文件模式。"
+            )
         return (
-            f"无法读取浏览器 Cookie 来源 {browser}：Chrome/Edge 的 Cookie 数据库当前无法复制。"
-            "请先关闭对应浏览器后重试，或改用 Cookies 文件模式。"
+            f"无法读取浏览器 Cookie 来源 {browser}：{reason}"
             f"原始错误：{message}"
         )
     if _looks_like_missing_ffmpeg(message):

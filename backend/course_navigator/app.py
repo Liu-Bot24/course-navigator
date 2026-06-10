@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import inspect
 import re
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ from fastapi import FastAPI, File as FormFile, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .ai import _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
+from .ai import LlmCancelled, _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
 from .asr import suggest_asr_corrections
 from .config import (
     AsrSearchServiceConfig,
@@ -80,7 +81,7 @@ from .models import (
 )
 from .online_asr import extract_online_asr_transcript
 from .processes import run_hidden
-from .ytdlp import YtDlpError, YtDlpRunner, is_subtitle_unavailable_error
+from .ytdlp import YtDlpCancelled, YtDlpError, YtDlpRunner, is_subtitle_unavailable_error
 
 logger = logging.getLogger("course_navigator.app")
 
@@ -476,6 +477,7 @@ def create_app(
     def _extract_and_save_course(
         request: ExtractRequest,
         progress: Callable[[str, int, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> CourseItem:
         if progress:
             progress("metadata", 3, "正在读取视频信息")
@@ -492,6 +494,7 @@ def create_app(
             metadata,
             settings_state["value"],
             progress=progress,
+            should_cancel=should_cancel,
         )
 
         existing = library.get(item_id)
@@ -531,6 +534,7 @@ def create_app(
     def _extract_and_save_local_video_course(
         request: ExtractRequest,
         progress: Callable[[str, int, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> CourseItem:
         item = _file_video_item_for_request(request)
         if not item:
@@ -547,6 +551,7 @@ def create_app(
                 item.id,
                 settings_state["value"],
                 progress,
+                should_cancel=should_cancel,
             )
             transcript_source = "online_asr"
         elif request.subtitle_source == "asr":
@@ -557,6 +562,7 @@ def create_app(
                 item.id,
                 ytdlp_runner,
                 progress,
+                should_cancel=should_cancel,
             )
             transcript_source = "asr"
         else:
@@ -568,6 +574,7 @@ def create_app(
                 settings_state["value"],
                 ytdlp_runner,
                 progress,
+                should_cancel=should_cancel,
             )
 
         keep_existing_study = bool(_same_transcript(item.transcript, transcript))
@@ -1105,6 +1112,7 @@ def create_app(
                 item_id,
             )
         except (ValueError, YtDlpError) as exc:
+            _delete_download_files_for_item(active_workspace_dir, item_id)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         item.local_video_path = _workspace_relative_path(active_workspace_dir, video_path)
         item.video_source_type = "workspace"
@@ -1251,10 +1259,11 @@ def create_app(
             )
 
         try:
+            should_cancel = lambda: _job_cancel_requested(job_id)
             if _is_file_video_url(request.url):
-                item = _extract_and_save_local_video_course(request, progress=update_progress)
+                item = _extract_and_save_local_video_course(request, progress=update_progress, should_cancel=should_cancel)
             else:
-                item = _extract_and_save_course(request, progress=update_progress)
+                item = _extract_and_save_course(request, progress=update_progress, should_cancel=should_cancel)
             _raise_if_job_cancelled(job_id)
             _set_job(
                 job_id,
@@ -1264,7 +1273,7 @@ def create_app(
                 phase="complete",
                 message="字幕已提取",
             )
-        except JobCancelled:
+        except (JobCancelled, YtDlpCancelled):
             _finish_cancelled_job(job_id)
         except Exception as exc:
             logger.exception("Extract job failed: job_id=%s url=%s", job_id, request.url)
@@ -1350,6 +1359,7 @@ def create_app(
 
         original_study: StudyMaterial | None = None
         try:
+            should_cancel = lambda: _study_job_cancel_requested(job_id)
             _raise_if_study_job_cancelled(job_id)
             item = library.get(item_id)
             if not item:
@@ -1373,6 +1383,7 @@ def create_app(
                     existing_translated_title=existing_translated_title,
                     source_language=item.metadata.language if item.metadata else None,
                     metadata=item.metadata,
+                    should_cancel=should_cancel,
                 )
             else:
                 study = regenerate_study_section(
@@ -1386,6 +1397,7 @@ def create_app(
                     progress=update_progress,
                     source_language=item.metadata.language if item.metadata else None,
                     metadata=item.metadata,
+                    should_cancel=should_cancel,
                 )
             with deleted_items_lock:
                 if item_id in deleted_items:
@@ -1393,7 +1405,7 @@ def create_app(
             _raise_if_study_job_cancelled(job_id)
             item.study = study
             library.save(item)
-        except StudyJobCancelled:
+        except (StudyJobCancelled, LlmCancelled):
             with deleted_items_lock:
                 item_deleted = item_id in deleted_items
             if not item_deleted:
@@ -1508,6 +1520,7 @@ def create_app(
 
         original_study: StudyMaterial | None = None
         try:
+            should_cancel = lambda: _job_cancel_requested(job_id)
             _raise_if_job_cancelled(job_id)
             item = library.get(item_id)
             if not item:
@@ -1526,6 +1539,7 @@ def create_app(
                 context_summary_created=save_context_summary,
                 source_language=item.metadata.language if item.metadata else None,
                 metadata=item.metadata,
+                should_cancel=should_cancel,
             )
             with deleted_items_lock:
                 if item_id in deleted_items:
@@ -1541,7 +1555,7 @@ def create_app(
                 context_summary_state["value"],
             )
             library.save(item)
-        except JobCancelled:
+        except (JobCancelled, LlmCancelled):
             with deleted_items_lock:
                 item_deleted = item_id in deleted_items
             if not item_deleted:
@@ -1601,6 +1615,7 @@ def create_app(
                 active_workspace_dir / "downloads",
                 item_id,
                 progress=update_progress,
+                should_cancel=lambda: _job_cancel_requested(job_id),
             )
             _raise_if_job_cancelled(job_id)
             with deleted_items_lock:
@@ -1615,7 +1630,7 @@ def create_app(
             item.local_video_path = _workspace_relative_path(active_workspace_dir, video_path)
             item.video_source_type = "workspace"
             library.save(item)
-        except JobCancelled:
+        except (JobCancelled, YtDlpCancelled):
             if video_path is not None:
                 _delete_download_path(active_workspace_dir, video_path)
             _delete_download_files_for_item(active_workspace_dir, item_id)
@@ -1624,6 +1639,7 @@ def create_app(
         except Exception as exc:
             if video_path is not None:
                 _delete_download_path(active_workspace_dir, video_path)
+            _delete_download_files_for_item(active_workspace_dir, item_id)
             _set_job(
                 job_id,
                 status="failed",
@@ -1670,6 +1686,7 @@ def create_app(
             )
 
         try:
+            should_cancel = lambda: _job_cancel_requested(job_id)
             _raise_if_job_cancelled(job_id)
             item = library.get(item_id)
             if not item:
@@ -1685,6 +1702,7 @@ def create_app(
                 context=_asr_context_for_item(item, request.user_context),
                 output_language=request.output_language,
                 progress=update_progress,
+                should_cancel=should_cancel,
             )
             _raise_if_job_cancelled(job_id)
             update_progress("finalizing", 96, "正在整理校正建议和置信度")
@@ -1699,7 +1717,7 @@ def create_app(
             )
             with asr_results_lock:
                 asr_results[job_id] = result
-        except JobCancelled:
+        except (JobCancelled, LlmCancelled):
             with asr_results_lock:
                 asr_results.pop(job_id, None)
             _finish_cancelled_job(job_id)
@@ -2300,12 +2318,24 @@ def _extract_transcript_with_source(
     metadata,
     settings: Settings,
     progress: Callable[[str, int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[list[TranscriptSegment], str | None]:
     asr_request = _request_with_metadata_language(request, metadata)
     if request.subtitle_source == "asr":
-        return _extract_asr_transcript(runner, asr_request, transcript_dir, item_id, progress), "asr"
+        return _extract_asr_transcript(runner, asr_request, transcript_dir, item_id, progress, should_cancel=should_cancel), "asr"
     if request.subtitle_source == "online_asr":
-        return _extract_online_asr_transcript(runner, asr_request, transcript_dir, item_id, settings, progress), "online_asr"
+        return (
+            _extract_online_asr_transcript(
+                runner,
+                asr_request,
+                transcript_dir,
+                item_id,
+                settings,
+                progress,
+                should_cancel=should_cancel,
+            ),
+            "online_asr",
+        )
 
     try:
         if progress:
@@ -2320,7 +2350,15 @@ def _extract_transcript_with_source(
         if _metadata_has_source_subtitles(metadata):
             raise YtDlpError("站方字幕存在，但当前访问方式没有下载到字幕；请使用浏览器模式或 cookies 重新提取。") from exc
 
-    return _extract_source_first_asr_fallback(runner, asr_request, transcript_dir, item_id, settings, progress)
+    return _extract_source_first_asr_fallback(
+        runner,
+        asr_request,
+        transcript_dir,
+        item_id,
+        settings,
+        progress,
+        should_cancel=should_cancel,
+    )
 
 
 def _request_with_metadata_language(request: ExtractRequest, metadata) -> ExtractRequest:
@@ -2348,23 +2386,36 @@ def _extract_source_first_asr_fallback(
     item_id: str,
     settings: Settings,
     progress: Callable[[str, int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[list[TranscriptSegment], str | None]:
     fallback_errors: list[str] = []
     if _online_asr_is_available(settings.online_asr):
         try:
             if progress:
                 progress("online_asr", 32, "站方字幕不可用，正在切换在线 ASR")
-            transcript = _extract_online_asr_transcript(runner, request, transcript_dir, item_id, settings, progress)
+            transcript = _extract_online_asr_transcript(
+                runner,
+                request,
+                transcript_dir,
+                item_id,
+                settings,
+                progress,
+                should_cancel=should_cancel,
+            )
             if transcript:
                 return transcript, "online_asr"
             fallback_errors.append("在线 ASR 没有返回字幕")
+        except YtDlpCancelled:
+            raise
         except YtDlpError as exc:
             fallback_errors.append(f"在线 ASR 失败：{exc}")
             if progress:
                 progress("asr", 39, "在线 ASR 不可用，正在切换本地 ASR")
 
     try:
-        transcript = _extract_asr_transcript(runner, request, transcript_dir, item_id, progress)
+        transcript = _extract_asr_transcript(runner, request, transcript_dir, item_id, progress, should_cancel=should_cancel)
+    except YtDlpCancelled:
+        raise
     except YtDlpError as exc:
         fallback_errors.append(f"本地 ASR 失败：{exc}")
         _raise_source_first_fallback_error("站方字幕不可用", fallback_errors)
@@ -2382,6 +2433,7 @@ def _extract_file_video_source_first_fallback(
     settings: Settings,
     runner: YtDlpRunner,
     progress: Callable[[str, int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[list[TranscriptSegment], str | None]:
     fallback_errors: list[str] = []
     if _online_asr_is_available(settings.online_asr):
@@ -2395,17 +2447,30 @@ def _extract_file_video_source_first_fallback(
                 item_id,
                 settings,
                 progress,
+                should_cancel=should_cancel,
             )
             if transcript:
                 return transcript, "online_asr"
             fallback_errors.append("在线 ASR 没有返回字幕")
+        except YtDlpCancelled:
+            raise
         except YtDlpError as exc:
             fallback_errors.append(f"在线 ASR 失败：{exc}")
             if progress:
                 progress("asr", 39, "在线 ASR 不可用，正在切换本地 ASR")
 
     try:
-        transcript = _extract_asr_transcript_from_file(video_path, request, transcript_dir, item_id, runner, progress)
+        transcript = _extract_asr_transcript_from_file(
+            video_path,
+            request,
+            transcript_dir,
+            item_id,
+            runner,
+            progress,
+            should_cancel=should_cancel,
+        )
+    except YtDlpCancelled:
+        raise
     except YtDlpError as exc:
         fallback_errors.append(f"本地 ASR 失败：{exc}")
         _raise_source_first_fallback_error("本地视频无站方字幕", fallback_errors)
@@ -2439,6 +2504,7 @@ def _extract_asr_transcript(
     transcript_dir: Path,
     item_id: str,
     progress: Callable[[str, int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[TranscriptSegment]:
     extractor = getattr(runner, "extract_asr", None)
     if not callable(extractor):
@@ -2446,13 +2512,15 @@ def _extract_asr_transcript(
             raise YtDlpError("当前提取器不支持本地 ASR")
         return []
     if progress:
-        return extractor(
+        return _call_extract_asr(
+            extractor,
             request,
             transcript_dir,
             item_id,
             progress=lambda value, message: progress("asr", value, message),
+            should_cancel=should_cancel,
         )
-    return extractor(request, transcript_dir, item_id)
+    return _call_extract_asr(extractor, request, transcript_dir, item_id, should_cancel=should_cancel)
 
 
 def _extract_online_asr_transcript(
@@ -2462,6 +2530,7 @@ def _extract_online_asr_transcript(
     item_id: str,
     settings: Settings,
     progress: Callable[[str, int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[TranscriptSegment]:
     if progress:
         return extract_online_asr_transcript(
@@ -2471,6 +2540,7 @@ def _extract_online_asr_transcript(
             getattr(runner, "binary", None),
             settings.online_asr,
             progress=lambda value, message: progress("online_asr", value, message),
+            should_cancel=should_cancel,
         )
     return extract_online_asr_transcript(
         request,
@@ -2478,6 +2548,7 @@ def _extract_online_asr_transcript(
         item_id,
         getattr(runner, "binary", None),
         settings.online_asr,
+        should_cancel=should_cancel,
     )
 
 
@@ -2488,19 +2559,73 @@ def _extract_asr_transcript_from_file(
     item_id: str,
     runner: YtDlpRunner,
     progress: Callable[[str, int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[TranscriptSegment]:
     extractor = getattr(runner, "extract_asr_from_file", None)
     if not callable(extractor):
         raise YtDlpError("当前提取器不支持本地视频 ASR")
     if progress:
-        return extractor(
+        return _call_extract_asr_from_file(
+            extractor,
             video_path,
             transcript_dir,
             item_id,
             language=request.language,
             progress=lambda value, message: progress("asr", value, message),
+            should_cancel=should_cancel,
         )
-    return extractor(video_path, transcript_dir, item_id, language=request.language)
+    return _call_extract_asr_from_file(
+        extractor,
+        video_path,
+        transcript_dir,
+        item_id,
+        language=request.language,
+        should_cancel=should_cancel,
+    )
+
+
+def _supported_call_kwargs(func: Callable[..., object], kwargs: dict[str, object]) -> dict[str, object]:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return {key: value for key, value in kwargs.items() if value is not None}
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        return {key: value for key, value in kwargs.items() if value is not None}
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if value is not None and key in signature.parameters
+    }
+
+
+def _call_extract_asr(
+    extractor: Callable[..., list[TranscriptSegment]],
+    request: ExtractRequest,
+    transcript_dir: Path,
+    item_id: str,
+    *,
+    progress: Callable[[int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[TranscriptSegment]:
+    kwargs = _supported_call_kwargs(extractor, {"progress": progress, "should_cancel": should_cancel})
+    return extractor(request, transcript_dir, item_id, **kwargs)
+
+
+def _call_extract_asr_from_file(
+    extractor: Callable[..., list[TranscriptSegment]],
+    video_path: Path,
+    transcript_dir: Path,
+    item_id: str,
+    *,
+    language: str,
+    progress: Callable[[int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[TranscriptSegment]:
+    kwargs = _supported_call_kwargs(
+        extractor,
+        {"language": language, "progress": progress, "should_cancel": should_cancel},
+    )
+    return extractor(video_path, transcript_dir, item_id, **kwargs)
 
 
 def _extract_online_asr_transcript_from_file(
@@ -2510,6 +2635,7 @@ def _extract_online_asr_transcript_from_file(
     item_id: str,
     settings: Settings,
     progress: Callable[[str, int, str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[TranscriptSegment]:
     if progress:
         return extract_online_asr_transcript(
@@ -2520,6 +2646,7 @@ def _extract_online_asr_transcript_from_file(
             settings.online_asr,
             source_video_path=video_path,
             progress=lambda value, message: progress("online_asr", value, message),
+            should_cancel=should_cancel,
         )
     return extract_online_asr_transcript(
         request,
@@ -2528,6 +2655,7 @@ def _extract_online_asr_transcript_from_file(
         None,
         settings.online_asr,
         source_video_path=video_path,
+        should_cancel=should_cancel,
     )
 
 

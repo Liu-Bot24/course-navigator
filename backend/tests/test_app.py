@@ -12,7 +12,7 @@ from course_navigator.app import create_app
 from course_navigator.config import OnlineAsrSettings, Settings
 from course_navigator.library import CourseLibrary
 from course_navigator.models import CourseItem, StudyMaterial, TimeRange, TranscriptSegment, VideoMetadata
-from course_navigator.ytdlp import YtDlpError
+from course_navigator.ytdlp import YtDlpCancelled, YtDlpError
 
 
 class FakeRunner:
@@ -38,7 +38,7 @@ class FakeRunner:
             TranscriptSegment(start=4, end=8, text="Important detail."),
         ]
 
-    def download_video(self, request, target_dir: Path, item_id: str, progress=None):
+    def download_video(self, request, target_dir: Path, item_id: str, progress=None, should_cancel=None):
         target_dir.mkdir(parents=True, exist_ok=True)
         if progress:
             progress(42, "正在缓存视频")
@@ -1125,7 +1125,7 @@ def test_extract_route_source_first_falls_back_to_online_asr_when_configured(tmp
 
     captured = {}
 
-    def fake_online_asr(request, target_dir, item_id, yt_dlp_binary, settings):
+    def fake_online_asr(request, target_dir, item_id, yt_dlp_binary, settings, should_cancel=None):
         captured["provider"] = settings.provider
         captured["language"] = request.language
         return [TranscriptSegment(start=0, end=3, text="Online fallback line.")]
@@ -1347,6 +1347,114 @@ def test_running_extract_job_can_be_cancelled_before_saving_transcript(tmp_path)
     assert client.get("/api/items/abc123").status_code == 404
 
 
+def test_running_extract_job_passes_cancel_signal_to_local_asr_runner(tmp_path):
+    started = Event()
+
+    class CancellableAsrRunner(FakeRunner):
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise AssertionError("subtitle extraction should not run when ASR is forced")
+
+        def extract_asr(self, request, target_dir: Path, item_id: str, progress=None, should_cancel=None):
+            if progress:
+                progress(55, "正在本地 ASR 转写音频")
+            started.set()
+            for _ in range(50):
+                if should_cancel and should_cancel():
+                    raise YtDlpCancelled("ASR was cancelled")
+                sleep(0.02)
+            raise AssertionError("ASR runner did not receive a cancellation signal")
+
+    client = make_client(tmp_path, runner=CancellableAsrRunner())
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": "https://learn.deeplearning.ai/courses/example",
+            "mode": "normal",
+            "subtitle_source": "asr",
+        },
+    )
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+
+    payload = cancel_response.json()
+    for _ in range(40):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    assert client.get("/api/items/abc123").status_code == 404
+
+
+def test_running_extract_job_passes_cancel_signal_to_online_asr(tmp_path, monkeypatch):
+    started = Event()
+
+    class OnlineAsrRunner(FakeRunner):
+        def fetch_metadata(self, request):
+            metadata = super().fetch_metadata(request)
+            metadata.language = "en"
+            return metadata
+
+        def extract_subtitles(self, request, target_dir: Path, metadata=None):
+            raise AssertionError("subtitle extraction should not run when online ASR is forced")
+
+    def fake_online_asr(
+        request,
+        target_dir,
+        item_id,
+        yt_dlp_binary,
+        settings,
+        source_video_path=None,
+        progress=None,
+        should_cancel=None,
+    ):
+        if progress:
+            progress(55, "正在请求在线 ASR")
+        started.set()
+        for _ in range(50):
+            if should_cancel and should_cancel():
+                raise YtDlpCancelled("ASR was cancelled")
+            sleep(0.02)
+        raise AssertionError("online ASR did not receive a cancellation signal")
+
+    monkeypatch.setattr(app_module, "extract_online_asr_transcript", fake_online_asr)
+    client = make_client(
+        tmp_path,
+        runner=OnlineAsrRunner(),
+        settings=Settings(
+            data_dir=tmp_path,
+            online_asr=OnlineAsrSettings(provider="xai", xai={"api_key": "xai-test"}),
+        ),
+    )
+    response = client.post(
+        "/api/extract-jobs",
+        json={
+            "url": "https://learn.deeplearning.ai/courses/example",
+            "mode": "normal",
+            "subtitle_source": "online_asr",
+        },
+    )
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+
+    payload = cancel_response.json()
+    for _ in range(40):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    assert client.get("/api/items/abc123").status_code == 404
+
+
 def test_extract_route_can_force_online_asr_source(tmp_path, monkeypatch):
     class OnlineAsrRunner(FakeRunner):
         subtitle_called = False
@@ -1362,7 +1470,7 @@ def test_extract_route_can_force_online_asr_source(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_online_asr(request, target_dir, item_id, yt_dlp_binary, settings):
+    def fake_online_asr(request, target_dir, item_id, yt_dlp_binary, settings, should_cancel=None):
         captured["provider"] = settings.provider
         captured["binary"] = yt_dlp_binary
         captured["item_id"] = item_id
@@ -1556,6 +1664,42 @@ def test_study_job_uses_request_detail_level(tmp_path, monkeypatch):
 
     assert payload["status"] == "succeeded"
     assert captured["detail_level"] == "standard"
+
+
+def test_running_study_job_passes_cancel_signal_to_ai(tmp_path, monkeypatch):
+    started = Event()
+
+    def slow_generate_study_material(**kwargs):
+        should_cancel = kwargs.get("should_cancel")
+        started.set()
+        for _ in range(50):
+            if should_cancel and should_cancel():
+                raise app_module.StudyJobCancelled("Study generation was cancelled")
+            sleep(0.02)
+        raise AssertionError("study generation did not receive a cancellation signal")
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", slow_generate_study_material)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN"})
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+
+    payload = cancel_response.json()
+    for _ in range(40):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
 
 
 def test_generate_study_route_accepts_chinese_output_language(tmp_path):
@@ -2131,6 +2275,42 @@ def test_running_translation_job_can_be_cancelled_before_saving_translation(tmp_
     assert (client.get("/api/items/abc123").json()["study"] or {}).get("translated_transcript", []) == []
 
 
+def test_running_translation_job_passes_cancel_signal_to_ai(tmp_path, monkeypatch):
+    started = Event()
+
+    def slow_translate(**kwargs):
+        should_cancel = kwargs.get("should_cancel")
+        started.set()
+        for _ in range(50):
+            if should_cancel and should_cancel():
+                raise app_module.JobCancelled("Translation was cancelled")
+            sleep(0.02)
+        raise AssertionError("translation did not receive a cancellation signal")
+
+    monkeypatch.setattr("course_navigator.app.translate_transcript_material", slow_translate)
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post("/api/items/abc123/translation-jobs", json={"output_language": "zh-CN"})
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+
+    payload = cancel_response.json()
+    for _ in range(40):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+
+
 def test_incomplete_cached_translation_is_hidden_from_response(tmp_path, monkeypatch):
     def fake_translate(**kwargs):
         return [
@@ -2381,6 +2561,61 @@ def test_running_asr_correction_job_can_be_cancelled_before_storing_result(tmp_p
     release.set()
     payload = cancel_response.json()
     for _ in range(30):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    assert client.get(f"/api/asr-correction-jobs/{job_id}/result").status_code == 404
+
+
+def test_running_asr_correction_job_passes_cancel_signal_to_ai(tmp_path, monkeypatch):
+    started = Event()
+
+    def slow_suggest(**kwargs):
+        should_cancel = kwargs.get("should_cancel")
+        started.set()
+        for _ in range(50):
+            if should_cancel and should_cancel():
+                raise app_module.JobCancelled("ASR correction was cancelled")
+            sleep(0.02)
+        raise AssertionError("ASR correction did not receive a cancellation signal")
+
+    monkeypatch.setattr("course_navigator.app.suggest_asr_corrections", slow_suggest)
+    client = make_client(
+        tmp_path,
+        settings=Settings(
+            data_dir=tmp_path,
+            model_profiles=[
+                {
+                    "id": "asr",
+                    "name": "ASR",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "careful-asr-model",
+                    "api_key": "sk-asr",
+                }
+            ],
+            asr_model_id="asr",
+        ),
+    )
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/items/abc123/asr-correction-jobs",
+        json={"output_language": "zh-CN", "search": {"enabled": False}},
+    )
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+
+    payload = cancel_response.json()
+    for _ in range(40):
         payload = client.get(f"/api/jobs/{job_id}").json()
         if payload["status"] == "cancelled":
             break
@@ -2925,7 +3160,7 @@ def test_running_download_job_can_be_cancelled_before_binding_cached_video(tmp_p
     release = Event()
 
     class SlowDownloadRunner(FakeRunner):
-        def download_video(self, request, target_dir: Path, item_id: str, progress=None):
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None, should_cancel=None):
             target_dir.mkdir(parents=True, exist_ok=True)
             if progress:
                 progress(42, "正在缓存视频")
@@ -2966,6 +3201,106 @@ def test_running_download_job_can_be_cancelled_before_binding_cached_video(tmp_p
     item_response = client.get("/api/items/abc123")
     assert item_response.json()["local_video_path"] is None
     assert not (tmp_path / "downloads" / "abc123.mp4").exists()
+
+
+def test_running_download_job_passes_cancel_signal_to_runner(tmp_path):
+    started = Event()
+
+    class CancelAwareDownloadRunner(FakeRunner):
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None, should_cancel=None):
+            started.set()
+            for _ in range(200):
+                if should_cancel and should_cancel():
+                    raise YtDlpCancelled("Download was cancelled")
+                sleep(0.01)
+            raise AssertionError("download runner did not receive a cancellation signal")
+
+    client = make_client(tmp_path, runner=CancelAwareDownloadRunner())
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/items/abc123/download-jobs",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    job_id = response.json()["job_id"]
+    assert started.wait(2)
+
+    cancel_response = client.post(f"/api/jobs/{job_id}/cancel")
+    assert cancel_response.status_code == 200
+
+    payload = cancel_response.json()
+    for _ in range(40):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "cancelled":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "cancelled"
+    assert payload["message"] == "视频缓存已取消"
+
+
+def test_sync_download_failure_cleans_partial_video_files(tmp_path):
+    class FailingDownloadRunner(FakeRunner):
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None, should_cancel=None):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / f"{item_id}.f399.mp4").write_text("partial video", encoding="utf-8")
+            (target_dir / f"{item_id}.mp4.part").write_text("partial merge", encoding="utf-8")
+            (target_dir / f"{item_id}4.mp4").write_text("other item", encoding="utf-8")
+            raise YtDlpError("download failed")
+
+    client = make_client(tmp_path, runner=FailingDownloadRunner())
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/items/abc123/download",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    assert response.status_code == 400
+    downloads_dir = tmp_path / "downloads"
+    assert not list(downloads_dir.glob("abc123.*"))
+    assert (downloads_dir / "abc1234.mp4").exists()
+
+
+def test_download_job_failure_cleans_partial_video_files(tmp_path):
+    class FailingDownloadRunner(FakeRunner):
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None, should_cancel=None):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if progress:
+                progress(42, "正在缓存视频")
+            (target_dir / f"{item_id}.f399.mp4").write_text("partial video", encoding="utf-8")
+            (target_dir / f"{item_id}.mp4.part").write_text("partial merge", encoding="utf-8")
+            (target_dir / f"{item_id}4.mp4").write_text("other item", encoding="utf-8")
+            raise YtDlpError("download failed")
+
+    client = make_client(tmp_path, runner=FailingDownloadRunner())
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+
+    response = client.post(
+        "/api/items/abc123/download-jobs",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    job_id = response.json()["job_id"]
+    payload = response.json()
+    for _ in range(30):
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        if payload["status"] == "failed":
+            break
+        sleep(0.02)
+
+    assert payload["status"] == "failed"
+    downloads_dir = tmp_path / "downloads"
+    assert not list(downloads_dir.glob("abc123.*"))
+    assert (downloads_dir / "abc1234.mp4").exists()
 
 
 def test_import_local_video_copies_file_to_workspace_downloads_and_creates_course_item(tmp_path):
@@ -3522,7 +3857,16 @@ def test_external_video_extract_job_runs_asr_from_linked_file(tmp_path):
 def test_local_video_extract_job_supports_online_asr_from_workspace_file(tmp_path, monkeypatch):
     captured = {}
 
-    def fake_online_asr(request, transcript_dir, item_id, yt_dlp_binary, settings, source_video_path=None, progress=None):
+    def fake_online_asr(
+        request,
+        transcript_dir,
+        item_id,
+        yt_dlp_binary,
+        settings,
+        source_video_path=None,
+        progress=None,
+        should_cancel=None,
+    ):
         captured["source_video_path"] = source_video_path
         captured["yt_dlp_binary"] = yt_dlp_binary
         if progress:
@@ -3565,7 +3909,16 @@ def test_local_video_extract_job_supports_online_asr_from_workspace_file(tmp_pat
 def test_local_video_extract_job_source_first_falls_back_to_online_asr_when_configured(tmp_path, monkeypatch):
     captured = {}
 
-    def fake_online_asr(request, transcript_dir, item_id, yt_dlp_binary, settings, source_video_path=None, progress=None):
+    def fake_online_asr(
+        request,
+        transcript_dir,
+        item_id,
+        yt_dlp_binary,
+        settings,
+        source_video_path=None,
+        progress=None,
+        should_cancel=None,
+    ):
         captured["source_video_path"] = source_video_path
         captured["provider"] = settings.provider
         if progress:
@@ -3893,7 +4246,7 @@ def test_delete_item_removes_stale_download_files_even_without_local_video_path(
 
 def test_download_job_cleans_file_when_course_is_deleted_during_download(tmp_path):
     class SlowDownloadRunner(FakeRunner):
-        def download_video(self, request, target_dir: Path, item_id: str, progress=None):
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None, should_cancel=None):
             target_dir.mkdir(parents=True, exist_ok=True)
             if progress:
                 progress(42, "正在缓存视频")
@@ -3938,7 +4291,7 @@ def test_download_job_reuses_active_item_job(tmp_path):
             self.release = Event()
             self.calls = 0
 
-        def download_video(self, request, target_dir: Path, item_id: str, progress=None):
+        def download_video(self, request, target_dir: Path, item_id: str, progress=None, should_cancel=None):
             self.calls += 1
             target_dir.mkdir(parents=True, exist_ok=True)
             if progress:

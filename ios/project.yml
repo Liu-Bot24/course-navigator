@@ -1,6 +1,6 @@
 name: CourseNavigatorMobile
 options:
-  bundleIdPrefix: com.liuqi
+  bundleIdPrefix: com.example
   deploymentTarget:
     iOS: "17.0"
 settings:
@@ -20,7 +20,7 @@ targets:
       - path: CourseNavigatorMobile/Resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.liuqi.coursenavigator.mobile
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.coursenavigator.mobile
         PRODUCT_NAME: Course Navigator
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
