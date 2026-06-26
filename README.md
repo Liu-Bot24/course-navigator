@@ -69,7 +69,7 @@ http://127.0.0.1:15173
 
 当前 macOS 安装包和 Homebrew Cask 支持 Apple Silicon Mac，暂不提供 Intel Mac 版本。
 
-如果你已安装 Homebrew，可以从 GitHub Release 安装 App：
+如果你已安装 Homebrew，可以从 [GitHub Release](https://github.com/Liu-Bot24/course-navigator/releases/latest) 安装 App：
 
 ```bash
 brew tap liu-bot24/course-navigator https://github.com/Liu-Bot24/course-navigator
@@ -88,6 +88,14 @@ brew upgrade --cask liu-bot24/course-navigator/course-navigator
 未公证版本首次打开时，macOS 可能需要你在 `系统设置` → `隐私与安全性` 中选择 `仍要打开`。确认安装包来源可信后，通过一次即可正常使用。
 
 完整安装说明见 [macOS 本地安装](docs/mac-install.md)。
+
+## Windows 本地安装
+
+最新 [GitHub Release](https://github.com/Liu-Bot24/course-navigator/releases/latest) 提供 Windows x64 安装器，文件名形如 `Course.Navigator-版本-windows-x64-setup.exe`。
+
+下载安装器后运行，按向导完成安装，再从开始菜单启动 `Course Navigator`。安装包会内置客户端运行所需资源；如需本地视频缓存、音频提取或媒体转换，请确认系统可用 `ffmpeg`，可通过 `winget install Gyan.FFmpeg` 安装。
+
+Release 页面同时提供 `.sha256` 校验文件，可用于核对下载完整性。
 
 ## AI 配置
 

@@ -69,7 +69,7 @@ Press `Ctrl+C` in the terminal to stop both services.
 
 The current macOS installer and Homebrew Cask support Apple Silicon Macs. Intel Mac builds are not provided yet.
 
-If you have Homebrew installed, you can install the app from the GitHub release:
+If you have Homebrew installed, you can install the app from the [GitHub release](https://github.com/Liu-Bot24/course-navigator/releases/latest):
 
 ```bash
 brew tap liu-bot24/course-navigator https://github.com/Liu-Bot24/course-navigator
@@ -88,6 +88,14 @@ You can also download the macOS installer, open the DMG, drag `Course Navigator.
 For an unnotarized build, macOS may require `System Settings` → `Privacy & Security` → `Open Anyway` on first launch. Once you confirm the installer source and approve it, the app opens normally.
 
 See [macOS Local Install](docs/mac-install.en.md) for the full install steps.
+
+## Windows Local Install
+
+The latest [GitHub release](https://github.com/Liu-Bot24/course-navigator/releases/latest) provides a Windows x64 installer named like `Course.Navigator-version-windows-x64-setup.exe`.
+
+Download and run the installer, follow the setup wizard, then launch `Course Navigator` from the Start menu. The installer includes the runtime resources needed by the desktop client. For local video cache, audio extraction, or media conversion workflows, make sure `ffmpeg` is available on the system; you can install it with `winget install Gyan.FFmpeg`.
+
+The release page also includes `.sha256` checksum files so you can verify the download.
 
 ## AI Setup
 
