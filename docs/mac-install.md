@@ -8,7 +8,7 @@ Course Navigator 提供 macOS 本地安装包时，可以像普通 Mac App 一�
 - Apple Silicon Mac。当前 DMG 和 Homebrew Cask 暂不提供 Intel Mac 版本。
 - 首次启动服务时需要联网，用于准备项目运行依赖。
 
-安装包内置 Node.js/npm、uv、ffmpeg/ffprobe 等基础运行工具；用户不需要先在终端安装这些工具。
+安装包内置 Node.js、uv、ffmpeg/ffprobe 等基础运行工具；用户不需要先在终端安装这些工具。
 
 ## 安装 App
 

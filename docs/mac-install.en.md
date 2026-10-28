@@ -8,7 +8,7 @@ When Course Navigator is provided as a macOS installer, you can install and laun
 - Apple Silicon Mac. The current DMG and Homebrew Cask do not provide an Intel Mac build yet.
 - An internet connection on the first service start, so the app can prepare project runtime dependencies.
 
-The app bundle includes Node.js/npm, uv, and ffmpeg/ffprobe. Users do not need to install these tools in Terminal before launching the app.
+The app bundle includes Node.js, uv, and ffmpeg/ffprobe. Users do not need to install these tools in Terminal before launching the app.
 
 ## Install The App
 

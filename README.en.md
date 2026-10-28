@@ -26,6 +26,21 @@ It is built for learners, researchers, and course-heavy teams who need to unders
 - Search validation: optionally validate ASR correction candidates with Tavily, hosted Firecrawl, or self-hosted Firecrawl.
 - Model profiles: share one model profile library across translation, study generation, and ASR correction, with OpenAI-compatible and Anthropic formats.
 
+## What's New in 0.1.7
+
+These are the main improvements in 0.1.7 over 0.1.6.
+
+- Smoother start: the window no longer freezes while services start or stop, and a failed start tells you why and where to find the full log.
+- Lighter install: the desktop app opens the course pages directly instead of running a separate web server, and an upgrade removes files left over from older versions, freeing several hundred MB.
+- Safer course data: the Workspace cannot be placed inside the app's install folder, upgrades never delete it, and it cannot be moved while the service is running.
+- More reliable cleanup and settings: audio the service is using is never cleaned up, and cleanup pauses with a message when the service does not respond; model settings changed while the service runs take effect right away, or you are told they apply after a restart.
+- Safer local service: other web pages cannot control Course Navigator on your computer in the background. When you open it to your local network, use the IP address or computer name (for example `my-pc.local`).
+- No more stuck tasks: fetching video details and subtitles stops after 3 minutes when a site stops responding and asks you to check the network, and cancelling a task fully stops its download or transcription.
+- More accurate subtitles: lines repeated by YouTube's scrolling auto captions are merged while phrases actually said twice are kept; numeric-only lines and files without blank lines between entries are read correctly; saving subtitle edits keeps the subtitle language, so no unneeded translation is triggered.
+- Edits are not lost: changes typed while a save is in progress are kept; a library that fails to load is retried instead of overwriting your content; your own edits in the ASR correction preview are kept as you typed them.
+- Better link matching: links with an episode parameter (such as Bilibili's `?p=2`) count as different videos, while sharing and tracking parameters are ignored.
+- Also: the library opens faster with many courses, and cookies files keep HttpOnly login entries.
+
 ## Requirements
 
 - Node.js 20.19+ on the Node 20 line, or Node.js 22.12+ on Node 22 and newer, with npm.
@@ -95,7 +110,7 @@ See [macOS Local Install](docs/mac-install.en.md) for the full install steps.
 
 The latest [GitHub release](https://github.com/Liu-Bot24/course-navigator/releases/latest) provides a Windows x64 installer named like `Course.Navigator-version-windows-x64-setup.exe`.
 
-Download and run the installer, follow the setup wizard, then launch `Course Navigator` from the Start menu. The installer includes the runtime resources needed by the desktop client. For local video cache, audio extraction, or media conversion workflows, make sure `ffmpeg` is available on the system; you can install it with `winget install Gyan.FFmpeg`.
+Download and run the installer, follow the setup wizard, then launch `Course Navigator` from the Start menu. The installer includes the tools the app needs, including `ffmpeg` for video cache and audio extraction, so there is nothing else to install.
 
 The release page also includes `.sha256` checksum files so you can verify the download.
 
