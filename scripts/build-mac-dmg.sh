@@ -24,7 +24,7 @@ trap cleanup EXIT
 create_dmg_background() {
   local background_path="$1"
   if command -v swift >/dev/null 2>&1; then
-    swift - "$background_path" <<'SWIFT'
+    if swift - "$background_path" <<'SWIFT'
 import AppKit
 
 let output = CommandLine.arguments[1]
@@ -89,7 +89,10 @@ else {
 
 try png.write(to: URL(fileURLWithPath: output))
 SWIFT
-    return
+    then
+      return
+    fi
+    echo "Swift background rendering failed; using the portable PNG renderer." >&2
   fi
 
   python3 - "$background_path" <<'PY'
