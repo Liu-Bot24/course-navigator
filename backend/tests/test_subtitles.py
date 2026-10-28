@@ -87,3 +87,67 @@ changing the way we work and live, and this non-technical course will teach you
         "Welcome to AI for everyone. AI is changing the way we work and live, and",
         "this non-technical course will teach you",
     ]
+
+
+def test_parse_srt_keeps_numeric_text_and_cues_without_blank_lines():
+    raw = """1
+00:00:01,000 --> 00:00:02,000
+2024
+2
+00:00:02,000 --> 00:00:03,000
+was a good year
+00:00:03,000 --> 00:00:04,000
+42
+"""
+
+    segments = parse_subtitle_text(raw, "srt")
+
+    assert [segment.model_dump() for segment in segments] == [
+        {"start": 1.0, "end": 2.0, "text": "2024"},
+        {"start": 2.0, "end": 3.0, "text": "was a good year"},
+        {"start": 3.0, "end": 4.0, "text": "42"},
+    ]
+
+
+def test_parse_subtitles_keeps_a_phrase_repeated_after_a_pause():
+    raw = """WEBVTT
+
+00:00:01.000 --> 00:00:02.000
+thank you very much
+
+00:00:30.000 --> 00:00:31.000
+thank you very much
+"""
+
+    segments = parse_subtitle_text(raw, "vtt")
+
+    assert [segment.text for segment in segments] == ["thank you very much", "thank you very much"]
+
+def test_parse_srt_keeps_a_phrase_repeated_in_the_next_cue():
+    raw = """1
+00:00:00,000 --> 00:00:01,000
+Thank you very much.
+
+2
+00:00:02,000 --> 00:00:03,000
+Thank you very much.
+"""
+
+    segments = parse_subtitle_text(raw, "srt")
+
+    assert [segment.text for segment in segments] == ["Thank you very much.", "Thank you very much."]
+
+
+def test_parse_srt_dedupes_only_cues_that_overlap_the_previous_one():
+    after_gap = """1
+00:00:00,000 --> 00:00:01,000
+Thank you very much.
+
+2
+00:00:01,040 --> 00:00:02,000
+Thank you very much.
+"""
+    overlapping = after_gap.replace("00:00:01,040 -->", "00:00:00,990 -->")
+
+    assert len(parse_subtitle_text(after_gap, "srt")) == 2
+    assert [segment.text for segment in parse_subtitle_text(overlapping, "srt")] == ["Thank you very much."]

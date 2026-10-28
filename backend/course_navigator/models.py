@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 
 OutputLanguage = Literal["zh-CN", "en", "ja"]
@@ -25,7 +26,9 @@ TaskParameterKey = Literal[
     "high_fidelity",
 ]
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, field_validator
+
+from .source_urls import validate_source_url
 
 
 class TranscriptSegment(BaseModel):
@@ -42,12 +45,16 @@ class ExtractRequest(BaseModel):
     language: str = "auto"
     subtitle_source: TranscriptSource = "subtitles"
 
+    _validate_url = field_validator("url")(validate_source_url)
+
 
 class DownloadRequest(BaseModel):
     url: str
     mode: Literal["normal", "browser", "cookies"] = "normal"
     browser: str = "chrome"
     cookies_path: str | None = None
+
+    _validate_url = field_validator("url")(validate_source_url)
 
 
 class CookieTextRequest(BaseModel):
@@ -81,6 +88,7 @@ class StudyRequest(BaseModel):
 
 class TranscriptUpdateRequest(BaseModel):
     transcript: list[TranscriptSegment]
+    language: str | None = Field(default=None, pattern=r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
 
 class CourseItemUpdate(BaseModel):
@@ -220,6 +228,7 @@ class OnlineAsrSettingsResponse(BaseModel):
 
 
 class OnlineAsrServiceSettingsUpdate(BaseModel):
+    model: str | None = None
     api_key: str | None = None
 
 
@@ -318,6 +327,9 @@ class VideoMetadata(BaseModel):
 
 class CourseItem(BaseModel):
     id: str
+    instance_id: str = Field(default_factory=lambda: uuid4().hex, pattern=r"^[0-9a-f]{32}$")
+    source_identity: str | None = None
+    media_revision: int = Field(default=0, ge=0)
     source_url: str
     title: str
     custom_title: bool = False
@@ -330,6 +342,7 @@ class CourseItem(BaseModel):
     created_at: str
     transcript: list[TranscriptSegment] = Field(default_factory=list)
     transcript_source: TranscriptSource | None = None
+    transcript_language: str | None = None
     metadata: VideoMetadata | None = None
     study: "StudyMaterial | None" = None
     local_video_path: Path | None = None
@@ -361,6 +374,11 @@ class OutlineNode(BaseModel):
 
 
 class StudyMaterial(BaseModel):
+    output_language: OutputLanguage | None = None
+    input_fingerprint: str | None = None
+    generation_version: int | None = None
+    learning_complete: bool = False
+    translation_complete: bool = False
     one_line: str
     translated_title: str | None = None
     context_summary: str | None = None
@@ -389,6 +407,7 @@ class CourseShareItem(BaseModel):
     created_at: str | None = None
     transcript: list[TranscriptSegment] = Field(default_factory=list)
     transcript_source: TranscriptSource | None = None
+    transcript_language: str | None = None
     metadata: VideoMetadata | None = None
     study: StudyMaterial | None = None
 

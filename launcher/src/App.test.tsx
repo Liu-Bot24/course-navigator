@@ -94,8 +94,8 @@ vi.mock("./api", () => ({
         providerType: "openai",
         baseUrl: "https://api.example.com/v1",
         model: "deepseek-ai/DeepSeek-V3.2",
-        contextWindow: null,
-        maxTokens: null,
+        contextWindow: 128000,
+        maxTokens: 8192,
         hasApiKey: true,
         apiKeyPreview: "sk-t********test",
       },
@@ -259,6 +259,13 @@ describe("App", () => {
 
     await waitFor(() => expect(apiMocks.saveModelConfig).toHaveBeenCalledTimes(1));
     expect(apiMocks.saveModelConfig.mock.calls[0][0].profiles).toHaveLength(2);
+    // Limits configured elsewhere are kept, and unset ones stay unset.
+    expect(apiMocks.saveModelConfig.mock.calls[0][0].profiles[0]).toEqual(
+      expect.objectContaining({ id: "default", contextWindow: 128000, maxTokens: 8192 }),
+    );
+    expect(apiMocks.saveModelConfig.mock.calls[0][0].profiles[1]).toEqual(
+      expect.objectContaining({ contextWindow: null, maxTokens: null }),
+    );
     expect(apiMocks.saveModelConfig.mock.calls[0][0].profiles).not.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -324,7 +331,7 @@ describe("App", () => {
     expect(apiMocks.saveModelConfig).not.toHaveBeenCalled();
   });
 
-  it("lets users edit web and API ports while services are stopped", async () => {
+  it("lets users edit the service port while services are stopped", async () => {
     render(<App />);
 
     const portPanel = await screen.findByRole("region", { name: "端口配置" });
@@ -332,16 +339,17 @@ describe("App", () => {
     await waitFor(() => expect(editButton.disabled).toBe(false));
     fireEvent.click(editButton);
     fireEvent.change(screen.getByLabelText("网页端口"), { target: { value: "5188" } });
-    fireEvent.change(screen.getByLabelText("API 端口"), { target: { value: "8100" } });
+    expect(screen.queryByLabelText("API 端口")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "保存端口" }));
 
     await waitFor(() => expect(apiMocks.saveConfig).toHaveBeenCalledTimes(1));
     expect(apiMocks.saveConfig).toHaveBeenCalledWith(
       expect.objectContaining({
         webPort: 5188,
-        apiPort: 8100,
+        apiPort: 18000,
       }),
     );
+    await waitFor(() => expect(screen.getByText("http://127.0.0.1:5188/api")).toBeTruthy());
   });
 
   it("opens a native directory picker before changing Workspace", async () => {
@@ -356,6 +364,8 @@ describe("App", () => {
     );
     expect(screen.getByRole("dialog", { name: "确认 Workspace 迁移" })).toBeTruthy();
     expect(apiMocks.setWorkspaceDirectory).not.toHaveBeenCalled();
+    // The service cannot start while the migration is waiting for confirmation.
+    expect((screen.getByRole("button", { name: "启动" }) as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.click(screen.getByRole("button", { name: "迁移并切换" }));
 
@@ -370,5 +380,6 @@ describe("App", () => {
 
     expect(await screen.findByText("Workspace 切换失败：新 Workspace 位置和当前位置相同")).toBeTruthy();
     expect(apiMocks.setWorkspaceDirectory).not.toHaveBeenCalled();
+    expect((screen.getByRole("button", { name: "启动" }) as HTMLButtonElement).disabled).toBe(false);
   });
 });

@@ -86,6 +86,11 @@ describe("Tauri app shell", () => {
     expect(hooks).toContain("Stop-Process");
     expect(hooks).not.toContain("/IM node.exe");
     expect(hooks).not.toContain("/IM python.exe");
+    // Resources are replaced as a whole, after services stopped using them.
+    expect(hooks).toContain('RMDir /r "$INSTDIR\\runtime-source"');
+    expect(hooks).toContain('RMDir /r "$INSTDIR\\runtime-tools"');
+    expect(hooks.indexOf("RMDir /r")).toBeGreaterThan(hooks.indexOf("Stop-Process"));
+    expect(hooks).not.toContain('RMDir /r "$INSTDIR"\n');
   });
 
   it("bundles the runtime source and Windows portable tools needed by direct distribution", () => {
@@ -108,6 +113,16 @@ describe("Tauri app shell", () => {
     expect(packageJson.scripts["tauri:build:windows"]).toContain("tauri build --bundles nsis");
   });
 
+  it("ships prebuilt web pages instead of a Node.js runtime", async () => {
+    const prepareScript = await readFile(resolve(testDir, "../../scripts/prepare-runtime-source.mjs"), "utf-8");
+
+    expect(prepareScript).toContain('const webBuildDir = "frontend/dist"');
+    expect(prepareScript).toContain('["run", "build"]');
+    expect(prepareScript.indexOf("await buildWebPages();")).toBeLessThan(prepareScript.indexOf("await copyDir(rootDir, resourceDir);"));
+    // Only the node executable ships, for yt-dlp; never npm.
+    expect(prepareScript).not.toContain("npm-cli.js");
+  });
+
   it("does not keep the deprecated mac-only runtime preparation entry point", async () => {
     await expect(readFile(resolve(testDir, "../../scripts/prepare-mac-runtime-source.sh"), "utf-8")).rejects.toMatchObject({
       code: "ENOENT",
@@ -121,7 +136,9 @@ describe("Tauri app shell", () => {
     expect(mainSource).toContain('windows_subsystem = "windows"');
     expect(runtimeSource).toContain("CREATE_NO_WINDOW");
     expect(runtimeSource).toContain("creation_flags(CREATE_NO_WINDOW)");
-    expect(runtimeSource).toContain("hidden_command(&command.program)");
+    // Setup steps spawn through service_command, which wraps hidden_command.
+    expect(runtimeSource).toContain("service_command(&command.program)");
+    expect(runtimeSource).toMatch(/fn service_command\(program: &str\) -> Command \{\s*let mut command = hidden_command\(program\);/);
   });
 
   it("bundles Windows runtime tools without a standalone yt-dlp executable", async () => {
@@ -130,6 +147,7 @@ describe("Tauri app shell", () => {
 
     expect(prepareScript).toContain("runtime-tools");
     expect(prepareScript).toContain("nodejs.org/dist");
+    expect(prepareScript).toContain('copyNodeExecutable(nodeExtractDir, "node.exe"');
     expect(prepareScript).toContain("uv-x86_64-pc-windows-msvc");
     expect(prepareScript).not.toContain("yt-dlp.exe");
     expect(prepareScript).toContain("ffmpeg-release-essentials");
@@ -139,7 +157,12 @@ describe("Tauri app shell", () => {
     expect(runtimeSource).toContain("bundled_tool_program");
     expect(runtimeSource).toContain("runtime-tools");
     expect(runtimeSource).toContain("prepend_bundled_tool_paths");
-    expect(runtimeSource).not.toContain('"ytdlp"');
+    // The legacy standalone yt-dlp folder is only ever named to delete it.
+    const cleanupStart = runtimeSource.indexOf("fn remove_legacy_tool_files_in");
+    const cleanupEnd = runtimeSource.indexOf("fn installed_tools_root");
+    expect(cleanupStart).toBeGreaterThan(-1);
+    expect(runtimeSource.slice(cleanupStart, cleanupEnd)).toContain('"ytdlp"');
+    expect(runtimeSource.slice(0, cleanupStart) + runtimeSource.slice(cleanupEnd)).not.toContain('"ytdlp"');
     expect(runtimeSource).toContain('"ffmpeg"');
   });
 
@@ -156,17 +179,10 @@ describe("Tauri app shell", () => {
     const runtimeSource = await import("../src-tauri/src/runtime.rs?raw").then((module) => module.default as string);
 
     expect(prepareScript).toContain("prepareMacRuntimeTools");
-    expect(prepareScript).toContain("pruneMacNodeRuntime");
-    expect(prepareScript).toContain("writeMacNodeCliWrappers");
     expect(prepareScript).toContain("node-${nodeVersion}-darwin-${arch}.tar.gz");
+    expect(prepareScript).not.toContain("writeMacNodeCliWrappers");
     expect(prepareScript).toContain("uv-aarch64-apple-darwin.tar.gz");
     expect(prepareScript).toContain("ffmpeg-ffprobe-static");
-    const wrapperFunction = prepareScript.slice(
-      prepareScript.indexOf("async function writeMacNodeCliWrappers"),
-      prepareScript.indexOf("async function copyExecutable"),
-    );
-    expect(wrapperFunction).toContain("await fs.rm(target, { force: true });");
-    expect(wrapperFunction.indexOf("await fs.rm(target")).toBeLessThan(wrapperFunction.indexOf("await fs.writeFile(target"));
     expect(runtimeSource).toContain("darwin-arm64");
     expect(runtimeSource).toContain("Contents");
     expect(runtimeSource).toContain("Resources");
@@ -177,8 +193,6 @@ describe("Tauri app shell", () => {
 
     expect(prepareScript).toContain('const DEFAULT_NODE_VERSION = "v24.16.0"');
     expect(prepareScript).toContain('const DEFAULT_UV_VERSION = "0.11.19"');
-    expect(prepareScript).toContain("COURSE_NAVIGATOR_WINDOWS_NODE_VERSION || DEFAULT_NODE_VERSION");
-    expect(prepareScript).toContain("COURSE_NAVIGATOR_MAC_NODE_VERSION || DEFAULT_NODE_VERSION");
     expect(prepareScript).toContain("releases/download/${uvVersion}");
     expect(prepareScript).not.toContain("releases/latest/download");
     expect(prepareScript).not.toContain("latestNodeLtsVersion");
@@ -273,9 +287,22 @@ describe("Tauri app shell", () => {
     const stopHandlerEnd = libSource.indexOf('"quit" => {', stopHandlerStart);
     const stopHandler = libSource.slice(stopHandlerStart, stopHandlerEnd);
 
-    expect(stopHandler).toContain("stop_services_from_app(app, state.inner())");
-    expect(stopHandler).toContain("emit_launcher_status");
+    // The tray runs the stop off the main thread; the stop itself emits its result.
+    expect(stopHandler).toContain("spawn_blocking");
+    expect(stopHandler).toContain("stop_services_from_app(&app)");
     expect(stopHandler).not.toContain("let _ = runtime::stop_configured_services");
+    const stopFnStart = libSource.indexOf("fn stop_services_from_app(");
+    const stopFn = libSource.slice(stopFnStart, libSource.indexOf("\nfn ", stopFnStart + 1));
+    expect(stopFn).toContain("status.with_emit(app)");
+  });
+
+  it("runs slow launcher commands off the main thread", async () => {
+    const libSource = await import("../src-tauri/src/lib.rs?raw").then((module) => module.default as string);
+    for (const command of ["get_status", "check_dependencies", "start_services", "stop_services", "set_workspace_directory"]) {
+      expect(libSource).toMatch(new RegExp(`#\\[tauri::command\\]\\s*async fn ${command}\\(`));
+    }
+    const startHandler = libSource.slice(libSource.indexOf('"start" => {'), libSource.indexOf('"stop" => {'));
+    expect(startHandler).toContain("spawn_blocking");
   });
 
   it("keeps ASR correction under LLM models and online ASR as a direct ASR menu", async () => {

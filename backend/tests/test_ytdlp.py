@@ -148,6 +148,49 @@ def test_default_ytdlp_runner_uses_current_python_module(monkeypatch):
     assert calls[0][:3] == [sys.executable, "-m", "yt_dlp"]
 
 
+def test_metadata_and_subtitle_queries_fail_instead_of_hanging(monkeypatch, tmp_path):
+    timeouts = []
+
+    def fake_run(cmd, capture_output, text, check, timeout=None, **_kwargs):
+        timeouts.append(timeout)
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    request = ExtractRequest(url="https://www.youtube.com/watch?v=abc")
+
+    with pytest.raises(YtDlpError, match="180 秒内没有响应"):
+        YtDlpRunner().fetch_metadata(request)
+    with pytest.raises(YtDlpError, match="180 秒内没有响应"):
+        YtDlpRunner().extract_subtitles(request, tmp_path / "subs")
+
+    assert timeouts == [ytdlp_module.YTDLP_QUERY_TIMEOUT_SECONDS] * 2
+
+    # Audio extraction is a download, so only cancellation may stop it.
+    timeouts.clear()
+
+    def failing_download(cmd, capture_output, text, check, timeout=None, **_kwargs):
+        timeouts.append(timeout)
+        return subprocess.CompletedProcess(cmd, 1, "", "network error")
+
+    monkeypatch.setattr("subprocess.run", failing_download)
+    with pytest.raises(YtDlpError):
+        YtDlpRunner().extract_asr(request, tmp_path / "asr", "abc")
+    assert timeouts == [None]
+
+
+def test_media_duration_is_unknown_when_ffprobe_hangs(monkeypatch, tmp_path):
+    timeouts = []
+
+    def fake_run(cmd, capture_output, text, check, timeout=None, **_kwargs):
+        timeouts.append(timeout)
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert YtDlpRunner().probe_local_video_duration(tmp_path / "lesson.mp4") is None
+    assert timeouts == [ytdlp_module.FFPROBE_TIMEOUT_SECONDS]
+
+
 def test_fetch_metadata_parses_ytdlp_json(monkeypatch):
     calls = []
 
@@ -593,6 +636,8 @@ def test_fetch_metadata_snapshots_windows_chrome_cookies_before_ytdlp(monkeypatc
         return MetadataResult()
 
     monkeypatch.setattr(ytdlp_module.sys, "platform", "win32")
+    # Resolving node with a faked platform fails off Windows; the runtime is not under test.
+    monkeypatch.setattr(ytdlp_module, "_node_js_runtime", lambda: "node")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setattr(ytdlp_module.shutil, "copy2", fake_copy2)
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -631,6 +676,8 @@ def test_fetch_metadata_leaves_windows_firefox_cookies_to_ytdlp(monkeypatch):
         return MetadataResult()
 
     monkeypatch.setattr(ytdlp_module.sys, "platform", "win32")
+    # Resolving node with a faked platform fails off Windows; the runtime is not under test.
+    monkeypatch.setattr(ytdlp_module, "_node_js_runtime", lambda: "node")
     monkeypatch.setattr("subprocess.run", fake_run)
     runner = YtDlpRunner(binary="yt-dlp")
 
@@ -1036,6 +1083,8 @@ def test_download_video_snapshots_windows_chrome_cookies_before_ytdlp(monkeypatc
             return self.returncode
 
     monkeypatch.setattr(ytdlp_module.sys, "platform", "win32")
+    # Resolving node with a faked platform fails off Windows; the runtime is not under test.
+    monkeypatch.setattr(ytdlp_module, "_node_js_runtime", lambda: "node")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setattr("subprocess.Popen", FakeProcess)
     runner = YtDlpRunner(binary="yt-dlp")

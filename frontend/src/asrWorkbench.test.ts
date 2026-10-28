@@ -121,7 +121,60 @@ describe("ASR workbench transcript editor helpers", () => {
       { ...transcript[1], text: "Crucial detail." },
     ]);
 
-    expect(previewTextToEditorText(previewText, [suggestion])).toBe(transcriptToEditorText(transcript));
+    expect(previewTextToEditorText(previewText, [suggestion], transcriptToEditorText(transcript))).toBe(transcriptToEditorText(transcript));
+  });
+
+  test("reverts a suggestion where it was applied when the line already had the corrected word", () => {
+    const suggestion: AsrCorrectionSuggestion = {
+      id: "patch-6",
+      segment_index: 0,
+      start: 0,
+      end: 4,
+      original_text: "Important",
+      corrected_text: "Crucial",
+      confidence: 0.92,
+      reason: "术语应为 Crucial。",
+      evidence: "相邻字幕使用同一术语。",
+      status: "pending",
+      source: "model",
+    };
+    const source = [{ start: 0, end: 4, text: "Crucial step and Important detail." }];
+    const editorText = transcriptToEditorText(source);
+    const previewText = transcriptToEditorText([{ ...source[0], text: "Crucial step and Crucial detail!" }]);
+
+    expect(editorTextToTranscript(previewTextToEditorText(previewText, [suggestion], editorText))[0].text).toBe(
+      "Crucial step and Important detail!",
+    );
+  });
+
+  test("leaves other words alone when the user retypes a corrected word", () => {
+    const suggestion: AsrCorrectionSuggestion = {
+      id: "patch-7",
+      segment_index: 0,
+      start: 0,
+      end: 4,
+      original_text: "TensorFloww",
+      corrected_text: "TensorFlow",
+      confidence: 0.92,
+      reason: "拼写。",
+      evidence: "术语。",
+      status: "pending",
+      source: "model",
+    };
+    const editorText = transcriptToEditorText([{ start: 0, end: 4, text: "TensorFlow replaces TensorFloww." }]);
+    const previewText = transcriptToEditorText([{ start: 0, end: 4, text: "TensorFlow replaces PyTorch." }]);
+
+    expect(editorTextToTranscript(previewTextToEditorText(previewText, [suggestion], editorText))[0].text).toBe(
+      "TensorFlow replaces PyTorch.",
+    );
+    expect(reconcilePreviewEditedSuggestions(previewText, [suggestion], editorText)[0].status).toBe("rejected");
+
+    // An edit elsewhere in the line keeps the suggestion and reverts it in place.
+    const elsewhere = transcriptToEditorText([{ start: 0, end: 4, text: "TensorFlow now replaces TensorFlow." }]);
+    expect(editorTextToTranscript(previewTextToEditorText(elsewhere, [suggestion], editorText))[0].text).toBe(
+      "TensorFlow now replaces TensorFloww.",
+    );
+    expect(reconcilePreviewEditedSuggestions(elsewhere, [suggestion], editorText)[0].status).toBe("pending");
   });
 
   test("treats manual edits in the preview as resolving that suggestion", () => {
@@ -143,8 +196,8 @@ describe("ASR workbench transcript editor helpers", () => {
       { ...transcript[1], text: "Useful detail." },
     ]);
 
-    expect(editorTextToTranscript(previewTextToEditorText(previewText, [suggestion]))[1].text).toBe("Useful detail.");
-    expect(reconcilePreviewEditedSuggestions(previewText, [suggestion])[0].status).toBe("rejected");
+    expect(editorTextToTranscript(previewTextToEditorText(previewText, [suggestion], transcriptToEditorText(transcript)))[1].text).toBe("Useful detail.");
+    expect(reconcilePreviewEditedSuggestions(previewText, [suggestion], transcriptToEditorText(transcript))[0].status).toBe("rejected");
   });
 
   test("sorts review suggestions by confidence only when requested", () => {

@@ -22,7 +22,6 @@ const LEGACY_DEFAULT_WEB_PORT: u16 = 5173;
 const PRESERVED_RUNTIME_ENTRIES: &[&str] = &[
     ".env",
     ".venv",
-    "node_modules",
     ".course-navigator",
     "course-navigator-workspace",
     ".course-navigator-deps.json",
@@ -48,7 +47,14 @@ pub fn prepare_bundled_runtime(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
     if runtime_source_needs_install(&resource_root, &target_root)? {
-        copy_runtime_source(&resource_root, &target_root)?;
+        // Older versions allowed a Workspace inside the runtime directory;
+        // the upgrade must never treat it as a stale resource.
+        let protected = [config.workspace_dir.trim()]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .map(|path| normalized_path(Path::new(path)))
+            .collect::<Vec<_>>();
+        install_runtime_source(&resource_root, &target_root, &protected)?;
     }
 
     if Path::new(&config.project_root) != target_root {
@@ -253,8 +259,38 @@ fn platform_application_support_dir() -> PathBuf {
         .join("Course Navigator")
 }
 
+fn runtime_root_for_support(support_dir: &Path) -> PathBuf {
+    support_dir.join("runtime")
+}
+
 fn runtime_project_dir_for_support(support_dir: &Path) -> PathBuf {
-    support_dir.join("runtime").join("project")
+    runtime_root_for_support(support_dir).join("project")
+}
+
+/// The bundled runtime is replaced on upgrade, so user data must live elsewhere.
+pub fn ensure_workspace_outside_runtime(target: &Path) -> Result<(), String> {
+    workspace_outside_runtime(target, &runtime_root_for_support(&application_support_dir()))
+}
+
+fn workspace_outside_runtime(target: &Path, runtime_root: &Path) -> Result<(), String> {
+    if normalized_path(target).starts_with(normalized_path(runtime_root)) {
+        return Err("Workspace 不能放在启动器的运行目录中，升级时该目录会被替换。".into());
+    }
+    Ok(())
+}
+
+/// Resolves the existing part of `path`, so paths that do not exist yet still
+/// compare with the same spelling, case and drive prefix as existing ones.
+fn normalized_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = path.canonicalize() {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            normalized_path(parent).join(name)
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 fn default_workspace_dir_for_support(support_dir: &Path) -> PathBuf {
@@ -280,18 +316,37 @@ fn runtime_source_needs_install(source: &Path, target: &Path) -> Result<bool, St
     Ok(source_raw != target_raw)
 }
 
-fn copy_runtime_source(source: &Path, target: &Path) -> Result<(), String> {
+/// The manifest marks a complete install: it is removed before copying and
+/// written last, so an interrupted upgrade is retried on the next start.
+fn install_runtime_source(source: &Path, target: &Path, protected: &[PathBuf]) -> Result<(), String> {
+    let target_manifest = target.join(RUNTIME_MANIFEST_FILE);
+    if target_manifest.exists() {
+        fs::remove_file(&target_manifest)
+            .map_err(|error| format!("无法重置运行资源清单: {error}"))?;
+    }
+    copy_runtime_source(source, target, protected)?;
+    let source_manifest = source.join(RUNTIME_MANIFEST_FILE);
+    if source_manifest.exists() {
+        fs::copy(&source_manifest, &target_manifest)
+            .map_err(|error| format!("无法写入运行资源清单: {error}"))?;
+    }
+    Ok(())
+}
+
+fn copy_runtime_source(source: &Path, target: &Path, protected: &[PathBuf]) -> Result<(), String> {
     fs::create_dir_all(target).map_err(|error| format!("无法创建运行目录: {error}"))?;
-    remove_stale_runtime_entries(source, target)?;
+    remove_stale_runtime_entries(source, target, protected)?;
     for entry in fs::read_dir(source).map_err(|error| format!("无法读取打包运行资源: {error}"))?
     {
         let entry = entry.map_err(|error| format!("无法读取打包运行资源条目: {error}"))?;
-        if should_preserve_runtime_entry(&entry.file_name()) {
+        if should_preserve_runtime_entry(&entry.file_name())
+            || entry.file_name() == RUNTIME_MANIFEST_FILE
+        {
             continue;
         }
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
-        copy_runtime_entry(&source_path, &target_path)?;
+        copy_runtime_entry(&source_path, &target_path, protected)?;
     }
 
     let env_path = target.join(".env");
@@ -303,11 +358,15 @@ fn copy_runtime_source(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_stale_runtime_entries(source: &Path, target: &Path) -> Result<(), String> {
+fn remove_stale_runtime_entries(source: &Path, target: &Path, protected: &[PathBuf]) -> Result<(), String> {
     for entry in fs::read_dir(target).map_err(|error| format!("无法读取运行目录: {error}"))?
     {
         let entry = entry.map_err(|error| format!("无法读取运行目录条目: {error}"))?;
         if should_preserve_runtime_entry(&entry.file_name()) {
+            continue;
+        }
+        // Keep the Workspace, everything in it and every directory that contains it.
+        if overlaps_protected(&entry.path(), protected) {
             continue;
         }
         if !source.join(entry.file_name()).exists() {
@@ -325,7 +384,7 @@ fn remove_runtime_entry(path: &Path) -> Result<(), String> {
     }
 }
 
-fn copy_runtime_entry(source: &Path, target: &Path) -> Result<(), String> {
+fn copy_runtime_entry(source: &Path, target: &Path, protected: &[PathBuf]) -> Result<(), String> {
     let metadata =
         fs::symlink_metadata(source).map_err(|error| format!("无法读取运行资源文件: {error}"))?;
     if metadata.is_dir() {
@@ -333,14 +392,27 @@ fn copy_runtime_entry(source: &Path, target: &Path) -> Result<(), String> {
             fs::remove_file(target).map_err(|error| format!("无法替换运行资源文件: {error}"))?;
         }
         fs::create_dir_all(target).map_err(|error| format!("无法创建运行资源目录: {error}"))?;
-        copy_runtime_source(source, target)
+        copy_runtime_source(source, target, protected)
     } else {
         if target.is_dir() {
+            if overlaps_protected(target, protected) {
+                return Err(format!(
+                    "运行资源 {} 与 Workspace 位置冲突，请先把 Workspace 移出运行目录。",
+                    target.display()
+                ));
+            }
             fs::remove_dir_all(target).map_err(|error| format!("无法替换运行资源目录: {error}"))?;
         }
         fs::copy(source, target).map_err(|error| format!("无法复制运行资源文件: {error}"))?;
         Ok(())
     }
+}
+
+fn overlaps_protected(path: &Path, protected: &[PathBuf]) -> bool {
+    let path = normalized_path(path);
+    protected
+        .iter()
+        .any(|protected| protected.starts_with(&path) || path.starts_with(protected))
 }
 
 fn should_preserve_runtime_entry(name: &OsStr) -> bool {
@@ -611,7 +683,7 @@ mod tests {
         fs::write(target.join("node_modules/pkg/index.js"), "module").expect("target module");
         fs::write(target.join(".venv/pyvenv.cfg"), "venv").expect("target venv cfg");
 
-        copy_runtime_source(&source, &target).expect("copy runtime source");
+        copy_runtime_source(&source, &target, &[]).expect("copy runtime source");
 
         assert_eq!(
             fs::read_to_string(target.join(".env")).expect("read target env"),
@@ -621,10 +693,8 @@ mod tests {
             fs::read_to_string(target.join("backend/app.py")).expect("read copied source"),
             "app"
         );
-        assert_eq!(
-            fs::read_to_string(target.join("node_modules/pkg/index.js")).expect("read module"),
-            "module"
-        );
+        // Web dependencies are no longer used at runtime; upgrades drop them.
+        assert!(!target.join("node_modules").exists());
         assert_eq!(
             fs::read_to_string(target.join(".venv/pyvenv.cfg")).expect("read venv"),
             "venv"
@@ -650,14 +720,104 @@ mod tests {
         fs::create_dir_all(target.join("node_modules/pkg")).expect("node modules");
         fs::write(target.join("node_modules/pkg/index.js"), "module").expect("module");
 
-        copy_runtime_source(&source, &target).expect("copy runtime source");
+        copy_runtime_source(&source, &target, &[]).expect("copy runtime source");
 
         assert!(!target.join("backend/old.py").exists());
         assert_eq!(
             fs::read_to_string(target.join("backend/app.py")).expect("new app"),
             "new"
         );
-        assert!(target.join("node_modules/pkg/index.js").exists());
+        assert!(!target.join("node_modules").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn unique_temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "course-navigator-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn runtime_upgrade_keeps_a_workspace_inside_the_runtime_directory() {
+        let root = unique_temp_root("runtime-protected");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("backend")).expect("source backend");
+        fs::write(source.join("backend/app.py"), "new").expect("source app");
+        fs::create_dir_all(target.join("data/Workspace/courses")).expect("workspace");
+        fs::write(target.join("data/Workspace/courses/a.json"), "{}").expect("course");
+        fs::write(target.join("stale.txt"), "old").expect("stale");
+        let protected = vec![normalized_path(&target.join("data/Workspace"))];
+
+        install_runtime_source(&source, &target, &protected).expect("install runtime");
+
+        assert!(target.join("data/Workspace/courses/a.json").exists());
+        assert!(!target.join("stale.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_upgrade_keeps_files_inside_a_workspace_that_overlaps_resources() {
+        let root = unique_temp_root("runtime-overlap");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("frontend")).expect("source frontend");
+        fs::write(source.join("frontend/index.html"), "new").expect("source page");
+        fs::create_dir_all(target.join("frontend/courses")).expect("workspace courses");
+        fs::write(target.join("frontend/courses/a.json"), "{}").expect("course");
+        fs::write(target.join("frontend/old.js"), "old").expect("old file");
+        let protected = vec![normalized_path(&target.join("frontend"))];
+
+        install_runtime_source(&source, &target, &protected).expect("install runtime");
+
+        assert!(target.join("frontend/courses/a.json").exists());
+        assert!(target.join("frontend/old.js").exists());
+        assert_eq!(fs::read_to_string(target.join("frontend/index.html")).expect("page"), "new");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_manifest_is_written_after_the_copy_completes() {
+        let root = unique_temp_root("runtime-manifest");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join(RUNTIME_MANIFEST_FILE), "v2").expect("source manifest");
+        // A file replacing a protected directory makes the copy fail midway.
+        fs::write(source.join("data"), "file").expect("conflicting file");
+        fs::create_dir_all(target.join("data/Workspace")).expect("workspace");
+        fs::write(target.join(RUNTIME_MANIFEST_FILE), "v1").expect("target manifest");
+        let protected = vec![normalized_path(&target.join("data/Workspace"))];
+
+        assert!(install_runtime_source(&source, &target, &protected).is_err());
+        assert!(!target.join(RUNTIME_MANIFEST_FILE).exists());
+        assert!(target.join("data/Workspace").is_dir());
+        assert!(runtime_source_needs_install(&source, &target).expect("needs install"));
+
+        fs::remove_file(source.join("data")).expect("remove conflict");
+        install_runtime_source(&source, &target, &protected).expect("install runtime");
+        assert_eq!(
+            fs::read_to_string(target.join(RUNTIME_MANIFEST_FILE)).expect("manifest"),
+            "v2"
+        );
+        assert!(!runtime_source_needs_install(&source, &target).expect("installed"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_must_stay_outside_the_runtime_directory() {
+        let root = unique_temp_root("runtime-guard");
+        let runtime = root.join("support/runtime");
+        fs::create_dir_all(runtime.join("project")).expect("runtime");
+
+        assert!(workspace_outside_runtime(&runtime.join("project/Workspace"), &runtime).is_err());
+        assert!(workspace_outside_runtime(&runtime, &runtime).is_err());
+        assert!(workspace_outside_runtime(&root.join("support/Workspace"), &runtime).is_ok());
+        assert!(workspace_outside_runtime(&root.join("support/runtime-data"), &runtime).is_ok());
         let _ = fs::remove_dir_all(root);
     }
 }

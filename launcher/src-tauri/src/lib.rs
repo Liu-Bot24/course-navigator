@@ -1,5 +1,7 @@
 mod asr_cache;
 mod config;
+#[cfg(windows)]
+mod job;
 mod model_config;
 mod models;
 mod runtime;
@@ -12,8 +14,9 @@ use tauri::{
     tray::TrayIconBuilder,
     Emitter, LogicalSize, Manager, Size,
 };
+use tauri::RunEvent;
 #[cfg(target_os = "macos")]
-use tauri::{ActivationPolicy, RunEvent};
+use tauri::ActivationPolicy;
 
 const TRAY_ID: &str = "course-navigator-tray";
 const LAUNCHER_STATUS_EVENT: &str = "launcher-status-changed";
@@ -34,25 +37,40 @@ fn save_config(app: tauri::AppHandle, config: LauncherConfig) -> Result<Launcher
     Ok(config)
 }
 
-#[tauri::command]
-fn get_status() -> LauncherStatus {
-    let config = get_config();
-    let api_url = format!("http://{}:{}", config.api_host, config.api_port);
-    let web_url = format!("http://{}:{}", config.web_host, config.web_port);
-    if runtime::configured_services_listening(&config) {
-        return LauncherStatus {
-            state: "running".to_string(),
-            api_url,
-            web_url,
-            message: "检测到本地服务已在运行。".to_string(),
-        };
-    }
+/// Runs slow work (process spawns, port probes, installs) off the main thread.
+/// Synchronous Tauri commands run on the main thread and freeze the window.
+async fn run_blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("后台任务异常结束: {error}"))
+}
+
+fn status_for(config: &LauncherConfig, state: &str, message: impl Into<String>) -> LauncherStatus {
     LauncherStatus {
-        state: "stopped".to_string(),
-        api_url,
-        web_url,
-        message: "尚未启动".to_string(),
+        state: state.to_string(),
+        api_url: runtime::api_url(config),
+        web_url: runtime::web_url(config),
+        message: message.into(),
     }
+}
+
+#[tauri::command]
+async fn get_status(app: tauri::AppHandle) -> Result<LauncherStatus, String> {
+    run_blocking(move || current_status(&app)).await
+}
+
+fn current_status(app: &tauri::AppHandle) -> LauncherStatus {
+    let config = get_config();
+    if let Some(operation) = app
+        .try_state::<runtime::ServiceState>()
+        .and_then(|state| state.current_operation())
+    {
+        return status_for(&config, operation.state, operation.message);
+    }
+    if runtime::configured_services_listening(&config) {
+        return status_for(&config, "running", "检测到本地服务已在运行。");
+    }
+    status_for(&config, "stopped", "尚未启动")
 }
 
 #[tauri::command]
@@ -67,125 +85,143 @@ fn save_model_config(
     input: model_config::LauncherModelConfigInput,
 ) -> Result<model_config::LauncherModelConfig, String> {
     let config = get_config();
-    let model_config = model_config::save_model_config(&config, input)?;
+    let state = app.try_state::<runtime::ServiceState>();
+    let model_config = model_config::save_model_config(state.as_deref(), &config, input)?;
     let _ = refresh_tray_menu(&app);
     let _ = app.emit("model-config-changed", ());
     Ok(model_config)
 }
 
 #[tauri::command]
-fn check_dependencies() -> Vec<runtime::DependencyStatus> {
-    let config = config::load_config();
-    runtime::check_dependencies(std::path::Path::new(&config.project_root))
+async fn check_dependencies() -> Result<Vec<runtime::DependencyStatus>, String> {
+    run_blocking(|| {
+        let config = config::load_config();
+        runtime::check_dependencies(std::path::Path::new(&config.project_root))
+    })
+    .await
 }
 
 #[tauri::command]
-fn start_services(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, runtime::ServiceState>,
-) -> LauncherStatus {
-    start_services_from_app(&app, state.inner())
+async fn start_services(app: tauri::AppHandle) -> LauncherStatus {
+    let fallback = app.clone();
+    run_blocking(move || start_services_from_app(&app))
+        .await
+        .unwrap_or_else(|error| status_for(&get_config(), "failed", error).with_emit(&fallback))
 }
 
-fn start_services_from_app(
-    app: &tauri::AppHandle,
-    state: &runtime::ServiceState,
-) -> LauncherStatus {
+/// Reports every step as a "starting" status event and returns the final status.
+fn start_services_from_app(app: &tauri::AppHandle) -> LauncherStatus {
+    let Some(state) = app.try_state::<runtime::ServiceState>() else {
+        return service_state_unavailable_status();
+    };
+    let state = state.inner();
+    let initial_config = config::load_config();
+    let Some(guard) = state.begin_operation("starting", "正在检查端口...") else {
+        return busy_status(state, &initial_config);
+    };
+    emit_launcher_status(app, &status_for(&initial_config, "starting", "正在检查端口..."));
+
     let (config, port_messages) = start_config_with_available_ports(app);
-    let api_url = format!("http://{}:{}", config.api_host, config.api_port);
-    let web_url = format!("http://{}:{}", config.web_host, config.web_port);
+    let report = |message: &str| {
+        state.set_operation_message(message);
+        emit_launcher_status(app, &status_for(&config, "starting", message));
+    };
     let existing_services_ready = runtime::configured_services_listening(&config);
-    let status = match runtime::start_project_services(state, &config) {
+    let status = match runtime::start_project_services(state, &config, &report) {
         Ok(()) => {
             if config.open_browser_on_start {
-                let _ = open::that(&web_url);
+                let _ = open::that(format!("http://{}:{}", config.web_host, config.web_port));
             }
-            LauncherStatus {
-                state: "running".to_string(),
-                api_url,
-                web_url,
-                message: if existing_services_ready {
-                    "检测到现有服务已可用，已复用并打开网页。".to_string()
-                } else if !port_messages.is_empty() {
-                    format!("{}；服务已启动", port_messages.join("；"))
-                } else {
-                    "服务已启动".to_string()
-                },
-            }
+            let message = if existing_services_ready {
+                "检测到现有服务已可用，已复用并打开网页。".to_string()
+            } else if !port_messages.is_empty() {
+                format!("{}；服务已启动", port_messages.join("；"))
+            } else {
+                "服务已启动".to_string()
+            };
+            status_for(&config, "running", message)
         }
-        Err(error) => LauncherStatus {
-            state: "failed".to_string(),
-            api_url,
-            web_url,
-            message: error,
-        },
+        Err(error) if error == runtime::START_CANCELLED => status_for(&config, "stopped", error),
+        Err(error) => status_for(&config, "failed", error),
     };
+    drop(guard);
     let _ = refresh_tray_menu(app);
-    status
+    status.with_emit(app)
+}
+
+fn busy_status(state: &runtime::ServiceState, config: &LauncherConfig) -> LauncherStatus {
+    match state.current_operation() {
+        Some(operation) => status_for(config, operation.state, operation.message),
+        None => status_for(config, "failed", "操作冲突，请稍后重试。"),
+    }
 }
 
 #[tauri::command]
-fn stop_services(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, runtime::ServiceState>,
-) -> LauncherStatus {
-    stop_services_from_app(&app, state.inner())
+async fn stop_services(app: tauri::AppHandle) -> LauncherStatus {
+    let fallback = app.clone();
+    run_blocking(move || stop_services_from_app(&app))
+        .await
+        .unwrap_or_else(|error| status_for(&get_config(), "failed", error).with_emit(&fallback))
 }
 
-fn stop_services_from_app(app: &tauri::AppHandle, state: &runtime::ServiceState) -> LauncherStatus {
-    let config = get_config();
-    stop_services_with_config(app, state, &config)
-}
-
-fn stop_services_with_config(
-    app: &tauri::AppHandle,
-    state: &runtime::ServiceState,
-    config: &LauncherConfig,
-) -> LauncherStatus {
-    let api_url = format!("http://{}:{}", config.api_host, config.api_port);
-    let web_url = format!("http://{}:{}", config.web_host, config.web_port);
-    let status = match runtime::stop_configured_services(state, config) {
-        Ok(stopped_any) => LauncherStatus {
-            state: "stopped".to_string(),
-            api_url,
-            web_url,
-            message: if stopped_any {
-                "服务已停止".to_string()
-            } else {
-                "没有检测到需要停止的服务。".to_string()
-            },
-        },
-        Err(error) => LauncherStatus {
-            state: "failed".to_string(),
-            api_url,
-            web_url,
-            message: error,
-        },
+/// Stopping during a start cancels it; the start then reports its own final status.
+fn stop_services_from_app(app: &tauri::AppHandle) -> LauncherStatus {
+    let Some(state) = app.try_state::<runtime::ServiceState>() else {
+        return service_state_unavailable_status();
     };
+    let state = state.inner();
+    let config = get_config();
+    if state.request_start_cancel() {
+        return status_for(&config, "stopping", "正在取消启动...").with_emit(app);
+    }
+    let Some(guard) = state.begin_operation("stopping", "正在停止本地服务...") else {
+        return busy_status(state, &config);
+    };
+    emit_launcher_status(app, &status_for(&config, "stopping", "正在停止本地服务..."));
+    let status = match runtime::stop_configured_services(state, &config) {
+        Ok(true) => status_for(&config, "stopped", "服务已停止"),
+        Ok(false) => status_for(&config, "stopped", "没有检测到需要停止的服务。"),
+        Err(error) => status_for(&config, "failed", error),
+    };
+    drop(guard);
     let _ = refresh_tray_menu(app);
-    status
+    status.with_emit(app)
 }
 
 fn service_state_unavailable_status() -> LauncherStatus {
-    let config = get_config();
-    LauncherStatus {
-        state: "failed".to_string(),
-        api_url: format!("http://{}:{}", config.api_host, config.api_port),
-        web_url: format!("http://{}:{}", config.web_host, config.web_port),
-        message: "无法读取启动器服务状态，请打开主窗口重试。".to_string(),
-    }
+    status_for(
+        &get_config(),
+        "failed",
+        "无法读取启动器服务状态，请打开主窗口重试。",
+    )
 }
 
 fn emit_launcher_status(app: &tauri::AppHandle, status: &LauncherStatus) {
     let _ = app.emit(LAUNCHER_STATUS_EVENT, status);
 }
 
+trait EmitStatus {
+    fn with_emit(self, app: &tauri::AppHandle) -> Self;
+}
+
+impl EmitStatus for LauncherStatus {
+    /// Tray actions have no caller to return to; the window learns through the event.
+    fn with_emit(self, app: &tauri::AppHandle) -> Self {
+        emit_launcher_status(app, &self);
+        self
+    }
+}
+
 #[tauri::command]
-fn plan_workspace_migration(
+async fn plan_workspace_migration(
     source: String,
     target: String,
 ) -> Result<workspace::WorkspaceMigrationPlan, String> {
-    workspace::migration_plan(&source, &target)
+    run_blocking(move || {
+        config::ensure_workspace_outside_runtime(std::path::Path::new(&target))?;
+        workspace::migration_plan(&source, &target)
+    })
+    .await?
 }
 
 #[tauri::command]
@@ -200,22 +236,41 @@ fn choose_workspace_directory(app: tauri::AppHandle) -> Result<Option<String>, S
 }
 
 #[tauri::command]
-fn set_workspace_directory(
+async fn set_workspace_directory(
     app: tauri::AppHandle,
     target: String,
     migrate_existing: bool,
 ) -> Result<LauncherConfig, String> {
-    let mut config = config::load_config();
-    let source = config.workspace_dir.clone();
-    let prepared = workspace::prepare_workspace_change(&source, &target, migrate_existing)?;
-    let _migrated = prepared.migrated;
-    config.workspace_dir = prepared.target;
-    crate::config::save_config(&config)?;
-    if prepared.should_remove_source {
-        workspace::remove_old_workspace(&source)?;
-    }
-    let _ = refresh_tray_menu(&app);
-    Ok(config)
+    // Migration copies the whole Workspace; keep the window responsive.
+    run_blocking(move || {
+        let Some(state) = app.try_state::<runtime::ServiceState>() else {
+            return Err("无法读取启动器服务状态，请重试。".to_string());
+        };
+        // Switching shares the start/stop slot, so the service can neither be
+        // running nor start while the Workspace is copied and removed.
+        let Some(_guard) = state
+            .inner()
+            .begin_operation("migrating", "正在切换 Workspace...")
+        else {
+            return Err("服务正在启动或停止，请稍后再切换 Workspace。".to_string());
+        };
+        let mut config = config::load_config();
+        if runtime::service_may_be_running(Some(state.inner()), &config) {
+            return Err("请先停止服务，再切换 Workspace。".to_string());
+        }
+        config::ensure_workspace_outside_runtime(std::path::Path::new(&target))?;
+        let source = config.workspace_dir.clone();
+        let prepared = workspace::prepare_workspace_change(&source, &target, migrate_existing)?;
+        let _migrated = prepared.migrated;
+        config.workspace_dir = prepared.target;
+        crate::config::save_config(&config)?;
+        if prepared.should_remove_source {
+            workspace::remove_old_workspace(&source)?;
+        }
+        let _ = refresh_tray_menu(&app);
+        Ok(config)
+    })
+    .await?
 }
 
 #[tauri::command]
@@ -238,6 +293,7 @@ pub fn run() {
             app.set_activation_policy(ActivationPolicy::Regular);
 
             config::prepare_bundled_runtime(app.handle()).map_err(std::io::Error::other)?;
+            tauri::async_runtime::spawn_blocking(runtime::remove_legacy_tool_files);
             let menu = build_tray_menu(app.handle())?;
             let tray_icon = platform_tray_icon();
             configure_main_window(app.handle());
@@ -254,23 +310,25 @@ pub fn run() {
                         let _ =
                             open::that(format!("http://{}:{}", config.web_host, config.web_port));
                     }
+                    // Tray handlers run on the main thread; long work goes to the background.
                     "start" => {
-                        let status = app
-                            .try_state::<runtime::ServiceState>()
-                            .map(|state| start_services_from_app(app, state.inner()))
-                            .unwrap_or_else(service_state_unavailable_status);
-                        emit_launcher_status(app, &status);
+                        let app = app.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            start_services_from_app(&app);
+                        });
                     }
                     "stop" => {
-                        let status = app
-                            .try_state::<runtime::ServiceState>()
-                            .map(|state| stop_services_from_app(app, state.inner()))
-                            .unwrap_or_else(service_state_unavailable_status);
-                        emit_launcher_status(app, &status);
+                        let app = app.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            stop_services_from_app(&app);
+                        });
                     }
                     "quit" => {
-                        stop_configured_from_app(app);
-                        app.exit(0);
+                        let app = app.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            stop_configured_from_app(&app);
+                            app.exit(0);
+                        });
                     }
                     id if id.starts_with("model:") => {
                         handle_model_menu_event(app, id);
@@ -279,14 +337,23 @@ pub fn run() {
                         handle_model_menu_event(app, id);
                     }
                     "asr_cache:cleanup" => {
-                        let config = config::load_config();
-                        let _ = asr_cache::cleanup(&config);
-                        let _ = refresh_tray_menu(app);
+                        let app = app.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            let config = config::load_config();
+                            let state = app.try_state::<runtime::ServiceState>();
+                            let _ = asr_cache::cleanup(state.as_deref(), &config);
+                            let _ = refresh_tray_menu(&app);
+                        });
                     }
                     "asr_cache:auto_cleanup" => {
                         let config = config::load_config();
                         let status = asr_cache::load_status(&config);
-                        let _ = asr_cache::set_auto_cleanup(&config, !status.auto_cleanup_enabled);
+                        let state = app.try_state::<runtime::ServiceState>();
+                        let _ = asr_cache::set_auto_cleanup(
+                            state.as_deref(),
+                            &config,
+                            !status.auto_cleanup_enabled,
+                        );
                         let _ = refresh_tray_menu(app);
                     }
                     _ => {}
@@ -319,20 +386,21 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build Course Navigator");
 
-    #[cfg(target_os = "macos")]
-    app.run(|app, event| {
-        if let RunEvent::Reopen {
+    app.run(|app, event| match event {
+        // Quitting from the Dock, the app menu or a logout skips the tray's
+        // quit item, and outside Windows no job object stops the services.
+        RunEvent::Exit => stop_configured_from_app(app),
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen {
             has_visible_windows,
             ..
-        } = event
-        {
+        } => {
             if !has_visible_windows {
                 show_main_window(app);
             }
         }
+        _ => {}
     });
-    #[cfg(not(target_os = "macos"))]
-    app.run(|_app, _event| {});
 }
 
 fn start_config_with_available_ports(app: &tauri::AppHandle) -> (LauncherConfig, Vec<String>) {
@@ -358,11 +426,21 @@ fn platform_tray_icon() -> Image<'static> {
         .to_owned()
 }
 
+/// Used on quit: abort a running start, give it time to clean up, then stop services.
+/// Runs once, whether the tray's quit item or the app's exit gets there first.
 fn stop_configured_from_app(app: &tauri::AppHandle) {
-    let config = config::load_config();
-    if let Some(state) = app.try_state::<runtime::ServiceState>() {
-        let _ = stop_services_with_config(app, state.inner(), &config);
+    static STOPPED_FOR_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STOPPED_FOR_QUIT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
+    let Some(state) = app.try_state::<runtime::ServiceState>() else {
+        return;
+    };
+    let state = state.inner();
+    state.request_start_cancel();
+    // A cancelled start kills its install step and services within a few seconds.
+    state.wait_for_idle(std::time::Duration::from_secs(15));
+    let _ = runtime::stop_configured_services(state, &config::load_config());
 }
 
 fn configure_main_window(app: &tauri::AppHandle) {
@@ -390,8 +468,8 @@ fn show_main_window(app: &tauri::AppHandle) {
 fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let config = config::load_config();
     let status_label = tray_status_label(&config);
-    let web_url = format!("http://{}:{}", config.web_host, config.web_port);
-    let api_url = format!("http://{}:{}", config.api_host, config.api_port);
+    let web_url = runtime::web_url(&config);
+    let api_url = runtime::api_url(&config);
     let model_menu = build_model_submenu(app, &config)?;
     let asr_cache_status = build_asr_cache_status_item(app, &config)?;
     let asr_auto_cleanup_menu = build_asr_auto_cleanup_submenu(app, &config)?;
@@ -633,14 +711,16 @@ fn tray_status_label(config: &LauncherConfig) -> &'static str {
 
 fn handle_model_menu_event(app: &tauri::AppHandle, id: &str) {
     let config = config::load_config();
+    let state = app.try_state::<runtime::ServiceState>();
+    let state = state.as_deref();
     let result = if let Some(rest) = id.strip_prefix("model:") {
         if let Some((role, profile_id)) = rest.split_once(':') {
-            model_config::set_model_role(&config, role, profile_id).map(|_| ())
+            model_config::set_model_role(state, &config, role, profile_id).map(|_| ())
         } else {
             Err("模型菜单事件格式错误".to_string())
         }
     } else if let Some(provider) = id.strip_prefix("online_asr:") {
-        model_config::set_online_asr_provider(&config, provider).map(|_| ())
+        model_config::set_online_asr_provider(state, &config, provider).map(|_| ())
     } else {
         Ok(())
     };

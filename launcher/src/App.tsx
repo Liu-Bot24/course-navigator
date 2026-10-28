@@ -43,7 +43,7 @@ import "./styles.css";
 
 const fallbackStatus: LauncherStatus = {
   state: "stopped",
-  apiUrl: "http://127.0.0.1:18000",
+  apiUrl: "http://127.0.0.1:15173/api",
   webUrl: "http://127.0.0.1:15173",
   message: "尚未启动",
 };
@@ -84,7 +84,7 @@ const ONLINE_ASR_OPTIONS: { value: OnlineAsrProvider; label: string }[] = [
 ];
 
 function isServiceBusy(state: LauncherStatus["state"]) {
-  return state === "running" || state === "starting" || state === "stopping";
+  return state === "running" || state === "starting" || state === "stopping" || state === "migrating";
 }
 
 function getErrorMessage(error: unknown) {
@@ -185,22 +185,20 @@ export function App() {
     setStatus(nextStatus);
   }
 
-  async function handleSavePorts(webPort: number, apiPort: number): Promise<boolean> {
+  async function handleSavePorts(webPort: number): Promise<boolean> {
     if (!config) return false;
     if (isServiceBusy(status.state)) {
       setNotice("请先停止服务，再修改端口。");
       return false;
     }
-    if (webPort === apiPort && config.webHost === config.apiHost) {
-      setNotice("网页端口和 API 端口不能相同。");
-      return false;
-    }
-    const nextConfig = await saveConfig({ ...config, webPort, apiPort });
+    const nextConfig = await saveConfig({ ...config, webPort });
     setConfig(nextConfig);
+    // One local service serves the pages and the API on the web port.
+    const webUrl = `http://${nextConfig.webHost}:${nextConfig.webPort}`;
     setStatus((current) => ({
       ...current,
-      apiUrl: `http://${nextConfig.apiHost}:${nextConfig.apiPort}`,
-      webUrl: `http://${nextConfig.webHost}:${nextConfig.webPort}`,
+      apiUrl: `${webUrl}/api`,
+      webUrl,
       message: "端口已保存，下一次启动服务时生效。",
     }));
     setNotice("端口已保存，下一次启动服务时生效。");
@@ -262,6 +260,11 @@ export function App() {
 
   async function handleConfirmWorkspaceMigration() {
     if (!pendingWorkspacePlan || workspaceBusy) return;
+    // The service may have been started while the confirmation was open.
+    if (isServiceBusy(status.state)) {
+      setNotice("请先停止服务，再切换 Workspace。");
+      return;
+    }
     setWorkspaceBusy(true);
     setNotice("正在迁移 Workspace...");
 
@@ -315,7 +318,7 @@ type SharedLauncherProps = {
   onSaveModelConfig: (input: ModelConfigInput, successMessage: string) => Promise<boolean>;
   onStart: () => Promise<void>;
   onStop: () => Promise<void>;
-  onSavePorts: (webPort: number, apiPort: number) => Promise<boolean>;
+  onSavePorts: (webPort: number) => Promise<boolean>;
   onChangeWorkspace: () => Promise<void>;
   pendingWorkspacePlan: WorkspaceMigrationPlan | null;
   workspaceBusy: boolean;
@@ -352,13 +355,28 @@ function MainLauncher({
           <h1>视频学习工作台</h1>
           <p className="hero-copy">用菜单栏启动本地服务，打开课程库、缓存并管理学习内容。</p>
           <div className="hero-actions" aria-label="服务操作">
-            <button type="button" onClick={() => void onStart()}>
+            <button
+              type="button"
+              onClick={() => void onStart()}
+              disabled={
+                status.state === "starting" ||
+                status.state === "stopping" ||
+                status.state === "migrating" ||
+                workspaceBusy ||
+                pendingWorkspacePlan !== null
+              }
+            >
               <Play size={20} />
               启动
             </button>
-            <button type="button" onClick={() => void onStop()}>
+            {/* Stopping during a start cancels it, including a slow dependency setup. */}
+            <button
+              type="button"
+              onClick={() => void onStop()}
+              disabled={status.state === "stopping" || status.state === "migrating"}
+            >
               <Square size={20} />
-              停止
+              {status.state === "starting" ? "取消" : "停止"}
             </button>
             {notice ? <p>{notice}</p> : null}
           </div>
@@ -645,8 +663,9 @@ function ModelArchiveDialog({
       providerType: profile.providerType,
       baseUrl: profile.baseUrl.trim(),
       model: profile.model.trim(),
-      contextWindow: null,
-      maxTokens: null,
+      // Limits set in the web settings have no editor here and must survive.
+      contextWindow: profile.contextWindow,
+      maxTokens: profile.maxTokens,
       ...apiKeyInput(profile.apiKey, profile.apiKeyPreview),
     }));
     const profileIds = new Set(input.profiles.map((profile) => profile.id));
@@ -896,16 +915,14 @@ function PortSettings({
   status: LauncherStatus;
   editing: boolean;
   onEditingChange: (editing: boolean) => void;
-  onSavePorts: (webPort: number, apiPort: number) => Promise<boolean>;
+  onSavePorts: (webPort: number) => Promise<boolean>;
 }) {
   const [webPort, setWebPort] = useState("");
-  const [apiPort, setApiPort] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!editing) return;
     setWebPort(String(config?.webPort ?? 15173));
-    setApiPort(String(config?.apiPort ?? 18000));
     setError(null);
   }, [config, editing]);
 
@@ -916,12 +933,11 @@ function PortSettings({
 
   async function savePorts() {
     const nextWebPort = parsePort(webPort);
-    const nextApiPort = parsePort(apiPort);
-    if (!nextWebPort || !nextApiPort) {
+    if (!nextWebPort) {
       setError("端口必须是 1-65535 之间的整数。");
       return;
     }
-    const saved = await onSavePorts(nextWebPort, nextApiPort);
+    const saved = await onSavePorts(nextWebPort);
     if (saved) {
       onEditingChange(false);
       setError(null);
@@ -951,10 +967,6 @@ function PortSettings({
           <label>
             网页端口
             <input inputMode="numeric" value={webPort} onChange={(event) => setWebPort(event.target.value)} />
-          </label>
-          <label>
-            API 端口
-            <input inputMode="numeric" value={apiPort} onChange={(event) => setApiPort(event.target.value)} />
           </label>
           <button type="button" onClick={() => void savePorts()}>
             <Save size={16} />

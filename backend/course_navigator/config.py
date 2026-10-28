@@ -23,6 +23,10 @@ def default_env_path() -> Path:
     return Path(__file__).resolve().parents[2] / ".env"
 
 
+def default_web_dist_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+
 class ModelProfileConfig(BaseModel):
     id: str
     name: str

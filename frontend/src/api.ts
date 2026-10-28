@@ -37,6 +37,10 @@ export async function listItems(): Promise<CourseItem[]> {
   return requestJson<CourseItem[]>("/items");
 }
 
+export async function getLibraryErrors(): Promise<Record<string, string>> {
+  return requestJson<Record<string, string>>("/library-errors");
+}
+
 export async function getItem(itemId: string): Promise<CourseItem> {
   return requestJson<CourseItem>(`/items/${itemId}`);
 }
@@ -192,10 +196,15 @@ export async function cancelStudyJob(jobId: string): Promise<StudyJobStatus> {
   return cancelJob(jobId);
 }
 
-export async function saveTranscript(itemId: string, transcript: TranscriptSegment[]): Promise<CourseItem> {
+// `language` undefined keeps the saved track language; null marks it unknown.
+export async function saveTranscript(
+  itemId: string,
+  transcript: TranscriptSegment[],
+  language?: string | null,
+): Promise<CourseItem> {
   return requestJson<CourseItem>(`/items/${itemId}/transcript`, {
     method: "PUT",
-    body: JSON.stringify({ transcript }),
+    body: JSON.stringify(language === undefined ? { transcript } : { transcript, language }),
   });
 }
 

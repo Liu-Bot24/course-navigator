@@ -1,4 +1,5 @@
 import json
+import socket
 import os
 from pathlib import Path
 from threading import Event
@@ -133,6 +134,80 @@ def test_save_cookie_text_accepts_browser_extension_json(tmp_path):
     assert response.status_code == 200
     content = Path(response.json()["path"]).read_text(encoding="utf-8")
     assert ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tjson-value" in content
+
+
+def test_save_cookie_text_keeps_http_only_netscape_rows(tmp_path):
+    client = make_client(tmp_path)
+    text = (
+        "# Netscape HTTP Cookie File\n"
+        "# a comment line\n"
+        "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tsession\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tPREF\tplain\n"
+    )
+
+    response = client.post("/api/cookies/text", json={"text": text})
+
+    assert response.status_code == 200
+    content = Path(response.json()["path"]).read_text(encoding="utf-8")
+    assert "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tsession" in content
+    assert ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tPREF\tplain" in content
+    assert "a comment line" not in content
+
+
+def test_local_request_guard_rejects_foreign_hosts_and_cross_site_writes(tmp_path):
+    client = make_client(tmp_path)
+    cookie = {"text": "Cookie: SID=one"}
+
+    # A DNS-rebinding page reaches the port under its own host name.
+    assert client.get("/api/health", headers={"host": "attacker.example:8000"}).status_code == 403
+    assert client.post("/api/cookies/text", json=cookie, headers={"origin": "https://attacker.example"}).status_code == 403
+    assert client.post("/api/cookies/text", json=cookie, headers={"origin": "null"}).status_code == 403
+    assert client.post("/api/cookies/text", json=cookie, headers={"sec-fetch-site": "cross-site"}).status_code == 403
+    assert not (tmp_path / "cookies" / "manual.cookies.txt").exists()
+
+
+def test_local_request_guard_allows_the_web_page_and_local_clients(tmp_path):
+    client = make_client(tmp_path)
+    cookie = {"text": "Cookie: SID=one"}
+
+    assert client.get("/api/health", headers={"host": "localhost:5173"}).status_code == 200
+    assert client.get("/api/health", headers={"host": "[::1]:5173"}).status_code == 200
+    # Same-origin page, the configured web origin, and the launcher (no Origin).
+    assert client.post("/api/cookies/text", json=cookie, headers={"origin": "http://127.0.0.1"}).status_code == 200
+    assert client.post("/api/cookies/text", json=cookie, headers={"origin": "http://localhost:15173", "sec-fetch-site": "same-site"}).status_code == 200
+    assert client.post("/api/cookies/text", json=cookie, headers={"origin": "http://localhost:3000"}).status_code == 403
+    assert client.post("/api/cookies/text", json=cookie).status_code == 200
+
+
+def test_local_request_guard_accepts_any_host_when_bound_to_all_addresses(tmp_path):
+    client = make_client(tmp_path, settings=Settings(data_dir=tmp_path, web_host="0.0.0.0"))
+
+    assert client.get("/api/health", headers={"host": "192.168.1.20:5173"}).status_code == 200
+    assert client.post(
+        "/api/cookies/text",
+        json={"text": "Cookie: SID=one"},
+        headers={"host": "192.168.1.20:5173", "origin": "http://192.168.1.20:5173"},
+    ).status_code == 200
+    assert client.post(
+        "/api/cookies/text",
+        json={"text": "Cookie: SID=one"},
+        headers={"host": "192.168.1.20:5173", "origin": "https://attacker.example"},
+    ).status_code == 403
+    # A rebinding domain that resolves to this machine is still refused.
+    assert client.get("/api/health", headers={"host": "attacker.example:5173"}).status_code == 403
+    assert client.post(
+        "/api/cookies/text",
+        json={"text": "Cookie: SID=one"},
+        headers={"host": "attacker.example:5173", "origin": "http://attacker.example:5173"},
+    ).status_code == 403
+    assert client.get("/api/health", headers={"host": f"{socket.gethostname()}:5173"}).status_code == 200
+
+
+def test_local_request_guard_ignores_the_unused_api_host(tmp_path):
+    client = make_client(tmp_path, settings=Settings(data_dir=tmp_path, api_host="0.0.0.0"))
+
+    assert client.get("/api/health", headers={"host": "attacker.example:15173"}).status_code == 403
+    assert client.get("/api/health").status_code == 200
 
 
 def test_save_cookie_text_rejects_unusable_cookie_text(tmp_path):
@@ -609,7 +684,8 @@ def test_workspace_video_picker_imports_single_file_to_existing_course(tmp_path,
     assert payload["id"] == item_id
     assert payload["source_url"] == f"local-video://{item_id}"
     assert payload["video_source_type"] == "workspace"
-    assert payload["local_video_path"] == f"downloads/{item_id}.mp4"
+    assert payload["local_video_path"].startswith(f"downloads/{payload['instance_id']}/")
+    assert payload["local_video_path"].endswith(f"/{item_id}.mp4")
     assert payload["duration"] == 67.5
     assert payload["transcript"][0]["text"] == "Hello"
     assert payload["study"]["high_fidelity_text"] == "Existing detail"
@@ -702,9 +778,10 @@ def test_workspace_keeps_course_records_and_downloads_separate_from_process_file
     assert captured["subtitle_dir"].resolve().is_relative_to((process_dir / "subtitles").resolve())
     assert (workspace_dir / "items" / "abc123.json").exists()
     assert not (process_dir / "items" / "abc123.json").exists()
-    assert (workspace_dir / "downloads" / "abc123.mp4").exists()
-    assert not (process_dir / "downloads" / "abc123.mp4").exists()
-    assert client.get("/api/items/abc123").json()["local_video_path"] == "downloads/abc123.mp4"
+    video_reference = client.get("/api/items/abc123").json()["local_video_path"]
+    assert (workspace_dir / video_reference).is_file()
+    assert (workspace_dir / video_reference).resolve().is_relative_to((workspace_dir / "downloads").resolve())
+    assert not list((process_dir / "downloads").rglob("*.mp4"))
     assert client.get("/api/items/abc123/video").content == b"video"
 
 
@@ -1171,7 +1248,7 @@ def test_extract_route_auto_cleans_asr_audio_when_cache_exceeds_threshold(tmp_pa
 
     assert response.status_code == 200
     assert response.json()["transcript_source"] == "asr"
-    assert not (tmp_path / "subtitles" / "abc123" / "abc123.wav").exists()
+    assert not list((tmp_path / "subtitles" / "abc123").rglob("*.wav"))
 
 
 def test_extract_route_keeps_asr_audio_when_auto_cleanup_is_disabled(tmp_path, monkeypatch):
@@ -1203,7 +1280,7 @@ def test_extract_route_keeps_asr_audio_when_auto_cleanup_is_disabled(tmp_path, m
 
     assert response.status_code == 200
     assert response.json()["transcript_source"] == "asr"
-    assert (tmp_path / "subtitles" / "abc123" / "abc123.wav").exists()
+    assert len(list((tmp_path / "subtitles" / "abc123").rglob("*.wav"))) == 1
     assert client.get("/api/settings/asr-cache").json()["size_bytes"] == 6
 
 
@@ -2254,32 +2331,17 @@ def test_running_translation_job_passes_cancel_signal_to_ai(tmp_path, monkeypatc
     assert payload["status"] == "cancelled"
 
 
-def test_incomplete_cached_translation_is_hidden_from_response(tmp_path, monkeypatch):
-    def fake_translate(**kwargs):
-        return [
-            TranscriptSegment(start=segment.start, end=segment.end, text=segment.text)
-            for segment in kwargs["transcript"]
-        ]
-
-    monkeypatch.setattr("course_navigator.app.translate_transcript_material", fake_translate)
+def test_incomplete_cached_translation_is_hidden_from_response(tmp_path):
     client = make_client(tmp_path)
-    client.post(
-        "/api/extract",
-        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    client.post("/api/extract", json={"url": "https://www.youtube.com/watch?v=abc123"})
+    library = CourseLibrary(tmp_path)
+    item = library.get("abc123")
+    item.study = StudyMaterial(
+        one_line="Legacy incomplete translation", time_map=[], outline=[], detailed_notes="", high_fidelity_text="",
+        translated_transcript=[segment.model_copy() for segment in item.transcript],
     )
-
-    response = client.post("/api/items/abc123/translation-jobs", json={"output_language": "zh-CN"})
-    job_id = response.json()["job_id"]
-    payload = response.json()
-    for _ in range(20):
-        payload = client.get(f"/api/jobs/{job_id}").json()
-        if payload["status"] in {"succeeded", "failed"}:
-            break
-        sleep(0.02)
-
-    assert payload["status"] == "succeeded"
-    item_response = client.get("/api/items/abc123")
-    assert item_response.json()["study"]["translated_transcript"] == []
+    library.save(item)
+    assert client.get("/api/items/abc123").json()["study"]["translated_transcript"] == []
 
 
 def test_transcript_update_saves_corrected_source_and_clears_cached_translation(tmp_path, monkeypatch):
@@ -2713,7 +2775,8 @@ def test_model_settings_default_env_path_does_not_follow_process_cwd(tmp_path, m
                 workspace_dir=tmp_path / "workspace",
                 runner=FakeRunner(),
                 settings=Settings(data_dir=tmp_path / "data", workspace_dir=tmp_path / "workspace"),
-            )
+            ),
+            base_url="http://127.0.0.1",
         )
 
         response = client.put(
@@ -2863,6 +2926,12 @@ def test_online_asr_settings_can_be_read_and_updated_without_exposing_keys(tmp_p
     assert "COURSE_NAVIGATOR_XAI_ASR_API_KEY=\"xai-secret-value\"" in written
     assert "COURSE_NAVIGATOR_CUSTOM_ASR_BASE_URL=\"https://custom.example.com/audio\"" in written
     assert "COURSE_NAVIGATOR_CUSTOM_ASR_MODEL=\"custom-whisper\"" in written
+    # An update without a model keeps the saved one.
+    assert "COURSE_NAVIGATOR_XAI_ASR_MODEL=\"grok-2-voice-1212\"" in written
+
+    client.put("/api/settings/online-asr", json={"xai": {"model": "grok-voice-next"}})
+
+    assert "COURSE_NAVIGATOR_XAI_ASR_MODEL=\"grok-voice-next\"" in env_path.read_text(encoding="utf-8")
 
 
 def test_online_asr_settings_can_disable_provider(tmp_path):
@@ -3191,9 +3260,11 @@ def test_sync_download_failure_cleans_partial_video_files(tmp_path):
             target_dir.mkdir(parents=True, exist_ok=True)
             (target_dir / f"{item_id}.f399.mp4").write_text("partial video", encoding="utf-8")
             (target_dir / f"{item_id}.mp4.part").write_text("partial merge", encoding="utf-8")
-            (target_dir / f"{item_id}4.mp4").write_text("other item", encoding="utf-8")
             raise YtDlpError("download failed")
 
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    (downloads_dir / "abc1234.mp4").write_text("other item", encoding="utf-8")
     client = make_client(tmp_path, runner=FailingDownloadRunner())
     client.post(
         "/api/extract",
@@ -3207,7 +3278,7 @@ def test_sync_download_failure_cleans_partial_video_files(tmp_path):
 
     assert response.status_code == 400
     downloads_dir = tmp_path / "downloads"
-    assert not list(downloads_dir.glob("abc123.*"))
+    assert not list(downloads_dir.rglob("abc123.*"))
     assert (downloads_dir / "abc1234.mp4").exists()
 
 
@@ -3219,9 +3290,11 @@ def test_download_job_failure_cleans_partial_video_files(tmp_path):
                 progress(42, "正在缓存视频")
             (target_dir / f"{item_id}.f399.mp4").write_text("partial video", encoding="utf-8")
             (target_dir / f"{item_id}.mp4.part").write_text("partial merge", encoding="utf-8")
-            (target_dir / f"{item_id}4.mp4").write_text("other item", encoding="utf-8")
             raise YtDlpError("download failed")
 
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    (downloads_dir / "abc1234.mp4").write_text("other item", encoding="utf-8")
     client = make_client(tmp_path, runner=FailingDownloadRunner())
     client.post(
         "/api/extract",
@@ -3242,7 +3315,7 @@ def test_download_job_failure_cleans_partial_video_files(tmp_path):
 
     assert payload["status"] == "failed"
     downloads_dir = tmp_path / "downloads"
-    assert not list(downloads_dir.glob("abc123.*"))
+    assert not list(downloads_dir.rglob("abc123.*"))
     assert (downloads_dir / "abc1234.mp4").exists()
 
 
@@ -3264,9 +3337,10 @@ def test_import_local_video_copies_file_to_workspace_downloads_and_creates_cours
     assert payload["duration"] == 67.5
     assert payload["course_index"] == 1
     assert payload["sort_order"] == 1
-    assert payload["local_video_path"] == "downloads/Local-Lesson.mp4"
+    assert payload["local_video_path"].startswith(f"downloads/{payload['instance_id']}/")
+    assert payload["local_video_path"].endswith("/Local-Lesson.mp4")
     assert (workspace_dir / "items" / "Local-Lesson.json").exists()
-    assert (workspace_dir / "downloads" / "Local-Lesson.mp4").read_bytes() == b"local video"
+    assert (workspace_dir / payload["local_video_path"]).read_bytes() == b"local video"
     assert not (process_dir / "downloads").exists()
     assert client.get("/api/items/Local-Lesson/video").content == b"local video"
 
@@ -3316,9 +3390,9 @@ def test_import_workspace_video_paths_copies_multiple_files(tmp_path):
     payload = response.json()
     assert [item["id"] for item in payload] == ["First", "Second"]
     assert [item["video_source_type"] for item in payload] == ["workspace", "workspace"]
-    assert [item["local_video_path"] for item in payload] == ["downloads/First.mp4", "downloads/Second.webm"]
-    assert (workspace_dir / "downloads" / "First.mp4").read_bytes() == b"first"
-    assert (workspace_dir / "downloads" / "Second.webm").read_bytes() == b"second"
+    assert all(item["local_video_path"].startswith(f"downloads/{item['instance_id']}/") for item in payload)
+    assert (workspace_dir / payload[0]["local_video_path"]).read_bytes() == b"first"
+    assert (workspace_dir / payload[1]["local_video_path"]).read_bytes() == b"second"
 
 
 def test_import_external_video_path_rejects_missing_file(tmp_path):
@@ -3572,7 +3646,8 @@ def test_import_local_video_keeps_title_and_uses_safe_id_for_non_ascii_filename(
     payload = response.json()
     assert payload["id"] == "course"
     assert payload["title"] == "本地课程"
-    assert payload["local_video_path"] == "downloads/course.mp4"
+    assert payload["local_video_path"].startswith(f"downloads/{payload['instance_id']}/")
+    assert payload["local_video_path"].endswith("/course.mp4")
     assert client.get("/api/items/course/video").content == b"local video"
 
 
@@ -4060,13 +4135,12 @@ def test_download_job_cleans_file_when_course_is_deleted_during_download(tmp_pat
     assert client.delete("/api/items/abc123").status_code == 200
     for _ in range(20):
         payload = client.get(f"/api/jobs/{job_id}").json()
-        if payload["status"] in {"succeeded", "failed"}:
+        if payload["status"] in {"succeeded", "failed", "cancelled"}:
             break
         sleep(0.02)
 
-    assert payload["status"] == "failed"
-    assert payload["error"] == "Course item was deleted"
-    assert not list((tmp_path / "downloads").glob("abc123.*"))
+    assert payload["status"] == "cancelled"
+    assert not list((tmp_path / "downloads").rglob("abc123.*"))
 
 
 def test_delete_local_video_keeps_course_item(tmp_path):
@@ -4102,5 +4176,6 @@ def make_client(
             runner=runner or FakeRunner(),
             settings=settings or Settings(data_dir=tmp_path, workspace_dir=workspace_dir),
             env_path=env_path,
-        )
+        ),
+        base_url="http://127.0.0.1",
     )

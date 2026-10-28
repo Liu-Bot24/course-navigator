@@ -403,6 +403,7 @@ def test_chat_text_honors_cancel_before_request(monkeypatch):
 
 
 def test_chat_text_closes_active_request_when_cancelled(monkeypatch):
+    import asyncio
     started = Event()
     closed = Event()
 
@@ -410,21 +411,18 @@ def test_chat_text_closes_active_request_when_cancelled(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def __enter__(self):
+        async def __aenter__(self):
             return self
 
-        def __exit__(self, exc_type, exc, traceback):
+        async def __aexit__(self, exc_type, exc, traceback):
+            closed.set()
             return False
 
-        def close(self):
-            closed.set()
-
-        def post(self, *args, **kwargs):
+        async def post(self, *args, **kwargs):
             started.set()
-            assert closed.wait(2)
-            raise httpx.ReadError("closed")
+            await asyncio.Event().wait()
 
-    monkeypatch.setattr("course_navigator.ai.httpx.Client", BlockingClient)
+    monkeypatch.setattr("course_navigator.ai.httpx.AsyncClient", BlockingClient)
 
     with pytest.raises(ai.LlmCancelled):
         _chat_text(
@@ -553,6 +551,52 @@ def test_learning_block_generation_downgrades_concurrency_after_transient_failur
     assert [block["title"] for block in blocks] == ["块 1", "块 2", "块 3"]
     assert max_active_by_attempt[0] == 3
     assert max_active_by_attempt[1] <= 2
+
+
+def test_learning_block_downgrade_keeps_blocks_that_finished_meanwhile(monkeypatch):
+    monkeypatch.setenv("COURSE_NAVIGATOR_LEARNING_BLOCK_WORKERS", "3")
+    calls: list[int] = []
+    lock = Lock()
+    first_failure_sent = False
+
+    def make_block(index, time_range, source_chunk, translated_chunk):
+        nonlocal first_failure_sent
+        with lock:
+            calls.append(index)
+        if index == 0 and not first_failure_sent:
+            first_failure_sent = True
+            raise httpx.ReadTimeout("temporary model timeout")
+        # The other blocks are still running when the failure is seen.
+        sleep(0.1)
+        return {"title": f"块 {index + 1}"}
+
+    tasks = [(index, TimeRange(start=index * 10, end=index * 10 + 10, title="t", summary="s", priority="focus"), [], []) for index in range(3)]
+
+    blocks = ai._generate_learning_block_tasks_adaptively(tasks, make_block, None, 0, 100, "生成")
+
+    assert sorted(blocks) == [0, 1, 2]
+    assert sorted(calls) == [0, 0, 1, 2]
+
+
+def test_learning_block_layers_reject_empty_model_output(monkeypatch):
+    monkeypatch.setattr(ai, "_chat_json", lambda *args, **kwargs: {"detailed_notes": "  ", "high_fidelity_text": ""})
+    provider = LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="learning")
+    chunk = [TranscriptSegment(start=0, end=5, text="Hello.")]
+
+    with pytest.raises(ValueError):
+        ai._generate_learning_block_interpretation_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful")
+    with pytest.raises(ValueError):
+        ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, "notes", provider, "zh-CN", "faithful")
+
+    monkeypatch.setattr(ai, "_chat_json", lambda *args, **kwargs: {"detailed_notes": ["解读"], "high_fidelity_text": {"error": "generation failed"}})
+    with pytest.raises(ValueError):
+        ai._generate_learning_block_interpretation_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful")
+    with pytest.raises(ValueError):
+        ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, "notes", provider, "zh-CN", "faithful")
+
+    monkeypatch.setattr(ai, "_chat_json", lambda *args, **kwargs: {"detailed_notes": "解读", "high_fidelity_text": "详解"})
+    assert ai._generate_learning_block_interpretation_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful") == "解读"
+    assert ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, "notes", provider, "zh-CN", "faithful") == "详解"
 
 
 def test_long_transcript_uses_role_specific_model_slots(monkeypatch):
@@ -779,23 +823,19 @@ def test_transcript_translation_skips_when_source_language_matches_output():
     assert partials[-1] == transcript
 
 
-def test_transcript_translation_skips_when_transcript_already_matches_output_language():
+def test_transcript_translation_requires_language_evidence_before_skipping():
     transcript = [
         TranscriptSegment(start=0, end=1, text="这是一个中文视频，内容已经是中文。"),
         TranscriptSegment(start=1, end=2, text="这里继续介绍课程的核心观点。"),
     ]
     partials = []
 
-    translated = ai.translate_transcript_material(
-        title="中文课程",
-        transcript=transcript,
-        provider=None,
-        output_language="zh-CN",
-        partial_translation=lambda value: partials.append(value),
-    )
-
-    assert translated == transcript
-    assert partials[-1] == transcript
+    with pytest.raises(ValueError, match="未配置可用的翻译模型"):
+        ai.translate_transcript_material(
+            title="中文课程", transcript=transcript, provider=None, output_language="zh-CN",
+            partial_translation=lambda value: partials.append(value),
+        )
+    assert partials == []
 
 
 def test_transcript_translation_context_generation_receives_video_metadata(monkeypatch):
@@ -1041,9 +1081,10 @@ def test_long_transcript_reuses_existing_context_summary(monkeypatch):
         transcript=transcript,
         provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
         output_language="zh-CN",
-        existing_translation=translated,
-        existing_context_summary="翻译阶段已经生成的上下文摘要",
-        existing_translated_title="面向所有人的 AI",
+        existing_study=ai.stamp_study_cache(StudyMaterial(
+            one_line="", time_map=[], outline=[], detailed_notes="", high_fidelity_text="",
+            translated_transcript=translated, context_summary="翻译阶段已经生成的上下文摘要",
+            translated_title="面向所有人的 AI"), "AI for Everyone", transcript, "zh-CN"),
     )
 
     assert used_contexts == ["翻译阶段已经生成的上下文摘要"]
@@ -1087,21 +1128,25 @@ def test_long_transcript_reuses_existing_context_summary_even_with_metadata(monk
     monkeypatch.setattr(ai, "_generate_outline_with_provider", lambda *args, **kwargs: [])
     monkeypatch.setattr(ai, "_generate_guidance_with_provider", lambda *args, **kwargs: {})
 
-    study = generate_study_material(
-        title="一个视频搞懂 DeepSeek V4！",
-        transcript=transcript,
-        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
-        output_language="zh-CN",
-        existing_translation=translated,
-        existing_context_summary="已有字幕阶段上下文摘要。",
-        metadata=VideoMetadata(
+    metadata = VideoMetadata(
             id="BV1tn9aBqEYg",
             title="一个视频搞懂 DeepSeek V4！",
             uploader="林亦LYi",
             description="我们全面测试了 DeepSeek V4。",
             webpage_url="https://www.bilibili.com/video/BV1tn9aBqEYg/",
             extractor="BiliBili",
-        ),
+        )
+    study = generate_study_material(
+        title="一个视频搞懂 DeepSeek V4！",
+        transcript=transcript,
+        provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+        output_language="zh-CN",
+        source_language="zh",
+        existing_study=ai.stamp_study_cache(StudyMaterial(
+            one_line="", time_map=[], outline=[], detailed_notes="", high_fidelity_text="",
+            translated_transcript=translated, context_summary="已有字幕阶段上下文摘要。"),
+            "一个视频搞懂 DeepSeek V4！", transcript, "zh-CN", "zh", metadata),
+        metadata=metadata,
     )
 
     assert study.context_summary == "已有字幕阶段上下文摘要。"
@@ -1156,9 +1201,10 @@ def test_long_transcript_repairs_incomplete_existing_translation(monkeypatch):
         transcript=transcript,
         provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
         output_language="zh-CN",
-        existing_translation=existing_translation,
-        existing_context_summary="已有上下文摘要",
-        existing_translated_title="面向所有人的 AI",
+        existing_study=ai.stamp_study_cache(StudyMaterial(
+            one_line="", time_map=[], outline=[], detailed_notes="", high_fidelity_text="",
+            translated_transcript=existing_translation, context_summary="已有上下文摘要",
+            translated_title="面向所有人的 AI"), "AI for Everyone", transcript, "zh-CN"),
     )
 
     assert calls["repair"] > 0
@@ -1210,7 +1256,7 @@ def test_regenerate_guide_updates_only_guidance(monkeypatch):
     study = ai.regenerate_study_section(
         title="Lesson",
         transcript=transcript,
-        existing_study=existing,
+        existing_study=ai.stamp_study_cache(existing, "Lesson", transcript, "zh-CN"),
         provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
         output_language="zh-CN",
         section="guide",
@@ -1312,7 +1358,7 @@ def test_regenerate_outline_preserves_other_sections(monkeypatch):
     study = ai.regenerate_study_section(
         title="Lesson",
         transcript=transcript,
-        existing_study=existing,
+        existing_study=ai.stamp_study_cache(existing, "Lesson", transcript, "zh-CN"),
         provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
         output_language="zh-CN",
         section="outline",
@@ -1359,7 +1405,7 @@ def test_regenerate_high_reuses_existing_structure_and_interpretation(monkeypatc
     study = ai.regenerate_study_section(
         title="Lesson",
         transcript=transcript,
-        existing_study=existing,
+        existing_study=ai.stamp_study_cache(existing, "Lesson", transcript, "zh-CN"),
         provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
         output_language="zh-CN",
         section="high",
@@ -1403,7 +1449,7 @@ def test_regenerate_learning_section_fails_instead_of_falling_back_to_subtitle_d
         ai.regenerate_study_section(
             title="Lesson",
             transcript=transcript,
-            existing_study=existing,
+            existing_study=ai.stamp_study_cache(existing, "Lesson", transcript, "zh-CN"),
             provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
             output_language="zh-CN",
             section=section,

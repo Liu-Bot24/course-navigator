@@ -126,17 +126,26 @@ export function asrEditorHighlightRanges(
     .filter((range, index, sorted) => index === 0 || range.start >= sorted[index - 1].end);
 }
 
+/**
+ * Undoes the pending suggestions shown in an edited preview. Each one is
+ * reverted where it was applied; one whose text the user edited counts as
+ * handled by hand and is left as typed.
+ */
 export function previewTextToEditorText(
   previewText: string,
   suggestions: AsrCorrectionSuggestion[],
+  editorText: string,
 ): string {
   const transcript = editorTextToTranscript(previewText);
-  for (const suggestion of suggestions) {
-    if (suggestion.status !== "pending") continue;
+  const positions = suggestionPositionsAfterEdit(transcript, suggestions, editorText);
+  const reverts = suggestions
+    .filter((suggestion) => typeof positions.get(suggestion.id) === "number")
+    .map((suggestion) => ({ suggestion, position: positions.get(suggestion.id) as number }))
+    // From the end, so reverting one never moves the positions still to revert.
+    .sort((left, right) => right.position - left.position);
+  for (const { suggestion, position } of reverts) {
     const segment = transcript[suggestion.segment_index];
-    if (!segment) continue;
-    if (!segment.text.includes(suggestion.corrected_text)) continue;
-    segment.text = segment.text.replace(suggestion.corrected_text, suggestion.original_text);
+    segment.text = `${segment.text.slice(0, position)}${suggestion.original_text}${segment.text.slice(position + suggestion.corrected_text.length)}`;
   }
   return transcriptToEditorText(transcript);
 }
@@ -144,16 +153,104 @@ export function previewTextToEditorText(
 export function reconcilePreviewEditedSuggestions(
   previewText: string,
   suggestions: AsrCorrectionSuggestion[],
+  editorText: string,
 ): AsrCorrectionSuggestion[] {
   const transcript = editorTextToTranscript(previewText);
+  const positions = suggestionPositionsAfterEdit(transcript, suggestions, editorText);
   return suggestions.map((suggestion) => {
     if (suggestion.status !== "pending") return suggestion;
-    const segmentText = transcript[suggestion.segment_index]?.text ?? "";
-    if (segmentText.includes(suggestion.corrected_text)) return suggestion;
+    const position = positions.get(suggestion.id);
+    if (typeof position === "number") return suggestion;
+    // Never shown in the preview: keep it while its correction is still possible.
+    if (position === undefined && (transcript[suggestion.segment_index]?.text ?? "").includes(suggestion.corrected_text)) {
+      return suggestion;
+    }
     return { ...suggestion, status: "rejected" };
   });
 }
 
+/**
+ * Where each pending suggestion's corrected text sits in the edited preview:
+ * a position while the user's edit left it intact, null once the edit touched
+ * it, and no entry when the preview never applied it. Preview edits arrive one
+ * change at a time, so the edit is the span between the unchanged start and end.
+ */
+function suggestionPositionsAfterEdit(
+  preview: TranscriptSegment[],
+  suggestions: AsrCorrectionSuggestion[],
+  editorText: string,
+): Map<string, number | null> {
+  const positions = new Map<string, number | null>();
+  let source: TranscriptSegment[];
+  try {
+    source = editorTextToTranscript(editorText);
+  } catch {
+    return positions;
+  }
+  const bySegment = new Map<number, AsrCorrectionSuggestion[]>();
+  for (const suggestion of suggestions) {
+    if (suggestion.status !== "pending" || !suggestion.corrected_text) continue;
+    const current = bySegment.get(suggestion.segment_index) ?? [];
+    current.push(suggestion);
+    bySegment.set(suggestion.segment_index, current);
+  }
+  for (const [segmentIndex, segmentSuggestions] of bySegment) {
+    const sourceText = source[segmentIndex]?.text;
+    const editedText = preview[segmentIndex]?.text;
+    if (sourceText === undefined || editedText === undefined) continue;
+    const { text: shownText, applied } = applySuggestionsWithPositions(sourceText, segmentSuggestions);
+    const prefix = commonPrefixLength(shownText, editedText);
+    const suffix = commonSuffixLength(shownText, editedText, prefix);
+    const shift = editedText.length - shownText.length;
+    for (const { suggestion, position } of applied) {
+      const end = position + suggestion.corrected_text.length;
+      const moved = end <= prefix ? position : position >= shownText.length - suffix ? position + shift : null;
+      positions.set(
+        suggestion.id,
+        moved !== null && editedText.startsWith(suggestion.corrected_text, moved) ? moved : null,
+      );
+    }
+  }
+  return positions;
+}
+
+/** Replays how the preview applies suggestions and records where each landed. */
+function applySuggestionsWithPositions(
+  sourceText: string,
+  suggestions: AsrCorrectionSuggestion[],
+): { text: string; applied: { suggestion: AsrCorrectionSuggestion; position: number }[] } {
+  let text = sourceText;
+  const applied: { suggestion: AsrCorrectionSuggestion; position: number }[] = [];
+  for (const suggestion of suggestions) {
+    const at = suggestion.original_text ? text.indexOf(suggestion.original_text) : -1;
+    if (at < 0) continue;
+    text = `${text.slice(0, at)}${suggestion.corrected_text}${text.slice(at + suggestion.original_text.length)}`;
+    const shift = suggestion.corrected_text.length - suggestion.original_text.length;
+    for (const entry of applied) {
+      if (entry.position >= at + suggestion.original_text.length) entry.position += shift;
+    }
+    applied.push({ suggestion, position: at });
+  }
+  return { text, applied };
+}
+
+function commonPrefixLength(left: string, right: string): number {
+  let length = 0;
+  while (length < left.length && length < right.length && left[length] === right[length]) length += 1;
+  return length;
+}
+
+function commonSuffixLength(left: string, right: string, prefix: number): number {
+  let length = 0;
+  while (
+    length < left.length - prefix &&
+    length < right.length - prefix &&
+    left[left.length - 1 - length] === right[right.length - 1 - length]
+  ) {
+    length += 1;
+  }
+  return length;
+}
 export function sortAsrReviewSuggestions(
   suggestions: AsrCorrectionSuggestion[],
   sortByConfidence: boolean,

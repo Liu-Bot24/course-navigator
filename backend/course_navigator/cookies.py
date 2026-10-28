@@ -6,6 +6,7 @@ from collections.abc import Iterable
 
 DEFAULT_COOKIE_DOMAIN = ".youtube.com"
 NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
+HTTP_ONLY_PREFIX = "#HttpOnly_"
 IGNORED_COOKIE_ATTRIBUTES = {
     "domain",
     "expires",
@@ -38,7 +39,9 @@ def _normalize_netscape_cookie_text(text: str) -> str | None:
     rows = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#"):
+        # Browsers export HttpOnly cookies, often the session ones, with this
+        # prefix; yt-dlp reads it, so the line is kept as it is.
+        if not line or (line.startswith("#") and not line.startswith(HTTP_ONLY_PREFIX)):
             continue
         fields = line.split("\t", 6)
         if len(fields) == 7 and fields[0] and fields[2] and fields[5]:

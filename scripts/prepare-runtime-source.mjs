@@ -13,6 +13,9 @@ const manifestPath = path.join(resourceDir, ".course-navigator-runtime.json");
 const execFileAsync = promisify(execFile);
 const DEFAULT_NODE_VERSION = "v24.16.0";
 const DEFAULT_UV_VERSION = "0.11.19";
+// The launcher serves this build from the Python service; Node.js is only
+// needed here, at packaging time.
+const webBuildDir = "frontend/dist";
 
 const excludedDirs = new Set([
   ".git",
@@ -21,7 +24,6 @@ const excludedDirs = new Set([
   "node_modules",
   "dist",
   "Casks",
-  "frontend/dist",
   "backend/tests",
   "launcher",
   ".worktrees",
@@ -57,6 +59,9 @@ function isExcluded(relativePath, isDirectory) {
   }
   if (isLocalPackagingJunk(name)) {
     return true;
+  }
+  if (rel === webBuildDir || rel.startsWith(`${webBuildDir}/`)) {
+    return false;
   }
   if (name === ".env.example") {
     return false;
@@ -190,11 +195,10 @@ async function prepareWindowsRuntimeTools() {
 
   const nodeVersion = process.env.COURSE_NAVIGATOR_WINDOWS_NODE_VERSION || DEFAULT_NODE_VERSION;
   const nodeZip = path.join(tempDir, `node-${nodeVersion}-win-x64.zip`);
-  const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/node-${nodeVersion}-win-x64.zip`;
-  await downloadFile(nodeUrl, nodeZip);
+  await downloadFile(`https://nodejs.org/dist/${nodeVersion}/node-${nodeVersion}-win-x64.zip`, nodeZip);
   const nodeExtractDir = path.join(tempDir, "node");
   await expandArchive(nodeZip, nodeExtractDir);
-  await renameOnlyChildDirectory(nodeExtractDir, path.join(windowsDir, "node"), "Downloaded Node archive did not contain a directory");
+  await copyNodeExecutable(nodeExtractDir, "node.exe", path.join(windowsDir, "node", "node.exe"));
 
   const uvVersion = process.env.COURSE_NAVIGATOR_UV_VERSION || DEFAULT_UV_VERSION;
   const uvZip = path.join(tempDir, "uv-x86_64-pc-windows-msvc.zip");
@@ -216,14 +220,10 @@ async function prepareMacRuntimeTools() {
 
   const nodeVersion = process.env.COURSE_NAVIGATOR_MAC_NODE_VERSION || DEFAULT_NODE_VERSION;
   const nodeArchive = path.join(tempDir, `node-${nodeVersion}-darwin-${arch}.tar.gz`);
-  const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/node-${nodeVersion}-darwin-${arch}.tar.gz`;
-  await downloadFile(nodeUrl, nodeArchive);
+  await downloadFile(`https://nodejs.org/dist/${nodeVersion}/node-${nodeVersion}-darwin-${arch}.tar.gz`, nodeArchive);
   const nodeExtractDir = path.join(tempDir, "node");
   await expandArchive(nodeArchive, nodeExtractDir);
-  const nodeDir = path.join(macDir, "node");
-  await renameOnlyChildDirectory(nodeExtractDir, nodeDir, "Downloaded Node archive did not contain a directory");
-  await pruneMacNodeRuntime(nodeDir);
-  await writeMacNodeCliWrappers(nodeDir);
+  await copyNodeExecutable(nodeExtractDir, path.join("bin", "node"), path.join(macDir, "node", "bin", "node"));
 
   const uvArchiveName = macUvArchiveName(arch);
   const uvVersion = process.env.COURSE_NAVIGATOR_UV_VERSION || DEFAULT_UV_VERSION;
@@ -280,28 +280,15 @@ async function prepareMacMediaTools(macDir, tempDir) {
   await copyExecutable(media.ffprobePath, path.join(targetDir, "ffprobe"));
 }
 
-async function pruneMacNodeRuntime(nodeDir) {
-  for (const entry of ["CHANGELOG.md", "README.md", "include", "share"]) {
-    await fs.rm(path.join(nodeDir, entry), { recursive: true, force: true });
+// yt-dlp solves YouTube challenges with an external JavaScript runtime, so the
+// app ships the Node.js executable alone; npm and the rest are not needed.
+async function copyNodeExecutable(extractDir, executable, target) {
+  const topDir = (await fs.readdir(extractDir, { withFileTypes: true })).find((entry) => entry.isDirectory());
+  if (!topDir) {
+    throw new Error("Downloaded Node archive did not contain a directory");
   }
-}
-
-async function writeMacNodeCliWrappers(nodeDir) {
-  const commands = [
-    ["npm", "npm-cli.js"],
-    ["npx", "npx-cli.js"],
-  ];
-  for (const [command, scriptName] of commands) {
-    const wrapper = `#!/bin/sh
-set -e
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-exec "$SCRIPT_DIR/node" "$SCRIPT_DIR/../lib/node_modules/npm/bin/${scriptName}" "$@"
-    `;
-    const target = path.join(nodeDir, "bin", command);
-    await fs.rm(target, { force: true });
-    await fs.writeFile(target, wrapper);
-    await fs.chmod(target, 0o755);
-  }
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await copyExecutable(path.join(extractDir, topDir.name, executable), target);
 }
 
 async function copyExecutable(source, target) {
@@ -387,6 +374,17 @@ async function expandArchive(zipPath, destination) {
   await execFileAsync("tar", ["-xf", zipPath, "-C", destination]);
 }
 
+async function buildWebPages() {
+  console.log("Building web pages");
+  // npm is a .cmd shim on Windows, which execFile can only start through a shell.
+  await execFileAsync(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build"], {
+    cwd: rootDir,
+    shell: process.platform === "win32",
+  });
+  await fs.access(path.join(rootDir, webBuildDir, "index.html"));
+}
+
+await buildWebPages();
 await fs.rm(resourceDir, { recursive: true, force: true });
 await copyDir(rootDir, resourceDir);
 await purgeLocalPackagingJunk(resourceDir);

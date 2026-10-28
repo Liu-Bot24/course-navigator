@@ -79,6 +79,7 @@ def test_asr_correction_honors_cancel_before_model_request(monkeypatch):
 
 
 def test_asr_search_closes_active_request_when_cancelled(monkeypatch):
+    import asyncio
     started = Event()
     closed = Event()
 
@@ -86,21 +87,18 @@ def test_asr_search_closes_active_request_when_cancelled(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def __enter__(self):
+        async def __aenter__(self):
             return self
 
-        def __exit__(self, exc_type, exc, traceback):
+        async def __aexit__(self, exc_type, exc, traceback):
+            closed.set()
             return False
 
-        def close(self):
-            closed.set()
-
-        def post(self, *args, **kwargs):
+        async def post(self, *args, **kwargs):
             started.set()
-            assert closed.wait(2)
-            raise asr.httpx.ReadError("closed")
+            await asyncio.Event().wait()
 
-    monkeypatch.setattr("course_navigator.asr.httpx.Client", BlockingClient)
+    monkeypatch.setattr("course_navigator.asr.httpx.AsyncClient", BlockingClient)
 
     with pytest.raises(ai.LlmCancelled):
         asr._search(

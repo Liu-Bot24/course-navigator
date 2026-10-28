@@ -39,7 +39,7 @@ import type {
   PointerEvent as ReactPointerEvent,
   ReactNode,
 } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   bindVideoSource,
@@ -53,6 +53,7 @@ import {
   getAsrCorrectionResult,
   getItem,
   getLibraryState,
+  getLibraryErrors,
   getAsrSearchSettings,
   getModelSettings,
   getOnlineAsrSettings,
@@ -126,7 +127,7 @@ import type {
   UiLanguage,
   VideoSourceBindingInput,
 } from "./types";
-import { buildWebVttTrack, formatTime, getBilibiliVideoId, getYouTubeVideoId } from "./utils";
+import { buildWebVttTrack, canonicalSourceKey, formatTime, getBilibiliVideoId, getYouTubeVideoId } from "./utils";
 
 type AiTab = "guide" | "outline" | "detailed" | "high";
 type SourceMode = "embed" | "local";
@@ -1107,6 +1108,7 @@ export function App() {
   const [playheadTime, setPlayheadTime] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [libraryErrors, setLibraryErrors] = useState<Record<string, string>>({});
   const [jobStatus, setJobStatus] = useState<StudyJobStatus | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [asrSettingsOpen, setAsrSettingsOpen] = useState(false);
@@ -1229,34 +1231,44 @@ export function App() {
       .then((loaded) => {
         setItems(loaded);
         selectCourse(initialSelectedCourse(loaded));
+        return getLibraryErrors().then(setLibraryErrors);
       })
       .catch((err: unknown) => setError(errorMessage(err, copy.unknownError)));
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-    getLibraryState()
-      .then((remoteState) => {
-        if (cancelled) return;
-        const localState = loadLocalLibraryState();
-        const nextState = isLibraryStateEmpty(remoteState) && !isLibraryStateEmpty(localState)
-          ? localState
-          : remoteState;
-        applyLibraryStateToLocalStorage(nextState);
-        setManualCollections(nextState.manual_collections);
-        setManualCollectionGroups(nextState.manual_collection_groups);
-        setCollectionOrder(nextState.collection_order);
-        setCollectionGroupOrder(nextState.collection_group_order);
-        setCollectionGroupAssignments(nextState.collection_group_assignments);
-        setLibraryStateReady(true);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setLibraryStateReady(true);
-        setError(errorMessage(err, copy.unknownError));
-      });
+    let retryTimer: number | undefined;
+    let failures = 0;
+    const load = () => {
+      getLibraryState()
+        .then((remoteState) => {
+          if (cancelled) return;
+          const localState = loadLocalLibraryState();
+          const nextState = isLibraryStateEmpty(remoteState) && !isLibraryStateEmpty(localState)
+            ? localState
+            : remoteState;
+          applyLibraryStateToLocalStorage(nextState);
+          setManualCollections(nextState.manual_collections);
+          setManualCollectionGroups(nextState.manual_collection_groups);
+          setCollectionOrder(nextState.collection_order);
+          setCollectionGroupOrder(nextState.collection_group_order);
+          setCollectionGroupAssignments(nextState.collection_group_assignments);
+          setLibraryStateReady(true);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setError(errorMessage(err, copy.unknownError));
+          // Autosave stays off until the saved state is known, or this page's
+          // defaults would replace the user's collections on the server.
+          failures += 1;
+          retryTimer = window.setTimeout(load, Math.min(30_000, 1_000 * 2 ** failures));
+        });
+    };
+    load();
     return () => {
       cancelled = true;
+      window.clearTimeout(retryTimer);
     };
   }, []);
 
@@ -1392,6 +1404,7 @@ export function App() {
     () => libraryEntries.filter((entry): entry is Extract<LibraryCollectionEntry, { type: "group" }> => entry.type === "group"),
     [libraryEntries],
   );
+  const courseMoves = useMemo(() => courseMoveAvailability(items), [items]);
   const collapsedCollectionKeys = useMemo(() => new Set(collapsedCollections), [collapsedCollections]);
   const collapsedCollectionGroupKeys = useMemo(() => new Set(collapsedCollectionGroups), [collapsedCollectionGroups]);
 
@@ -1415,12 +1428,6 @@ export function App() {
     if (nextSelectedId) {
       selectCourse(loaded.find((item) => item.id === nextSelectedId) ?? loaded[0] ?? null);
     }
-  }
-
-  async function refreshItemsPreservingSelection() {
-    const loaded = await listItems();
-    setItems(loaded);
-    setSelected((current) => (current ? loaded.find((item) => item.id === current.id) ?? current : current));
   }
 
   async function refreshItemInList(itemId: string) {
@@ -1732,7 +1739,8 @@ export function App() {
       if (!transcript.length) {
         throw new Error(copy.localSubtitleEmpty);
       }
-      await handleSaveWorkbenchTranscript(target.id, transcript);
+      // An uploaded file replaces the track; its language is not known.
+      await handleSaveWorkbenchTranscript(target.id, transcript, null);
       setSubtitleSource("local_upload");
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
@@ -1908,6 +1916,7 @@ export function App() {
         created_at: item.created_at,
         transcript: item.transcript,
         transcript_source: "imported" as const,
+        transcript_language: item.transcript_language ?? null,
         metadata: item.metadata ?? null,
         study: item.study ?? null,
       };
@@ -1996,13 +2005,13 @@ export function App() {
         await refreshItemInList(task.itemId);
       }
     }
+    await refreshItemInList(task.itemId);
     if (current.status === "failed") {
       throw new Error(current.error ?? current.message);
     }
     if (current.status === "cancelled") {
       return;
     }
-    await refreshItemInList(task.itemId);
   }
 
   async function runTranslationJob(itemId: string) {
@@ -2014,20 +2023,22 @@ export function App() {
     let current = firstStatus;
     while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
       await delay(1000);
+      if (!appMountedRef.current) return;
       current = await getStudyJob(firstStatus.job_id);
+      if (!appMountedRef.current) return;
       setJobStatus(current);
       setBusy(`${current.message} ${current.progress}%`);
       if (current.status === "running" && current.phase === "translation") {
-        await refreshItemsPreservingSelection();
+        await refreshItemInList(itemId);
       }
     }
+    await refreshItemInList(itemId);
     if (current.status === "failed") {
       throw new Error(current.error ?? current.message);
     }
     if (current.status === "cancelled") {
       return;
     }
-    await refreshItemsPreservingSelection();
   }
 
   async function runDownloadJob(itemId: string) {
@@ -2047,7 +2058,9 @@ export function App() {
     let current = firstStatus;
     while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
       await delay(1000);
+      if (!appMountedRef.current) return;
       current = await getStudyJob(firstStatus.job_id);
+      if (!appMountedRef.current) return;
       setJobStatus(current);
       setBusy(`${current.message} ${current.progress}%`);
     }
@@ -2076,7 +2089,9 @@ export function App() {
     let current = firstStatus;
     while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
       await delay(1000);
+      if (!appMountedRef.current) return;
       current = await getStudyJob(firstStatus.job_id);
+      if (!appMountedRef.current) return;
       setJobStatus(current);
       setBusy(`${current.message} ${current.progress}%`);
     }
@@ -2795,8 +2810,12 @@ export function App() {
     }
   }
 
-  async function handleSaveWorkbenchTranscript(itemId: string, transcript: TranscriptSegment[]): Promise<CourseItem> {
-    const next = await saveTranscript(itemId, transcript);
+  async function handleSaveWorkbenchTranscript(
+    itemId: string,
+    transcript: TranscriptSegment[],
+    language?: string | null,
+  ): Promise<CourseItem> {
+    const next = await saveTranscript(itemId, transcript, language);
     upsertCourseItem(next);
     return next;
   }
@@ -3095,7 +3114,7 @@ export function App() {
                     className="library-move"
                     aria-label={`${copy.moveCourseUp} ${item.title}`}
                     title={copy.moveCourseUp}
-                    disabled={!canMoveCourse(items, item, -1)}
+                    disabled={!courseMoves.get(item.id)?.up}
                     onClick={() => void handleMoveCourse(item, -1)}
                   >
                     <ArrowUp size={13} />
@@ -3104,7 +3123,7 @@ export function App() {
                     className="library-move"
                     aria-label={`${copy.moveCourseDown} ${item.title}`}
                     title={copy.moveCourseDown}
-                    disabled={!canMoveCourse(items, item, 1)}
+                    disabled={!courseMoves.get(item.id)?.down}
                     onClick={() => void handleMoveCourse(item, 1)}
                   >
                     <ArrowDown size={13} />
@@ -3491,6 +3510,15 @@ export function App() {
       ) : null}
 
       {error ? <div className="error-strip" role="alert" aria-live="polite">{error}</div> : null}
+      {Object.keys(libraryErrors).length ? (
+        <details className="error-strip" role="alert">
+          <summary>{uiLanguage === "zh-CN" ? "部分课程文件无法读取，其他课程仍可使用" : "Some course files could not be read; other courses are available"}</summary>
+          <p>{uiLanguage === "zh-CN" ? "原文件已保留。可先下载备份，再用有效备份替换 Workspace/items 中的对应文件并刷新页面。" : "Original files are preserved. Download a copy, restore a valid backup in Workspace/items, then reload this page."}</p>
+          <ul>{Object.entries(libraryErrors).map(([filename, message]) => (
+            <li key={filename}><a href={`/api/library-errors/${encodeURIComponent(filename)}`}>{filename}</a>: {message}</li>
+          ))}</ul>
+        </details>
+      ) : null}
       {busy ? (
         <div className={canCancelActiveJob ? "status-strip has-cancel" : "status-strip"}>
           <span>{busy}</span>
@@ -4706,7 +4734,7 @@ function AsrWorkbench({
   onBack: () => void;
   onOpenSettings: () => void;
   onAsrModelChange: (profileId: string) => Promise<void>;
-  onSaveTranscript: (itemId: string, transcript: TranscriptSegment[]) => Promise<CourseItem>;
+  onSaveTranscript: (itemId: string, transcript: TranscriptSegment[], language?: string | null) => Promise<CourseItem>;
 }) {
   const editorRef = useRef<HTMLTextAreaElement | null>(null);
   const previewRef = useRef<HTMLTextAreaElement | null>(null);
@@ -4741,6 +4769,14 @@ function AsrWorkbench({
     base_url: "",
     result_limit: "5",
   });
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     setEditorText(transcriptToEditorText(item?.transcript ?? []));
@@ -4911,7 +4947,9 @@ function AsrWorkbench({
       let current = firstStatus;
       while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
         await delay(1000);
+        if (!mountedRef.current) return;
         current = await getStudyJob(firstStatus.job_id);
+        if (!mountedRef.current) return;
         setJobStatus(current);
         setBusy(`${current.message} ${current.progress}%`);
       }
@@ -4971,10 +5009,7 @@ function AsrWorkbench({
     setError(null);
     setMessage(null);
     try {
-      const transcript = editorTextToTranscript(editorText);
-      const next = await onSaveTranscript(item.id, transcript);
-      setEditorText(transcriptToEditorText(next.transcript));
-      setMessage(copy.transcriptSaved);
+      await saveTranscriptText(editorText);
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
     }
@@ -4983,8 +5018,9 @@ function AsrWorkbench({
   async function saveTranscriptText(nextEditorText: string) {
     if (!item) return;
     const transcript = editorTextToTranscript(nextEditorText);
-    const next = await onSaveTranscript(item.id, transcript);
-    setEditorText(transcriptToEditorText(next.transcript));
+    const next = await onSaveTranscript(item.id, transcript, item.transcript_language ?? null);
+    // Edits typed while the save was in flight stay in the editor.
+    setEditorText((current) => (current === nextEditorText ? transcriptToEditorText(next.transcript) : current));
     setMessage(copy.transcriptSaved);
   }
 
@@ -5046,8 +5082,8 @@ function AsrWorkbench({
 
   function changePreviewText(nextPreviewText: string) {
     try {
-      setEditorText(previewTextToEditorText(nextPreviewText, suggestions));
-      setSuggestions((current) => reconcilePreviewEditedSuggestions(nextPreviewText, current));
+      setEditorText(previewTextToEditorText(nextPreviewText, suggestions, editorText));
+      setSuggestions((current) => reconcilePreviewEditedSuggestions(nextPreviewText, current, editorText));
     } catch {
       setEditorText(nextPreviewText);
     }
@@ -6980,6 +7016,21 @@ function Transcript({
 }) {
   const rowRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const activeIndex = item ? findActiveSegmentIndex(item.transcript, currentTime) : -1;
+  // The playhead ticks several times a second; rows get only stable props so
+  // each tick re-renders just the rows whose active state changes.
+  const onSeekRef = useRef(onSeek);
+  useEffect(() => {
+    onSeekRef.current = onSeek;
+  });
+  const handleSeek = useCallback((seconds: number) => onSeekRef.current(seconds), []);
+  const registerRow = useCallback((index: number, element: HTMLButtonElement | null) => {
+    rowRefs.current[index] = element;
+  }, []);
+  const segments = item?.transcript;
+  const translations = useMemo(
+    () => segments?.map((segment, index) => translatedTranscript[index] ?? findSegmentByTime(translatedTranscript, segment.start)) ?? [],
+    [segments, translatedTranscript],
+  );
 
   useEffect(() => {
     if (activeIndex < 0) return;
@@ -6991,33 +7042,61 @@ function Transcript({
   }
   return (
     <div className="transcript-list">
-      {item.transcript.map((segment, index) => {
-        const translated = translatedTranscript[index] ?? findSegmentByTime(translatedTranscript, segment.start);
-        const lines = composeSegmentLines(segment, translated, textDisplayMode);
-        return (
-          <button
-            className={index === activeIndex ? "transcript-row active" : "transcript-row"}
-            key={`${segment.start}-${index}`}
-            onClick={() => onSeek(segment.start)}
-            ref={(element) => {
-              rowRefs.current[index] = element;
-            }}
-          >
-            <time>{formatTime(segment.start)}</time>
-            <span className="text-stack">
-              {lines.map((line) => (
-                <span className={line.kind === "target" ? "target-text" : "source-text"} key={line.key}>
-                  {textDisplayMode === "bilingual" ? <small>{line.kind === "target" ? copy.targetLabel : copy.sourceLabel}</small> : null}
-                  {line.text}
-                </span>
-              ))}
-            </span>
-          </button>
-        );
-      })}
+      {item.transcript.map((segment, index) => (
+        <TranscriptRow
+          key={`${segment.start}-${index}`}
+          index={index}
+          segment={segment}
+          translated={translations[index]}
+          active={index === activeIndex}
+          textDisplayMode={textDisplayMode}
+          copy={copy}
+          onSeek={handleSeek}
+          registerRow={registerRow}
+        />
+      ))}
     </div>
   );
 }
+
+const TranscriptRow = memo(function TranscriptRow({
+  index,
+  segment,
+  translated,
+  active,
+  textDisplayMode,
+  copy,
+  onSeek,
+  registerRow,
+}: {
+  index: number;
+  segment: TranscriptSegment;
+  translated: TranscriptSegment | undefined;
+  active: boolean;
+  textDisplayMode: TextDisplayMode;
+  copy: (typeof COPY)[UiLanguage];
+  onSeek: (seconds: number) => void;
+  registerRow: (index: number, element: HTMLButtonElement | null) => void;
+}) {
+  const lines = composeSegmentLines(segment, translated, textDisplayMode);
+  return (
+    <button
+      className={active ? "transcript-row active" : "transcript-row"}
+      onClick={() => onSeek(segment.start)}
+      ref={(element) => registerRow(index, element)}
+    >
+      <time>{formatTime(segment.start)}</time>
+      <span className="text-stack">
+        {lines.map((line) => (
+          <span className={line.kind === "target" ? "target-text" : "source-text"} key={line.key}>
+            {textDisplayMode === "bilingual" ? <small>{line.kind === "target" ? copy.targetLabel : copy.sourceLabel}</small> : null}
+            {line.text}
+          </span>
+        ))}
+      </span>
+    </button>
+  );
+});
 
 function TimeMap({
   study,
@@ -8034,10 +8113,22 @@ function courseGroupForItem(items: CourseItem[], item: CourseItem): CourseItem[]
   return sortCourseItems(items.filter((entry) => (entry.collection_title ?? "") === collectionKey));
 }
 
-function canMoveCourse(items: CourseItem[], item: CourseItem, direction: -1 | 1): boolean {
-  const group = courseGroupForItem(items, item);
-  const index = group.findIndex((entry) => entry.id === item.id);
-  return index >= 0 && Boolean(group[index + direction]);
+/** Whether each course can move up or down within its collection, computed once per library. */
+function courseMoveAvailability(items: CourseItem[]): Map<string, { up: boolean; down: boolean }> {
+  const collections = new Map<string, CourseItem[]>();
+  for (const item of items) {
+    const key = item.collection_title ?? "";
+    const collection = collections.get(key);
+    if (collection) collection.push(item);
+    else collections.set(key, [item]);
+  }
+  const moves = new Map<string, { up: boolean; down: boolean }>();
+  for (const collection of collections.values()) {
+    sortCourseItems(collection).forEach((item, index, sorted) => {
+      moves.set(item.id, { up: index > 0, down: index < sorted.length - 1 });
+    });
+  }
+  return moves;
 }
 
 function scrollIntoViewIfPossible(element: Element | null | undefined) {
@@ -8137,19 +8228,6 @@ function findActiveSegmentIndex(segments: TranscriptSegment[], currentTime: numb
 
 function findSegmentByTime(segments: TranscriptSegment[], start: number): TranscriptSegment | undefined {
   return segments.find((segment) => Math.abs(segment.start - start) < 0.4);
-}
-
-function canonicalSourceKey(sourceUrl: string): string {
-  const youtubeId = getYouTubeVideoId(sourceUrl);
-  if (youtubeId) return `youtube:${youtubeId}`;
-  try {
-    const parsed = new URL(sourceUrl);
-    parsed.hash = "";
-    parsed.search = "";
-    return parsed.toString().replace(/\/$/, "");
-  } catch {
-    return sourceUrl.trim();
-  }
 }
 
 function isTimeRangeActive(range: StudyMaterial["time_map"][number], currentTime: number): boolean {

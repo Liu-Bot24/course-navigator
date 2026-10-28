@@ -1,6 +1,25 @@
 import { describe, expect, it } from "vitest";
 
-import { buildWebVttTrack, formatTime, getBilibiliVideoId, getYouTubeVideoId } from "./utils";
+import { buildWebVttTrack, canonicalSourceKey, formatTime, getBilibiliVideoId, getYouTubeVideoId } from "./utils";
+
+describe("canonicalSourceKey", () => {
+  it("keeps query parameters that select a different video", () => {
+    expect(canonicalSourceKey("https://www.bilibili.com/video/BV1xx?p=2")).not.toBe(
+      canonicalSourceKey("https://www.bilibili.com/video/BV1xx?p=3"),
+    );
+    expect(canonicalSourceKey("https://example.com/watch?id=1")).not.toBe(
+      canonicalSourceKey("https://example.com/watch?id=2"),
+    );
+  });
+
+  it("ignores sharing parameters, fragments, order and a trailing slash", () => {
+    expect(
+      canonicalSourceKey("https://www.bilibili.com/video/BV1xx/?spm_id_from=333&p=2&vd_source=abc&utm_source=x#t"),
+    ).toBe(canonicalSourceKey("https://www.bilibili.com/video/BV1xx?p=2"));
+    expect(canonicalSourceKey("https://example.com/v?b=2&a=1")).toBe(canonicalSourceKey("https://example.com/v?a=1&b=2"));
+    expect(canonicalSourceKey("https://www.youtube.com/watch?v=JPcx9qHzzgk&t=13s")).toBe("youtube:JPcx9qHzzgk");
+  });
+});
 
 describe("formatTime", () => {
   it("formats seconds as mm:ss", () => {

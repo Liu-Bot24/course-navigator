@@ -16,8 +16,9 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .models import DownloadRequest, ExtractRequest, TranscriptSegment, VideoMetadata
-from .processes import popen_hidden, resolve_tool, run_hidden
+from .processes import popen_hidden, resolve_tool, run_hidden, terminate_process_tree
 from .subtitles import parse_subtitle_text
+from .languages import transcript_language_tag
 
 try:
     from opencc import OpenCC
@@ -33,6 +34,14 @@ class YtDlpCancelled(YtDlpError):
     pass
 
 
+class SubtitleTranscript(list[TranscriptSegment]):
+    """Segments plus the selected track language; None means unverified."""
+
+    def __init__(self, segments: list[TranscriptSegment], language: str | None) -> None:
+        super().__init__(segments)
+        self.language = transcript_language_tag(language)
+
+
 NON_AUXILIARY_SUBTITLE_SELECTOR = "all,-danmaku,-live_chat,-comments,-rechat"
 DEFAULT_SUBTITLE_LANGUAGE_PRIORITY = (
     "zh-Hans",
@@ -45,6 +54,10 @@ DEFAULT_SUBTITLE_LANGUAGE_PRIORITY = (
     "ja",
 )
 YTDLP_RUNTIME_ARGS = ("--remote-components", "ejs:github", "--no-playlist")
+# Metadata and subtitle queries only fetch pages; a stalled one must not block
+# the course task forever. Downloads stay unbounded and rely on cancellation.
+YTDLP_QUERY_TIMEOUT_SECONDS = 180
+FFPROBE_TIMEOUT_SECONDS = 60
 CHROMIUM_COOKIE_BROWSERS = {"brave", "chrome", "chromium", "edge", "opera", "vivaldi", "whale"}
 CHROMIUM_BROWSERS_WITHOUT_PROFILES = {"opera"}
 COOKIE_SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
@@ -177,9 +190,10 @@ class YtDlpRunner:
         if not subtitle_file:
             raise YtDlpError("yt-dlp did not produce a subtitle file")
 
-        return parse_subtitle_text(
-            subtitle_file.read_text(encoding="utf-8", errors="replace"),
-            subtitle_file.suffix.lstrip("."),
+        return SubtitleTranscript(
+            parse_subtitle_text(subtitle_file.read_text(encoding="utf-8", errors="replace"),
+                                subtitle_file.suffix.lstrip(".")),
+            _subtitle_file_language(subtitle_file, metadata),
         )
 
     def download_video(
@@ -345,7 +359,8 @@ def _run_with_browser_cookie_retry(
         subprocess.CompletedProcess[str],
     ] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], ExtractRequest | DownloadRequest]:
-    active_run_command = run_command or _run_hidden_with_browser_cookie_snapshot
+    # Without a runner the command is a page query; downloads pass their own.
+    active_run_command = run_command or _run_bounded_query
     active_request = _request_with_browser_cookie_cache(request, cookie_cache_dir)
     result = active_run_command(command_builder, active_request)
     if request.mode != "browser" or result.returncode == 0:
@@ -383,9 +398,21 @@ def _run_with_browser_cookie_retry(
 def _run_hidden_with_browser_cookie_snapshot(
     command_builder: Callable[[ExtractRequest | DownloadRequest], list[str]],
     request: ExtractRequest | DownloadRequest,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     with _browser_cookie_snapshot_request(request) as command_request:
-        return run_hidden(command_builder(command_request), capture_output=True, text=True, check=False)
+        try:
+            return run_hidden(command_builder(command_request), capture_output=True, text=True, check=False,
+                              timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise YtDlpError(f"yt-dlp 在 {int(exc.timeout)} 秒内没有响应，请检查网络连接后重试") from exc
+
+
+def _run_bounded_query(
+    command_builder: Callable[[ExtractRequest | DownloadRequest], list[str]],
+    request: ExtractRequest | DownloadRequest,
+) -> subprocess.CompletedProcess[str]:
+    return _run_hidden_with_browser_cookie_snapshot(command_builder, request, timeout=YTDLP_QUERY_TIMEOUT_SECONDS)
 
 
 def _run_cancellable_with_browser_cookie_snapshot(
@@ -891,9 +918,10 @@ def _extract_hls_manifest_subtitles(
         return []
     try:
         manifest = _download_text(manifest_url)
-        subtitle_uri = _choose_hls_subtitle_uri(manifest, manifest_url, requested_language)
-        if not subtitle_uri:
+        track = _choose_hls_subtitle_track(manifest, manifest_url, requested_language)
+        if not track:
             return []
+        subtitle_uri = track["URI"]
         subtitle_manifest_or_vtt = _download_text(subtitle_uri)
         raw_vtt = (
             subtitle_manifest_or_vtt
@@ -905,14 +933,19 @@ def _extract_hls_manifest_subtitles(
     except Exception:
         return []
 
-    language = requested_language.replace("*", "auto") or "auto"
+    language = transcript_language_tag(track.get("LANGUAGE"))
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", metadata.id).strip("_") or "subtitle"
-    target_file = target_dir / f"{safe_id}.{language}.hls.vtt"
+    target_file = target_dir / f"{safe_id}.{language or 'und'}.hls.vtt"
     target_file.write_text(raw_vtt, encoding="utf-8")
-    return parse_subtitle_text(raw_vtt, "vtt")
+    return SubtitleTranscript(parse_subtitle_text(raw_vtt, "vtt"), language)
 
 
 def _choose_hls_subtitle_uri(manifest: str, manifest_url: str, requested_language: str) -> str | None:
+    track = _choose_hls_subtitle_track(manifest, manifest_url, requested_language)
+    return track["URI"] if track else None
+
+
+def _choose_hls_subtitle_track(manifest: str, manifest_url: str, requested_language: str) -> dict[str, str] | None:
     subtitle_tracks: list[dict[str, str]] = []
     for line in manifest.splitlines():
         if not line.startswith("#EXT-X-MEDIA:"):
@@ -933,8 +966,17 @@ def _choose_hls_subtitle_uri(manifest: str, manifest_url: str, requested_languag
         for track in subtitle_tracks:
             language = (track.get("LANGUAGE") or track.get("NAME") or "").lower()
             if language == requested_language.lower() or language.split("-", 1)[0] == requested_base:
-                return track["URI"]
-    return subtitle_tracks[0]["URI"]
+                return track
+    return subtitle_tracks[0]
+
+
+def _subtitle_file_language(path: Path, metadata: VideoMetadata | None) -> str | None:
+    # yt-dlp writes %(id)s.<language>.<ext>. A plain id.vtt carries no
+    # track language, even if a language was requested or advertised.
+    if metadata and path.stem == metadata.id:
+        return None
+    parts = path.stem.rsplit(".", 1)
+    return transcript_language_tag(parts[-1]) if len(parts) == 2 else None
 
 
 def _download_hls_subtitle_segments(playlist: str, playlist_url: str) -> str:
@@ -1167,6 +1209,7 @@ def _whisper_executable_names() -> tuple[str, ...]:
 
 
 def _media_duration(path: Path) -> float:
+    """Duration in seconds, or 0.0 when ffprobe is missing, fails or hangs."""
     cmd = [
         "ffprobe",
         "-v",
@@ -1178,8 +1221,8 @@ def _media_duration(path: Path) -> float:
         str(path),
     ]
     try:
-        result = run_hidden(cmd, capture_output=True, text=True, check=False)
-    except FileNotFoundError:
+        result = run_hidden(cmd, capture_output=True, text=True, check=False, timeout=FFPROBE_TIMEOUT_SECONDS)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return 0.0
     if result.returncode != 0:
         return 0.0
@@ -1214,14 +1257,7 @@ def _start_cancellation_monitor(
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
+    terminate_process_tree(process)
 
 
 def _whisper_language(language: str) -> str:

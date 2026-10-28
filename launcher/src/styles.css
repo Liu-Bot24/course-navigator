@@ -164,6 +164,9 @@ h1 {
   font-size: 0.86rem;
   font-weight: 700;
   line-height: 1.35;
+  /* Failure messages include log excerpts and paths. */
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 
 .hero-actions > button,

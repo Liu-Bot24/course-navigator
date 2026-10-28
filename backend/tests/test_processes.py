@@ -1,7 +1,41 @@
 import os
+import subprocess
 import sys
+import threading
 
 from course_navigator import processes
+
+
+def test_terminate_process_tree_stops_processes_the_child_started():
+    # The grandchild inherits stdout, so the pipe reaches EOF only once both
+    # the child and the grandchild are gone.
+    script = (
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    process = processes.popen_hidden([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    try:
+        assert process.stdout.readline().strip() == "ready"
+        processes.terminate_process_tree(process)
+        closed = threading.Event()
+        threading.Thread(target=lambda: (process.stdout.read(), closed.set()), daemon=True).start()
+        assert closed.wait(10), "a grandchild process kept running"
+        assert process.poll() is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def test_terminate_process_tree_leaves_finished_processes_alone():
+    process = processes.popen_hidden([sys.executable, "-c", "pass"])
+    process.wait(timeout=30)
+
+    processes.terminate_process_tree(process)
+
+    assert process.returncode == 0
 
 
 def test_subprocess_env_prepends_existing_tool_paths(tmp_path, monkeypatch):

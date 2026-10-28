@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -193,9 +194,40 @@ fn same_file_contents(left: &Path, right: &Path) -> Result<bool, String> {
     if !right.exists() {
         return Ok(false);
     }
-    let left_bytes = fs::read(left).map_err(|error| format!("无法读取源文件: {error}"))?;
-    let right_bytes = fs::read(right).map_err(|error| format!("无法读取目标文件: {error}"))?;
-    Ok(left_bytes == right_bytes)
+    let left_len = fs::metadata(left).map_err(|error| format!("无法读取源文件: {error}"))?.len();
+    let right_len = fs::metadata(right).map_err(|error| format!("无法读取目标文件: {error}"))?.len();
+    if left_len != right_len {
+        return Ok(false);
+    }
+    // Workspaces hold videos, so files are compared in chunks, never loaded whole.
+    let mut left = fs::File::open(left).map_err(|error| format!("无法读取源文件: {error}"))?;
+    let mut right = fs::File::open(right).map_err(|error| format!("无法读取目标文件: {error}"))?;
+    let mut left_buffer = vec![0_u8; 64 * 1024];
+    let mut right_buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = read_full(&mut left, &mut left_buffer)
+            .map_err(|error| format!("无法读取源文件: {error}"))?;
+        let right_read = read_full(&mut right, &mut right_buffer[..read.max(1)])
+            .map_err(|error| format!("无法读取目标文件: {error}"))?;
+        if read == 0 {
+            return Ok(right_read == 0);
+        }
+        if right_read != read || left_buffer[..read] != right_buffer[..read] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Fills `buffer` unless the file ends first; returns the bytes read.
+fn read_full(file: &mut fs::File, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled)
 }
 
 fn dir_has_entries(path: &Path) -> Result<bool, String> {
@@ -316,6 +348,28 @@ mod tests {
         );
 
         assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn file_comparison_reads_in_chunks_and_finds_late_differences() {
+        let root = test_dir("compare");
+        fs::create_dir_all(&root).expect("root");
+        let content = (0..200_000_u32).map(|value| value as u8).collect::<Vec<_>>();
+        let mut changed = content.clone();
+        *changed.last_mut().expect("last byte") ^= 1;
+        fs::write(root.join("a"), &content).expect("a");
+        fs::write(root.join("same"), &content).expect("same");
+        fs::write(root.join("changed"), &changed).expect("changed");
+        fs::write(root.join("short"), &content[..1000]).expect("short");
+        fs::write(root.join("empty-a"), b"").expect("empty a");
+        fs::write(root.join("empty-b"), b"").expect("empty b");
+
+        assert!(same_file_contents(&root.join("a"), &root.join("same")).unwrap());
+        assert!(!same_file_contents(&root.join("a"), &root.join("changed")).unwrap());
+        assert!(!same_file_contents(&root.join("a"), &root.join("short")).unwrap());
+        assert!(!same_file_contents(&root.join("a"), &root.join("missing")).unwrap());
+        assert!(same_file_contents(&root.join("empty-a"), &root.join("empty-b")).unwrap());
         cleanup(&root);
     }
 

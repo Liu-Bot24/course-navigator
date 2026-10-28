@@ -9,6 +9,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: Number(process.env.COURSE_NAVIGATOR_WEB_PORT ?? 15173),
+    // The launcher waits on this exact port; never drift to another one.
+    strictPort: true,
     proxy: {
       "/api": `http://${apiHost}:${apiPort}`,
     },

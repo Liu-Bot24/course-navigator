@@ -5,10 +5,11 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from threading import Event, Thread
 from typing import Any
 
 import httpx
+
+from .http_requests import RequestCancelled, post_cancellable
 
 from .config import OnlineAsrServiceConfig, OnlineAsrSettings
 from .models import DownloadRequest, ExtractRequest, OnlineAsrProvider, TranscriptSegment
@@ -18,7 +19,9 @@ from .ytdlp import (
     YtDlpCancelled,
     YtDlpError,
     _friendly_error,
+    _media_duration,
     _run_cancellable_with_browser_cookie_snapshot,
+    _run_hidden_with_browser_cookie_snapshot,
     _run_with_browser_cookie_retry,
     _should_cancel,
     _start_cancellation_monitor,
@@ -111,7 +114,7 @@ def _extract_audio(
     run_command = (
         (lambda builder, active_request: _run_cancellable_with_browser_cookie_snapshot(builder, active_request, should_cancel))
         if should_cancel is not None
-        else None
+        else _run_hidden_with_browser_cookie_snapshot
     )
     result, active_request = _run_with_browser_cookie_retry(audio_command, request, run_command=run_command)
     _raise_if_cancelled(should_cancel)
@@ -226,26 +229,7 @@ def _audio_chunks(
 def _audio_duration(audio_path: Path) -> float:
     if not resolve_tool("ffprobe"):
         return 0.0
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(audio_path),
-    ]
-    try:
-        result = run_hidden(cmd, capture_output=True, text=True, check=False)
-    except FileNotFoundError:
-        return 0.0
-    if result.returncode != 0:
-        return 0.0
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return 0.0
+    return _media_duration(audio_path)
 
 
 def _run_media_command(cmd: list[str], should_cancel: Callable[[], bool] | None) -> subprocess.CompletedProcess[str]:
@@ -286,27 +270,11 @@ def _post_transcription_request(
             timeout=300,
         )
 
-    with httpx.Client(timeout=300) as client:
-        stop = Event()
-
-        def close_on_cancel() -> None:
-            while not stop.wait(0.25):
-                if _should_cancel(should_cancel):
-                    client.close()
-                    return
-
-        Thread(target=close_on_cancel, name="course-navigator-online-asr-cancel", daemon=True).start()
-        try:
-            response = client.post(
-                endpoint,
-                headers={"Authorization": f"Bearer {api_key}"},
-                data=data,
-                files=files,
-            )
-        finally:
-            stop.set()
-    _raise_if_cancelled(should_cancel)
-    return response
+    try:
+        return post_cancellable(endpoint, headers={"Authorization": f"Bearer {api_key}"},
+                                data=data, files=files, timeout=300, should_cancel=should_cancel)
+    except RequestCancelled as exc:
+        raise YtDlpCancelled("Online ASR request was cancelled") from exc
 
 
 def _transcribe_chunk(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,8 @@ DEFAULT_TOOL_DIRS = (
     Path("/usr/local/bin"),
 )
 RUNTIME_TOOL_PATHS_ENV = "COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS"
+# Tests replace subprocess.Popen with fakes, which have no process tree.
+_REAL_POPEN = subprocess.Popen
 
 
 def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
@@ -66,4 +69,55 @@ def run_hidden(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str
 
 def popen_hidden(cmd: list[str], **kwargs: Any) -> subprocess.Popen[str]:
     kwargs["env"] = _subprocess_env(kwargs.get("env"))
+    if not sys.platform.startswith("win"):
+        # Its own process group lets a cancel stop everything it started.
+        kwargs.setdefault("start_new_session", True)
     return subprocess.Popen(cmd, **_hidden_windows_kwargs(kwargs))
+
+
+def terminate_process_tree(process: subprocess.Popen[str], timeout: float = 5) -> None:
+    """Stops `process` and the processes it started, such as yt-dlp's ffmpeg."""
+    if process.poll() is not None:
+        return
+    if isinstance(process, _REAL_POPEN):
+        if sys.platform.startswith("win"):
+            try:
+                run_hidden(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        elif _owns_process_group(process):
+            _signal_group(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+            # Children that ignored SIGTERM or outlived the parent go too.
+            _signal_group(process.pid, signal.SIGKILL)
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
+
+
+def _owns_process_group(process: subprocess.Popen[str]) -> bool:
+    try:
+        return os.getpgid(process.pid) == process.pid
+    except OSError:
+        return False
+
+
+def _signal_group(pgid: int, signum: int) -> None:
+    try:
+        os.killpg(pgid, signum)
+    except OSError:
+        pass

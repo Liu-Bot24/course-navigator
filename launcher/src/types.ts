@@ -1,4 +1,4 @@
-export type ServiceState = "stopped" | "starting" | "running" | "stopping" | "failed";
+export type ServiceState = "stopped" | "starting" | "running" | "stopping" | "migrating" | "failed";
 
 export type LauncherConfig = {
   projectRoot: string;

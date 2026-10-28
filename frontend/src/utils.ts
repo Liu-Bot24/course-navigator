@@ -25,6 +25,42 @@ export function getYouTubeVideoId(url: string): string | null {
   return null;
 }
 
+const TRACKING_QUERY_PARAMS = new Set([
+  "fbclid",
+  "gclid",
+  "share_from",
+  "share_medium",
+  "share_plat",
+  "share_session_id",
+  "share_source",
+  "share_tag",
+  "si",
+  "spm_id_from",
+  "timestamp",
+  "unique_k",
+  "vd_source",
+]);
+
+export function canonicalSourceKey(sourceUrl: string): string {
+  const youtubeId = getYouTubeVideoId(sourceUrl);
+  if (youtubeId) return `youtube:${youtubeId}`;
+  try {
+    const parsed = new URL(sourceUrl);
+    parsed.hash = "";
+    // The query can select a different video (such as ?p=2 for a multi-part
+    // Bilibili upload); only sharing and tracking parameters are dropped.
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (TRACKING_QUERY_PARAMS.has(key.toLowerCase()) || key.toLowerCase().startsWith("utm_")) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    parsed.searchParams.sort();
+    return parsed.toString().replace(/\/(?=$|\?)/, "");
+  } catch {
+    return sourceUrl.trim();
+  }
+}
+
 export function getBilibiliVideoId(url: string): string | null {
   try {
     const parsed = new URL(url);

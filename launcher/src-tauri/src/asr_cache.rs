@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::models::LauncherConfig;
+use crate::runtime::{self, ServiceState};
 
 const AUTO_CLEANUP_ENV_KEY: &str = "COURSE_NAVIGATOR_ASR_CACHE_AUTO_CLEANUP_ENABLED";
 const DATA_DIR_ENV_KEY: &str = "COURSE_NAVIGATOR_DATA_DIR";
@@ -31,23 +29,39 @@ pub fn load_status(config: &LauncherConfig) -> AsrCacheStatus {
     }
 }
 
-pub fn set_auto_cleanup(config: &LauncherConfig, enabled: bool) -> Result<AsrCacheStatus, String> {
+pub fn set_auto_cleanup(
+    state: Option<&ServiceState>,
+    config: &LauncherConfig,
+    enabled: bool,
+) -> Result<AsrCacheStatus, String> {
     write_auto_cleanup_env(config, enabled)?;
-    let _ = put_backend_json(
-        config,
-        "/api/settings/asr-cache",
-        &json!({"auto_cleanup_enabled": enabled}),
-    );
+    if runtime::configured_services_listening(config) {
+        runtime::send_service_json(
+            config,
+            "PUT",
+            "/api/settings/asr-cache",
+            Some(&json!({"auto_cleanup_enabled": enabled})),
+        )?;
+    }
     if enabled {
         let env = read_project_env(config);
         if cache_size_bytes(config, &env) > THRESHOLD_BYTES {
-            let _ = cleanup(config);
+            let _ = cleanup(state, config);
         }
     }
     Ok(load_status(config))
 }
 
-pub fn cleanup(config: &LauncherConfig) -> Result<AsrCacheStatus, String> {
+pub fn cleanup(state: Option<&ServiceState>, config: &LauncherConfig) -> Result<AsrCacheStatus, String> {
+    // A running service may be transcribing from these files; it knows which
+    // ones are in use, so the cleanup goes through it.
+    if runtime::configured_services_listening(config) {
+        runtime::send_service_json(config, "POST", "/api/settings/asr-cache/cleanup", None)?;
+        return Ok(load_status(config));
+    }
+    if runtime::service_may_be_running(state, config) {
+        return Err("服务没有响应，无法确认哪些音频正在使用，请稍后再试或先停止服务。".to_string());
+    }
     let env = read_project_env(config);
     let root = cache_root(config, &env);
     if root.exists() {
@@ -56,7 +70,6 @@ pub fn cleanup(config: &LauncherConfig) -> Result<AsrCacheStatus, String> {
         }
         prune_empty_dirs(&root);
     }
-    let _ = post_backend(config, "/api/settings/asr-cache/cleanup");
     Ok(load_status(config))
 }
 
@@ -194,55 +207,6 @@ fn update_env_text(
         }
     }
     format!("{}\n", lines.join("\n"))
-}
-
-fn put_backend_json(config: &LauncherConfig, path: &str, body: &Value) -> Result<(), String> {
-    send_backend_json(config, "PUT", path, Some(body))
-}
-
-fn post_backend(config: &LauncherConfig, path: &str) -> Result<(), String> {
-    send_backend_json(config, "POST", path, None)
-}
-
-fn send_backend_json(
-    config: &LauncherConfig,
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-) -> Result<(), String> {
-    let address = format!("{}:{}", config.api_host, config.api_port);
-    let mut addrs = address
-        .to_socket_addrs()
-        .map_err(|error| format!("无法解析 API 地址: {error}"))?;
-    let Some(addr) = addrs.next() else {
-        return Err("无法解析 API 地址".to_string());
-    };
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
-        .map_err(|error| format!("无法连接 API: {error}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1200)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(1200)));
-
-    let raw = body
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|error| format!("无法序列化 API 请求: {error}"))?
-        .unwrap_or_default();
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        config.api_host,
-        raw.len(),
-        raw
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("无法写入 API 请求: {error}"))?;
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    if response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2") {
-        Ok(())
-    } else {
-        Err("API 设置同步失败".to_string())
-    }
 }
 
 fn read_project_env(config: &LauncherConfig) -> BTreeMap<String, String> {

@@ -12,6 +12,7 @@ import {
   getAsrCacheSettings,
   getOnlineAsrSettings,
   getLibraryState,
+  getLibraryErrors,
   getModelSettings,
   getAsrCorrectionResult,
   getStudyJob,
@@ -41,12 +42,13 @@ const apiMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("./api", () => ({
-  cleanupAsrCache: vi.fn().mockResolvedValue({
+  getLibraryErrors: vi.fn(async () => ({})),
+  cleanupAsrCache: vi.fn(async () => ({
     size_bytes: 0,
     threshold_bytes: 524288000,
     auto_cleanup_enabled: true,
     cleaned_bytes: 0,
-  }),
+  })),
   bindVideoSource: vi.fn(),
   bindVideoSourceFromPicker: vi.fn(),
   cancelJob: vi.fn(),
@@ -56,7 +58,7 @@ vi.mock("./api", () => ({
   downloadVideo: vi.fn(),
   extractCourse: vi.fn(),
   previewCourse: vi.fn(),
-  getModelSettings: vi.fn().mockResolvedValue({
+  getModelSettings: vi.fn(async () => ({
     profiles: [
       {
         id: "default",
@@ -76,58 +78,58 @@ vi.mock("./api", () => ({
     asr_model_id: "default",
     study_detail_level: "faithful",
     task_parameters: {},
-  }),
-  getOnlineAsrSettings: vi.fn().mockResolvedValue({
+  })),
+  getOnlineAsrSettings: vi.fn(async () => ({
     provider: "xai",
     openai: { has_api_key: false, api_key_preview: null },
     groq: { has_api_key: true, api_key_preview: "gsk...test" },
     xai: { has_api_key: true, api_key_preview: "xai...test" },
     custom: { base_url: null, model: null, has_api_key: false, api_key_preview: null },
-  }),
+  })),
   getItem: apiMocks.getItem,
   getStudyJob: vi.fn(),
   getAsrCorrectionResult: vi.fn(),
-  getLibraryState: vi.fn().mockResolvedValue({
+  getLibraryState: vi.fn(async () => ({
     manual_collections: [],
     manual_collection_groups: [],
     collection_order: [],
     collection_group_order: [],
     collection_group_assignments: {},
-  }),
-  getAsrSearchSettings: vi.fn().mockResolvedValue({
+  })),
+  getAsrSearchSettings: vi.fn(async () => ({
     enabled: false,
     provider: "tavily",
     result_limit: 5,
     tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
     firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
-  }),
-  getAsrCacheSettings: vi.fn().mockResolvedValue({
+  })),
+  getAsrCacheSettings: vi.fn(async () => ({
     size_bytes: 0,
     threshold_bytes: 524288000,
     auto_cleanup_enabled: true,
-  }),
+  })),
   importCoursePackage: vi.fn(),
   importLocalVideo: vi.fn(),
   importWorkspaceVideoFromPicker: vi.fn(),
   itemVideoPath: (itemId: string) => `/api/items/${itemId}/video`,
   listAvailableModels: vi.fn(),
-  listItems: vi.fn().mockResolvedValue([]),
+  listItems: vi.fn(async () => ([])),
   saveModelSettings: vi.fn(),
   saveAsrSearchSettings: vi.fn(),
-  saveAsrCacheSettings: vi.fn().mockResolvedValue({
+  saveAsrCacheSettings: vi.fn(async () => ({
     size_bytes: 0,
     threshold_bytes: 524288000,
     auto_cleanup_enabled: true,
-  }),
-  saveCookieText: vi.fn().mockResolvedValue({ path: "/Users/LQ/cookies/manual.cookies.txt" }),
-  saveLibraryState: vi.fn().mockImplementation(async (state) => state),
-  saveOnlineAsrSettings: vi.fn().mockResolvedValue({
+  })),
+  saveCookieText: vi.fn(async () => ({ path: "/Users/LQ/cookies/manual.cookies.txt" })),
+  saveLibraryState: vi.fn(async (state) => state),
+  saveOnlineAsrSettings: vi.fn(async () => ({
     provider: "xai",
     openai: { has_api_key: false, api_key_preview: null },
     groq: { has_api_key: true, api_key_preview: "gsk...test" },
     xai: { has_api_key: true, api_key_preview: "xai...test" },
     custom: { base_url: null, model: null, has_api_key: false, api_key_preview: null },
-  }),
+  })),
   saveTranscript: vi.fn(),
   startAsrCorrectionJob: vi.fn(),
   startExtractJob: vi.fn(),
@@ -139,7 +141,9 @@ vi.mock("./api", () => ({
 
 describe("App language defaults", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    // Reset, not clear: queued once-values and per-test overrides must not
+    // leak into the next test. Defaults live in the vi.fn implementations.
+    vi.resetAllMocks();
     installTestLocalStorage();
     window.localStorage.removeItem("course-navigator-manual-collections");
     window.localStorage.removeItem("course-navigator-manual-collection-groups");
@@ -153,6 +157,14 @@ describe("App language defaults", () => {
     window.localStorage.removeItem("course-navigator-asr-save-accepted-changes");
     window.localStorage.removeItem("course-navigator-asr-sort-by-confidence");
     window.localStorage.removeItem("course-navigator-study-detail-level");
+  });
+
+  it("reports unreadable courses with a download link while keeping the workspace usable", async () => {
+    vi.mocked(getLibraryErrors).mockResolvedValueOnce({ "broken.json": "Invalid course record" });
+    render(<App />);
+    expect(await screen.findByText("部分课程文件无法读取，其他课程仍可使用")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "broken.json" }).getAttribute("href")).toBe("/api/library-errors/broken.json");
+    expect(screen.getByRole("button", { name: "翻译字幕" })).toBeTruthy();
   });
 
   it("uses Chinese UI and a language menu by default", async () => {
@@ -276,9 +288,68 @@ describe("App language defaults", () => {
     });
 
     await waitFor(() => {
-      expect(saveTranscript).toHaveBeenCalledWith("local-upload-course", parsedTranscript);
+      expect(saveTranscript).toHaveBeenCalledWith("local-upload-course", parsedTranscript, null);
     });
     expect(sourceSelect.value).toBe("local_upload");
+  });
+
+  it("keeps the subtitle track language when saving workbench edits", async () => {
+    const item: CourseItem = {
+      id: "zh-edit-course",
+      source_url: "https://example.com/zh-video",
+      title: "中文课程",
+      duration: 4,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "今天我们学习梯度下降" }],
+      transcript_language: "zh-CN",
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveTranscript).mockResolvedValueOnce(item);
+
+    render(<App />);
+    fireEvent.click(await screen.findByTitle("打开 ASR 校正工作台"));
+    fireEvent.click(await screen.findByRole("button", { name: "保存字幕" }));
+
+    await waitFor(() => {
+      expect(saveTranscript).toHaveBeenCalledWith("zh-edit-course", item.transcript, "zh-CN");
+    });
+  });
+
+  it("keeps workbench edits typed while a transcript save is in flight", async () => {
+    const item: CourseItem = {
+      id: "racing-edit-course",
+      source_url: "https://example.com/racing-video",
+      title: "Racing Course",
+      duration: 4,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "first version" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    let resolveSave: ((value: CourseItem) => void) | null = null;
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveTranscript).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveSave = resolve;
+    }));
+
+    const { container } = render(<App />);
+    fireEvent.click(await screen.findByTitle("打开 ASR 校正工作台"));
+    fireEvent.click(await screen.findByRole("button", { name: "保存字幕" }));
+    await waitFor(() => expect(saveTranscript).toHaveBeenCalledTimes(1));
+
+    const editor = container.querySelector("textarea.asr-editor") as HTMLTextAreaElement;
+    const typedDuringSave = editor.value.replace("first version", "second version");
+    expect(typedDuringSave).toContain("second version");
+    fireEvent.change(editor, { target: { value: typedDuringSave } });
+    await act(async () => {
+      resolveSave?.(item);
+    });
+
+    expect((container.querySelector("textarea.asr-editor") as HTMLTextAreaElement).value).toBe(typedDuringSave);
   });
 
   it("imports local videos from the topbar icon button", async () => {
@@ -1640,6 +1711,30 @@ describe("App language defaults", () => {
     });
   });
 
+  it("refreshes only the translating course during progress and completion", async () => {
+    const item: CourseItem = {
+      id: "single-refresh", source_url: "https://example.com/course", title: "Refresh lesson", duration: 2,
+      created_at: new Date().toISOString(), transcript: [{ start: 0, end: 2, text: "Source" }],
+      metadata: null, study: null, local_video_path: null,
+    };
+    const running: StudyJobStatus = {
+      job_id: "single-refresh-job", item_id: item.id, status: "running", progress: 30,
+      phase: "translation", message: "Translating", error: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(startTranslationJob).mockResolvedValueOnce(running);
+    vi.mocked(getStudyJob).mockResolvedValueOnce(running).mockResolvedValueOnce({
+      ...running, status: "succeeded", progress: 100, phase: "complete",
+    });
+    apiMocks.getItem.mockResolvedValueOnce(item).mockResolvedValueOnce(item);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "翻译字幕" }));
+    await waitFor(() => expect(apiMocks.getItem).toHaveBeenCalledTimes(2), { timeout: 4000 });
+    expect(apiMocks.getItem).toHaveBeenNthCalledWith(1, item.id);
+    expect(apiMocks.getItem).toHaveBeenNthCalledWith(2, item.id);
+    expect(listItems).toHaveBeenCalledTimes(1);
+  });
+
   it("shows a cancel action while translating subtitles", async () => {
     const item = {
       id: "translation-lesson",
@@ -1653,6 +1748,7 @@ describe("App language defaults", () => {
       local_video_path: null,
     };
     vi.mocked(listItems).mockResolvedValueOnce([item]);
+    apiMocks.getItem.mockResolvedValueOnce(item);
     vi.mocked(startTranslationJob).mockResolvedValueOnce({
       job_id: "translation-job",
       item_id: "translation-lesson",
@@ -1688,6 +1784,8 @@ describe("App language defaults", () => {
 
     await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("translation-job"));
     await waitFor(() => expect(getStudyJob).toHaveBeenCalledWith("translation-job"), { timeout: 3500 });
+    await waitFor(() => expect(apiMocks.getItem).toHaveBeenCalledWith("translation-lesson"));
+    expect(listItems).toHaveBeenCalledTimes(1);
     await waitFor(() => {
       expect(screen.queryByText(/正在取消字幕翻译|字幕翻译已取消/)).toBeNull();
       expect(screen.queryByRole("button", { name: "停止翻译字幕" })).toBeNull();
@@ -3291,6 +3389,36 @@ describe("App language defaults", () => {
       );
     });
     expect(screen.getByRole("button", { name: "收起分类 摄影" })).toBeTruthy();
+  });
+
+  it("does not save library state until the saved state has loaded", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(getLibraryState).mockRejectedValueOnce(new Error("library state unavailable"));
+      vi.mocked(getLibraryState).mockResolvedValueOnce({
+        manual_collections: [],
+        manual_collection_groups: ["摄影"],
+        collection_order: [],
+        collection_group_order: ["collection-group:摄影"],
+        collection_group_assignments: {},
+      });
+
+      render(<App />);
+
+      expect(await screen.findByText("library state unavailable")).toBeTruthy();
+      expect(saveLibraryState).not.toHaveBeenCalled();
+
+      // The load is retried, and saving starts from the server's state.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_500);
+      });
+      await waitFor(() => expect(getLibraryState).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(saveLibraryState).toHaveBeenCalledWith(expect.objectContaining({ manual_collection_groups: ["摄影"] })),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("serializes library state saves so a stale request cannot overwrite the latest category state", async () => {

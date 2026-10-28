@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::models::LauncherConfig;
+use crate::runtime::{self, ServiceState};
 
 const MODEL_ENV_KEYS: &[&str] = &[
     "COURSE_NAVIGATOR_LLM_BASE_URL",
@@ -177,17 +175,27 @@ pub fn load_model_config(config: &LauncherConfig) -> Result<LauncherModelConfig,
 }
 
 pub fn save_model_config(
+    state: Option<&ServiceState>,
     config: &LauncherConfig,
     input: LauncherModelConfigInput,
 ) -> Result<LauncherModelConfig, String> {
     let current = load_stored_settings(config)?;
     let settings = input_to_stored_settings(input, current)?;
     write_model_env(config, &settings)?;
-    sync_backend_settings(config, &settings);
+    // A stopped service reads the .env on its next start; a running one
+    // would keep the old settings without telling the user.
+    if runtime::configured_services_listening(config) {
+        sync_backend_settings(config, &settings).map_err(|error| {
+            format!("配置已写入，但同步到运行中的服务失败（{error}），重启服务后生效。")
+        })?;
+    } else if runtime::service_may_be_running(state, config) {
+        return Err("配置已写入，但服务没有响应，未能同步，重启服务后生效。".to_string());
+    }
     Ok(public_model_config(settings))
 }
 
 pub fn set_model_role(
+    state: Option<&ServiceState>,
     config: &LauncherConfig,
     role: &str,
     profile_id: &str,
@@ -204,10 +212,11 @@ pub fn set_model_role(
         "asr_model_id" => input.asr_model_id = profile_id.to_string(),
         _ => {}
     }
-    save_model_config(config, input)
+    save_model_config(state, config, input)
 }
 
 pub fn set_online_asr_provider(
+    state: Option<&ServiceState>,
     config: &LauncherConfig,
     provider: &str,
 ) -> Result<LauncherModelConfig, String> {
@@ -217,7 +226,7 @@ pub fn set_online_asr_provider(
     let current = load_stored_settings(config)?;
     let mut input = stored_to_input(&current);
     input.online_asr.provider = provider.to_string();
-    save_model_config(config, input)
+    save_model_config(state, config, input)
 }
 
 pub fn profile_label(profile: &ModelProfileView) -> String {
@@ -393,10 +402,17 @@ fn input_to_stored_settings(
         if !seen_ids.insert(id.clone()) {
             return Err(format!("模型档案 ID 重复: {id}"));
         }
+        let provider_type = normalized_provider_type(&profile.provider_type);
+        // A blank key keeps the saved one only while it goes to the same
+        // service; otherwise the key would be sent to the new endpoint.
         let api_key = match profile.api_key {
             Some(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
             _ => current_by_id
                 .get(&id)
+                .filter(|current| {
+                    llm_service_identity(&current.base_url, &current.provider_type)
+                        == llm_service_identity(&base_url, &provider_type)
+                })
                 .and_then(|profile| profile.api_key.clone()),
         };
         profiles.push(StoredModelProfile {
@@ -406,7 +422,7 @@ fn input_to_stored_settings(
             } else {
                 profile.name.trim().to_string()
             },
-            provider_type: normalized_provider_type(&profile.provider_type),
+            provider_type,
             base_url,
             model,
             context_window: profile.context_window,
@@ -500,16 +516,55 @@ fn merge_custom_online_service(
     input: OnlineAsrServiceInput,
     current: StoredOnlineAsrService,
 ) -> StoredOnlineAsrService {
+    let base_url = input
+        .base_url
+        .filter(|value| !value.trim().is_empty())
+        .or(current.base_url.clone());
+    let same_endpoint = base_url.as_deref().map(transcription_endpoint)
+        == current.base_url.as_deref().map(transcription_endpoint);
     StoredOnlineAsrService {
-        base_url: input
-            .base_url
-            .filter(|value| !value.trim().is_empty())
-            .or(current.base_url),
+        base_url,
         model: input
             .model
             .filter(|value| !value.trim().is_empty())
             .or(current.model),
-        api_key: secret_or_current(input.api_key, current.api_key),
+        api_key: secret_or_current(input.api_key, current.api_key.filter(|_| same_endpoint)),
+    }
+}
+
+/// Mirrors the backend's `llm_service_identity`: two settings with the same
+/// identity send requests to the same endpoints.
+fn llm_service_identity(base_url: &str, provider_type: &str) -> (String, String) {
+    let mut base = base_url.trim().trim_end_matches('/').to_string();
+    let suffixes: &[&str] = if provider_type == "anthropic" {
+        &["/messages", "/models"]
+    } else {
+        &["/chat/completions", "/models"]
+    };
+    if let Some(suffix) = suffixes.iter().find(|suffix| base.ends_with(*suffix)) {
+        base.truncate(base.len() - suffix.len());
+        base = base.trim_end_matches('/').to_string();
+    } else if provider_type == "anthropic" {
+        let after_scheme = base.split_once("://").map_or(base.as_str(), |(_, rest)| rest);
+        let path_start = after_scheme.find(['/', '?', '#']);
+        let authority = &after_scheme[..path_start.unwrap_or(after_scheme.len())];
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+        let has_path = path_start.is_some_and(|start| after_scheme[start..].starts_with('/'));
+        if (host == "api.anthropic.com" && !has_path) || base.ends_with("/anthropic") {
+            base.push_str("/v1");
+        }
+    }
+    (provider_type.to_string(), base)
+}
+
+/// Mirrors the backend's transcription endpoint for a custom online ASR.
+fn transcription_endpoint(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.ends_with("/audio/transcriptions") {
+        base.to_string()
+    } else {
+        format!("{base}/audio/transcriptions")
     }
 }
 
@@ -756,7 +811,7 @@ fn update_env_text_with_values(
     format!("{}\n", lines.join("\n"))
 }
 
-fn sync_backend_settings(config: &LauncherConfig, settings: &StoredModelSettings) {
+fn sync_backend_settings(config: &LauncherConfig, settings: &StoredModelSettings) -> Result<(), String> {
     let model_body = json!({
         "profiles": settings.profiles.iter().map(|profile| json!({
             "id": profile.id,
@@ -777,50 +832,26 @@ fn sync_backend_settings(config: &LauncherConfig, settings: &StoredModelSettings
     });
     let online_body = json!({
         "provider": settings.online_asr.provider,
-        "openai": {"api_key": settings.online_asr.openai.api_key.clone().unwrap_or_default()},
-        "groq": {"api_key": settings.online_asr.groq.api_key.clone().unwrap_or_default()},
-        "xai": {"api_key": settings.online_asr.xai.api_key.clone().unwrap_or_default()},
+        "openai": {
+            "model": settings.online_asr.openai.model,
+            "api_key": settings.online_asr.openai.api_key.clone().unwrap_or_default(),
+        },
+        "groq": {
+            "model": settings.online_asr.groq.model,
+            "api_key": settings.online_asr.groq.api_key.clone().unwrap_or_default(),
+        },
+        "xai": {
+            "model": settings.online_asr.xai.model,
+            "api_key": settings.online_asr.xai.api_key.clone().unwrap_or_default(),
+        },
         "custom": {
             "base_url": settings.online_asr.custom.base_url,
             "model": settings.online_asr.custom.model,
             "api_key": settings.online_asr.custom.api_key.clone().unwrap_or_default(),
         },
     });
-    let _ = put_backend_json(config, "/api/settings/model", &model_body);
-    let _ = put_backend_json(config, "/api/settings/online-asr", &online_body);
-}
-
-fn put_backend_json(config: &LauncherConfig, path: &str, body: &Value) -> Result<(), String> {
-    let address = format!("{}:{}", config.api_host, config.api_port);
-    let mut addrs = address
-        .to_socket_addrs()
-        .map_err(|error| format!("无法解析 API 地址: {error}"))?;
-    let Some(addr) = addrs.next() else {
-        return Err("无法解析 API 地址".to_string());
-    };
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
-        .map_err(|error| format!("无法连接 API: {error}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1200)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(1200)));
-
-    let raw =
-        serde_json::to_string(body).map_err(|error| format!("无法序列化 API 请求: {error}"))?;
-    let request = format!(
-        "PUT {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        config.api_host,
-        raw.as_bytes().len(),
-        raw
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("无法写入 API 请求: {error}"))?;
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    if response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2") {
-        Ok(())
-    } else {
-        Err("API 设置同步失败".to_string())
-    }
+    runtime::send_service_json(config, "PUT", "/api/settings/model", Some(&model_body))?;
+    runtime::send_service_json(config, "PUT", "/api/settings/online-asr", Some(&online_body))
 }
 
 fn read_project_env(config: &LauncherConfig) -> BTreeMap<String, String> {
@@ -1065,6 +1096,89 @@ COURSE_NAVIGATOR_OPENAI_ASR_API_KEY="sk-asr"
         assert_eq!(
             public.profiles[0].api_key_preview.as_deref(),
             Some("sk-1********7890")
+        );
+    }
+
+    fn settings_with_key(base_url: &str) -> StoredModelSettings {
+        let mut online_asr = load_online_asr_from_env(&BTreeMap::new());
+        online_asr.custom.base_url = Some("https://asr.example.com/v1".into());
+        online_asr.custom.api_key = Some("asr-secret".into());
+        StoredModelSettings {
+            profiles: vec![StoredModelProfile {
+                id: "default".into(),
+                name: "Default".into(),
+                provider_type: "openai".into(),
+                base_url: base_url.into(),
+                model: "model".into(),
+                context_window: None,
+                max_tokens: None,
+                api_key: Some("sk-secret".into()),
+            }],
+            translation_model_id: "default".into(),
+            learning_model_id: "default".into(),
+            global_model_id: "default".into(),
+            asr_model_id: "default".into(),
+            study_detail_level: "faithful".into(),
+            task_parameters: json!({}),
+            online_asr,
+        }
+    }
+
+    #[test]
+    fn blank_key_is_kept_only_for_the_same_llm_service() {
+        let current = settings_with_key("https://api.example.com/v1");
+        let mut input = stored_to_input(&current);
+        input.profiles[0].api_key = None;
+        input.profiles[0].base_url = "https://api.example.com/v1/chat/completions/".into();
+        let same = input_to_stored_settings(input, current.clone()).unwrap();
+        assert_eq!(same.profiles[0].api_key.as_deref(), Some("sk-secret"));
+
+        let mut input = stored_to_input(&current);
+        input.profiles[0].api_key = None;
+        input.profiles[0].base_url = "https://attacker.example/v1".into();
+        let moved = input_to_stored_settings(input, current.clone()).unwrap();
+        assert_eq!(moved.profiles[0].api_key, None);
+
+        let mut input = stored_to_input(&current);
+        input.profiles[0].api_key = None;
+        input.profiles[0].provider_type = "anthropic".into();
+        let switched = input_to_stored_settings(input, current).unwrap();
+        assert_eq!(switched.profiles[0].api_key, None);
+    }
+
+    #[test]
+    fn blank_key_is_kept_only_for_the_same_custom_asr_endpoint() {
+        let current = settings_with_key("https://api.example.com/v1");
+        let mut input = stored_to_input(&current);
+        input.online_asr.custom.api_key = None;
+        input.online_asr.custom.base_url = Some("https://asr.example.com/v1/audio/transcriptions".into());
+        let same = input_to_stored_settings(input, current.clone()).unwrap();
+        assert_eq!(same.online_asr.custom.api_key.as_deref(), Some("asr-secret"));
+
+        let mut input = stored_to_input(&current);
+        input.online_asr.custom.api_key = None;
+        input.online_asr.custom.base_url = Some("https://other.example.com/v1".into());
+        let moved = input_to_stored_settings(input, current).unwrap();
+        assert_eq!(moved.online_asr.custom.api_key, None);
+    }
+
+    #[test]
+    fn llm_service_identity_matches_the_backend_rules() {
+        assert_eq!(
+            llm_service_identity("https://api.anthropic.com", "anthropic"),
+            llm_service_identity("https://api.anthropic.com/v1/messages", "anthropic")
+        );
+        assert_eq!(
+            llm_service_identity("https://proxy.example/anthropic", "anthropic").1,
+            "https://proxy.example/anthropic/v1"
+        );
+        assert_ne!(
+            llm_service_identity("https://api.anthropic.com/custom", "anthropic").1,
+            "https://api.anthropic.com/custom/v1"
+        );
+        assert_eq!(
+            llm_service_identity(" https://api.example.com/v1/models ", "openai").1,
+            "https://api.example.com/v1"
         );
     }
 

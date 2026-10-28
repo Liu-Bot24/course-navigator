@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from .http_requests import RequestCancelled, post_cancellable
+
 from .ai import CancelCallback, LlmCancelled, LlmProvider, _chat_text, _loads_json_content
 from .models import (
     AsrCorrectionSearchConfig,
@@ -579,6 +581,19 @@ def _short_string_list(value: object, *, limit: int, item_limit: int) -> list[st
     return items
 
 
+def search_endpoint(provider: str, base_url: str | None) -> str:
+    if provider == "tavily":
+        return "https://api.tavily.com/search"
+    endpoint = (base_url or "").strip().rstrip("/")
+    if not endpoint:
+        return ""
+    if not endpoint.endswith("/search"):
+        if not endpoint.endswith("/v1"):
+            endpoint = f"{endpoint}/v1"
+        endpoint = f"{endpoint}/search"
+    return endpoint
+
+
 def _search(
     query: str,
     config: AsrCorrectionSearchConfig,
@@ -589,7 +604,7 @@ def _search(
         if not config.api_key:
             raise ValueError("Tavily API key is required when search calibration is enabled")
         response = _post_search_request(
-            "https://api.tavily.com/search",
+            search_endpoint(config.provider, config.base_url),
             headers={"Authorization": f"Bearer {config.api_key}"},
             payload={"query": query, "max_results": config.result_limit},
             timeout=30,
@@ -600,14 +615,9 @@ def _search(
         payload = response.json()
         return _normalize_search_results(payload.get("results"), "tavily")
 
-    base_url = (config.base_url or "").strip().rstrip("/")
-    if not base_url:
+    endpoint = search_endpoint(config.provider, config.base_url)
+    if not endpoint:
         raise ValueError("Firecrawl base URL is required when search calibration is enabled")
-    endpoint = base_url
-    if not endpoint.endswith("/search"):
-        if not endpoint.endswith("/v1"):
-            endpoint = f"{endpoint}/v1"
-        endpoint = f"{endpoint}/search"
     headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
@@ -636,25 +646,11 @@ def _post_search_request(
     if should_cancel is None:
         return httpx.post(url, headers=headers, json=payload, timeout=timeout)
 
-    with httpx.Client(timeout=timeout) as client:
-        stop = Event()
-
-        def close_on_cancel() -> None:
-            while not stop.wait(0.25):
-                if should_cancel():
-                    client.close()
-                    return
-
-        Thread(target=close_on_cancel, name="course-navigator-asr-search-cancel", daemon=True).start()
-        try:
-            response = client.post(url, headers=headers, json=payload)
-        except httpx.RequestError:
-            _raise_if_cancelled(should_cancel)
-            raise
-        finally:
-            stop.set()
-    _raise_if_cancelled(should_cancel)
-    return response
+    try:
+        return post_cancellable(url, headers=headers, json=payload, timeout=timeout,
+                                should_cancel=should_cancel)
+    except RequestCancelled as exc:
+        raise LlmCancelled("Search request was cancelled") from exc
 
 
 def _normalize_search_results(raw_results: object, source: str) -> list[dict[str, Any]]:

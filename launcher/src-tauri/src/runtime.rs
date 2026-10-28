@@ -1,15 +1,16 @@
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,13 +28,27 @@ const LOGIN_SHELL_PATH: &str = "/bin/zsh";
 #[cfg(not(windows))]
 const PS_PATH: &str = "/bin/ps";
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
 const DEPENDENCY_MARKER_FILE: &str = ".course-navigator-deps.json";
 const INSTALL_TARGET_MEDIA_TOOLS: &str = "media-tools";
 const RUNTIME_TOOL_PATHS_ENV: &str = "COURSE_NAVIGATOR_RUNTIME_TOOL_PATHS";
 #[cfg(windows)]
 const FFMPEG_DOWNLOAD_URL: &str =
     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+// The services themselves start in seconds; this covers slow disks and
+// antivirus scans. A process that exits is reported immediately instead.
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(90);
+// First-time installs download large Python wheels (torch via whisper).
+const SETUP_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const LOG_EXCERPT_LINES: usize = 8;
+pub const START_CANCELLED: &str = "启动已取消";
+const SERVICE_LOG: &str = "service";
+#[cfg(windows)]
+const TOOLS_LOG: &str = "tools";
+#[cfg(windows)]
+const TOOL_SCRIPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const WEB_BUILD_INDEX: &str = "frontend/dist/index.html";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCommand {
@@ -54,8 +69,28 @@ pub struct DependencyStatus {
 }
 
 pub struct ServiceState {
-    api: Mutex<Option<Child>>,
-    web: Mutex<Option<Child>>,
+    service: Mutex<Option<Child>>,
+    operation: Mutex<Option<Operation>>,
+    cancel_start: AtomicBool,
+}
+
+/// A start or stop that is still running on a background thread.
+#[derive(Clone, Debug)]
+pub struct Operation {
+    pub state: &'static str,
+    pub message: String,
+}
+
+pub struct OperationGuard<'a> {
+    state: &'a ServiceState,
+}
+
+impl Drop for OperationGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut operation) = self.state.operation.lock() {
+            *operation = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -77,10 +112,89 @@ impl StopSignal {
 impl ServiceState {
     pub fn new() -> Self {
         Self {
-            api: Mutex::new(None),
-            web: Mutex::new(None),
+            service: Mutex::new(None),
+            operation: Mutex::new(None),
+            cancel_start: AtomicBool::new(false),
         }
     }
+
+    /// Claims the single start/stop slot; None while another one runs.
+    pub fn begin_operation(&self, state: &'static str, message: &str) -> Option<OperationGuard<'_>> {
+        let mut operation = self.operation.lock().ok()?;
+        if operation.is_some() {
+            return None;
+        }
+        *operation = Some(Operation {
+            state,
+            message: message.to_string(),
+        });
+        if state == "starting" {
+            self.cancel_start.store(false, Ordering::SeqCst);
+        }
+        Some(OperationGuard { state: self })
+    }
+
+    pub fn current_operation(&self) -> Option<Operation> {
+        self.operation.lock().ok()?.clone()
+    }
+
+    pub fn set_operation_message(&self, message: &str) {
+        if let Ok(mut operation) = self.operation.lock() {
+            if let Some(operation) = operation.as_mut() {
+                operation.message = message.to_string();
+            }
+        }
+    }
+
+    /// Asks a running start to abort; returns whether a start was running.
+    pub fn request_start_cancel(&self) -> bool {
+        let starting = self
+            .current_operation()
+            .is_some_and(|operation| operation.state == "starting");
+        if starting {
+            self.cancel_start.store(true, Ordering::SeqCst);
+            self.set_operation_message("正在取消启动...");
+        }
+        starting
+    }
+
+    pub fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while self.current_operation().is_some() {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        true
+    }
+
+    fn start_cancelled(&self) -> bool {
+        self.cancel_start.load(Ordering::SeqCst)
+    }
+
+    /// True while the service process this launcher started has not exited.
+    pub fn has_live_service(&self) -> bool {
+        self.service
+            .lock()
+            .ok()
+            .is_some_and(|mut child| child.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None))))
+    }
+}
+
+/// For destructive work (moving the Workspace, deleting cache files): a
+/// service that is up but slow to answer its health check still counts.
+pub fn service_may_be_running(state: Option<&ServiceState>, config: &LauncherConfig) -> bool {
+    state.is_some_and(ServiceState::has_live_service) || any_configured_service_listening(config)
+}
+
+/// One local service on the web port serves both the pages and `/api`.
+pub fn web_url(config: &LauncherConfig) -> String {
+    format!("http://{}:{}", config.web_host, config.web_port)
+}
+
+pub fn api_url(config: &LauncherConfig) -> String {
+    format!("{}/api", web_url(config))
 }
 
 pub fn configured_services_listening(config: &LauncherConfig) -> bool {
@@ -88,8 +202,7 @@ pub fn configured_services_listening(config: &LauncherConfig) -> bool {
 }
 
 pub fn any_configured_service_listening(config: &LauncherConfig) -> bool {
-    endpoint_listening(&config.api_host, config.api_port)
-        || endpoint_listening(&config.web_host, config.web_port)
+    endpoint_listening(&config.web_host, config.web_port)
 }
 
 pub fn resolve_available_ports(config: &LauncherConfig) -> (LauncherConfig, Vec<String>) {
@@ -99,27 +212,12 @@ pub fn resolve_available_ports(config: &LauncherConfig) -> (LauncherConfig, Vec<
 
     let mut next = config.clone();
     let mut messages = Vec::new();
-    if endpoint_listening(&config.api_host, config.api_port) && !course_api_ready(config) {
-        if let Some(port) = first_available_port(&config.api_host, config.api_port) {
-            messages.push(format!(
-                "API 端口 {} 被占用，已改用 {port}",
-                config.api_port
-            ));
-            next.api_port = port;
-        }
-    }
-    if endpoint_listening(&config.web_host, config.web_port) && !course_web_ready(config) {
+    if endpoint_listening(&config.web_host, config.web_port) {
         if let Some(port) = first_available_port(&config.web_host, config.web_port) {
             messages.push(format!(
                 "网页端口 {} 被占用，已改用 {port}",
                 config.web_port
             ));
-            next.web_port = port;
-        }
-    }
-    if next.api_host == next.web_host && next.api_port == next.web_port {
-        if let Some(port) = first_available_port(&next.web_host, next.web_port) {
-            messages.push(format!("网页端口与 API 端口冲突，已改用 {port}"));
             next.web_port = port;
         }
     }
@@ -135,48 +233,27 @@ fn first_available_port(host: &str, preferred: u16) -> Option<u16> {
 }
 
 pub fn owns_services(state: &ServiceState) -> bool {
-    let api_owned = state.api.lock().map(|api| api.is_some()).unwrap_or(false);
-    let web_owned = state.web.lock().map(|web| web.is_some()).unwrap_or(false);
-    api_owned || web_owned
+    state
+        .service
+        .lock()
+        .map(|service| service.is_some())
+        .unwrap_or(false)
 }
 
-pub fn api_command(config: &LauncherConfig) -> RuntimeCommand {
+/// The FastAPI app also serves the built pages in `frontend/dist`, so the
+/// launcher needs neither Node.js nor a separate web server.
+pub fn app_command(config: &LauncherConfig) -> RuntimeCommand {
     if cfg!(windows) {
         RuntimeCommand {
             program: "uv".into(),
+            // --frozen: run from the shipped uv.lock, never re-resolve it at start.
             args: vec![
                 "run".into(),
+                "--frozen".into(),
                 "uvicorn".into(),
                 "course_navigator.app:app".into(),
                 "--app-dir".into(),
                 "backend".into(),
-                "--host".into(),
-                config.api_host.clone(),
-                "--port".into(),
-                config.api_port.to_string(),
-            ],
-        }
-    } else {
-        let command = shell_command_with_bundled_tool_paths(&format!(
-            "exec uv run uvicorn course_navigator.app:app --app-dir backend --host {} --port {}",
-            shell_quote(&config.api_host),
-            config.api_port
-        ));
-        RuntimeCommand {
-            program: LOGIN_SHELL_PATH.into(),
-            args: vec!["-lic".into(), command],
-        }
-    }
-}
-
-pub fn web_command(config: &LauncherConfig) -> RuntimeCommand {
-    if cfg!(windows) {
-        RuntimeCommand {
-            program: "npm.cmd".into(),
-            args: vec![
-                "run".into(),
-                "dev".into(),
-                "--".into(),
                 "--host".into(),
                 config.web_host.clone(),
                 "--port".into(),
@@ -185,7 +262,7 @@ pub fn web_command(config: &LauncherConfig) -> RuntimeCommand {
         }
     } else {
         let command = shell_command_with_bundled_tool_paths(&format!(
-            "exec npm run dev -- --host {} --port {}",
+            "exec uv run --frozen uvicorn course_navigator.app:app --app-dir backend --host {} --port {}",
             shell_quote(&config.web_host),
             config.web_port
         ));
@@ -198,21 +275,6 @@ pub fn web_command(config: &LauncherConfig) -> RuntimeCommand {
 
 pub fn check_dependencies(project_root: &Path) -> Vec<DependencyStatus> {
     vec![
-        DependencyStatus {
-            name: "node".into(),
-            available: command_exists("node")
-                && node_version().is_some_and(|version| node_version_supported(&version)),
-            purpose: "显示学习网页界面".into(),
-            install_target: None,
-            install_label: None,
-        },
-        DependencyStatus {
-            name: "npm".into(),
-            available: command_exists("npm"),
-            purpose: "加载网页所需资源".into(),
-            install_target: None,
-            install_label: None,
-        },
         DependencyStatus {
             name: "uv".into(),
             available: command_exists("uv"),
@@ -274,18 +336,20 @@ fn media_tools_are_available(command_available: impl Fn(&str) -> bool) -> bool {
     command_available("ffmpeg") && command_available("ffprobe")
 }
 
-fn prepare_preferred_windows_tools() {
+fn prepare_preferred_windows_tools(state: &ServiceState) {
     #[cfg(windows)]
     {
-        let _ = prepare_latest_windows_tools();
+        let _ = prepare_latest_windows_tools(state);
     }
+    #[cfg(not(windows))]
+    let _ = state;
 }
 
 #[cfg(windows)]
-fn prepare_latest_windows_tools() -> Result<(), String> {
+fn prepare_latest_windows_tools(state: &ServiceState) -> Result<(), String> {
     let mut errors = Vec::new();
     if bundled_tool_program("ffmpeg").is_none() || bundled_tool_program("ffprobe").is_none() {
-        if let Err(error) = download_latest_media_tools() {
+        if let Err(error) = download_latest_media_tools(state) {
             errors.push(format!("ffmpeg / ffprobe 更新失败: {error}"));
         }
     }
@@ -297,7 +361,7 @@ fn prepare_latest_windows_tools() -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn download_latest_media_tools() -> Result<(), String> {
+fn download_latest_media_tools(state: &ServiceState) -> Result<(), String> {
     let target_dir = installed_tools_root().join("ffmpeg");
     let temp_root = installed_tools_root()
         .join(".tmp")
@@ -310,65 +374,69 @@ fn download_latest_media_tools() -> Result<(), String> {
 
     let url = env::var("COURSE_NAVIGATOR_WINDOWS_FFMPEG_URL")
         .unwrap_or_else(|_| FFMPEG_DOWNLOAD_URL.to_string());
-    let result = download_file_with_powershell(&url, &zip_path)
-        .and_then(|()| expand_archive_with_powershell(&zip_path, &extract_dir))
-        .and_then(|()| copy_media_tools_from_archive(&extract_dir, &target_dir));
+    let result = download_file_with_powershell(&url, &zip_path, state)
+        .and_then(|()| expand_archive_with_powershell(&zip_path, &extract_dir, state))
+        .and_then(|()| copy_media_tools_from_archive(&extract_dir, &target_dir, state));
     let _ = fs::remove_dir_all(&temp_root);
     result
 }
 
 #[cfg(windows)]
-fn download_file_with_powershell(url: &str, target: &Path) -> Result<(), String> {
+fn download_file_with_powershell(url: &str, target: &Path, state: &ServiceState) -> Result<(), String> {
     let script = format!(
         "$ErrorActionPreference = 'Stop'; New-Item -ItemType Directory -Force -Path (Split-Path -Parent {target}) | Out-Null; Invoke-WebRequest -UseBasicParsing -Uri {url} -OutFile {target}",
         url = powershell_quote(url),
         target = powershell_quote_path(target),
     );
-    run_powershell_script(&script, "下载运行工具失败")
+    run_powershell_script(&script, "下载运行工具失败", state)
 }
 
 #[cfg(windows)]
-fn expand_archive_with_powershell(zip_path: &Path, destination: &Path) -> Result<(), String> {
+fn expand_archive_with_powershell(zip_path: &Path, destination: &Path, state: &ServiceState) -> Result<(), String> {
     let script = format!(
         "$ErrorActionPreference = 'Stop'; Expand-Archive -LiteralPath {zip_path} -DestinationPath {destination} -Force",
         zip_path = powershell_quote_path(zip_path),
         destination = powershell_quote_path(destination),
     );
-    run_powershell_script(&script, "解压运行工具失败")
+    run_powershell_script(&script, "解压运行工具失败", state)
 }
 
 #[cfg(windows)]
-fn copy_media_tools_from_archive(source: &Path, target: &Path) -> Result<(), String> {
+fn copy_media_tools_from_archive(source: &Path, target: &Path, state: &ServiceState) -> Result<(), String> {
     let script = format!(
         "$ErrorActionPreference = 'Stop'; $source = {source}; $target = {target}; $ffmpeg = Get-ChildItem -Path $source -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1; $ffprobe = Get-ChildItem -Path $source -Recurse -Filter 'ffprobe.exe' | Select-Object -First 1; if (-not $ffmpeg -or -not $ffprobe) {{ throw '下载的 ffmpeg 包缺少 ffmpeg.exe 或 ffprobe.exe' }}; New-Item -ItemType Directory -Force -Path $target | Out-Null; Copy-Item -LiteralPath $ffmpeg.FullName -Destination (Join-Path $target 'ffmpeg.exe') -Force; Copy-Item -LiteralPath $ffprobe.FullName -Destination (Join-Path $target 'ffprobe.exe') -Force",
         source = powershell_quote_path(source),
         target = powershell_quote_path(target),
     );
-    run_powershell_script(&script, "安装媒体工具失败")
+    run_powershell_script(&script, "安装媒体工具失败", state)
 }
 
+/// Runs a tool-install script with output in tools.log, honoring cancel and a timeout.
 #[cfg(windows)]
-fn run_powershell_script(script: &str, context: &str) -> Result<(), String> {
-    let output = hidden_command("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .output()
-        .map_err(|error| format!("{context}: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{context}: {}",
-            command_failure_summary(
-                &String::from_utf8_lossy(&output.stderr),
-                &String::from_utf8_lossy(&output.stdout)
-            )
-        ))
+fn run_powershell_script(script: &str, context: &str, state: &ServiceState) -> Result<(), String> {
+    let log = open_fresh_log(TOOLS_LOG)?;
+    let stderr = log
+        .try_clone()
+        .map_err(|error| format!("{context}: 无法写入日志: {error}"))?;
+    // Windows PowerShell's progress bar slows Invoke-WebRequest and
+    // Expand-Archive down several times over, and nobody sees it here.
+    let script = format!("$ProgressPreference = 'SilentlyContinue'; {script}");
+    let mut command = hidden_command("powershell");
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(stderr);
+    let mut child = spawn_managed(&mut command).map_err(|error| format!("{context}: {error}"))?;
+    match wait_managed_child(&mut child, state, TOOL_SCRIPT_TIMEOUT, |_| {}) {
+        Ok(ChildWait::Exited(status)) if status.success() => Ok(()),
+        Ok(ChildWait::Exited(_)) => Err(format!("{context}: {}", log_excerpt(TOOLS_LOG))),
+        Ok(ChildWait::Cancelled) => Err(START_CANCELLED.to_string()),
+        Ok(ChildWait::TimedOut) => Err(format!(
+            "{context}: 超过 {} 分钟仍未完成，已停止",
+            TOOL_SCRIPT_TIMEOUT.as_secs() / 60
+        )),
+        Err(error) => Err(format!("{context}: {error}")),
     }
 }
 
@@ -391,68 +459,164 @@ fn unique_temp_name(prefix: &str) -> String {
     format!("{prefix}-{nanos}")
 }
 
-pub fn start_project_services(state: &ServiceState, config: &LauncherConfig) -> Result<(), String> {
+/// Runs on a background thread. `progress` receives user-facing step messages.
+pub fn start_project_services(
+    state: &ServiceState,
+    config: &LauncherConfig,
+    progress: &dyn Fn(&str),
+) -> Result<(), String> {
     let project_root = std::path::Path::new(&config.project_root);
     if !project_root.exists() {
         return Err(format!("项目目录不存在: {}", config.project_root));
     }
 
-    {
-        let api = state.api.lock().map_err(|_| "API 状态锁失效".to_string())?;
-        let web = state.web.lock().map_err(|_| "Web 状态锁失效".to_string())?;
-        if api.is_some() || web.is_some() {
-            return Err("服务已经由 Launcher 启动".to_string());
-        }
+    if owns_services(state) {
+        return Err("服务已经由 Launcher 启动".to_string());
     }
 
     if configured_services_listening(config) {
         return Ok(());
     }
     if any_configured_service_listening(config) {
-        return Err(
-            "检测到 API 或网页端口已被占用，但服务不完整；请先停止旧服务或换端口。".to_string(),
-        );
+        return Err("网页端口已被其他程序占用；请先停止旧服务或换端口。".to_string());
     }
-    ensure_project_dependencies(project_root)?;
+    if !web_build_present(project_root) {
+        return Err(format!(
+            "缺少网页文件 {}。请重新安装 Course Navigator；从源码运行时先执行 npm run build。",
+            project_root.join(WEB_BUILD_INDEX).display()
+        ));
+    }
+    progress("正在检查运行依赖...");
+    ensure_project_dependencies(project_root, state, progress)?;
+    if state.start_cancelled() {
+        return Err(START_CANCELLED.to_string());
+    }
 
-    let api = api_command(config);
-    let web = web_command(config);
+    let app = app_command(config);
 
-    let mut api_command = service_command(&api.program);
-    apply_service_env(&mut api_command, config);
-    let api_child = api_command
-        .args(&api.args)
+    progress("正在启动本地服务...");
+    let (stdout, stderr) = service_log_stdio(SERVICE_LOG);
+    let mut command = service_command(&app.program);
+    apply_service_env(&mut command, config);
+    command
+        .args(&app.args)
         .current_dir(project_root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("API 启动失败: {error}"))?;
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+    let child = spawn_managed(&mut command).map_err(|error| format!("服务启动失败: {error}"))?;
 
-    let mut web_command = service_command(&web.program);
-    apply_service_env(&mut web_command, config);
-    let web_child = match web_command
-        .args(&web.args)
-        .current_dir(project_root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = stop_child(api_child);
-            return Err(format!("Web 启动失败: {error}"));
-        }
-    };
-
-    *state.api.lock().map_err(|_| "API 状态锁失效".to_string())? = Some(api_child);
-    *state.web.lock().map_err(|_| "Web 状态锁失效".to_string())? = Some(web_child);
-    if wait_for_configured_services_to_start(config).is_err() {
+    *state.service.lock().map_err(|_| "服务状态锁失效".to_string())? = Some(child);
+    if let Err(error) = wait_for_services_ready(state, config, progress) {
         let _ = stop_configured_services(state, config);
-        return Err(
-            "服务已启动命令，但端口没有按预期响应；请确认 uv、npm 和项目依赖可用。".to_string(),
-        );
+        return Err(error);
     }
     Ok(())
+}
+
+fn wait_for_services_ready(
+    state: &ServiceState,
+    config: &LauncherConfig,
+    progress: &dyn Fn(&str),
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut last_report = 0;
+    loop {
+        if configured_services_listening(config) {
+            return Ok(());
+        }
+        if state.start_cancelled() {
+            return Err(START_CANCELLED.to_string());
+        }
+        if let Some(message) = exited_service_message(state) {
+            return Err(message);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= SERVICE_START_TIMEOUT {
+            return Err(not_ready_message(config, elapsed));
+        }
+        let seconds = elapsed.as_secs();
+        if seconds >= last_report + 5 {
+            last_report = seconds;
+            progress(&format!("正在等待服务就绪（已等待 {seconds} 秒）..."));
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn exited_service_message(state: &ServiceState) -> Option<String> {
+    let mut child = state.service.lock().ok()?;
+    let status = child.as_mut()?.try_wait().ok()??;
+    Some(format!(
+        "服务进程已退出（{status}）。\n{}",
+        log_excerpt(SERVICE_LOG)
+    ))
+}
+
+fn not_ready_message(config: &LauncherConfig, elapsed: Duration) -> String {
+    let missing = match (course_api_ready(config), course_web_ready(config)) {
+        (false, false) => "API 和网页都未响应",
+        (false, true) => "API 未响应",
+        _ => "网页未响应",
+    };
+    format!(
+        "服务在 {} 秒内没有就绪（{missing}）。\n{}",
+        elapsed.as_secs(),
+        log_excerpt(SERVICE_LOG)
+    )
+}
+
+pub fn logs_dir() -> PathBuf {
+    crate::config::application_support_dir().join("logs")
+}
+
+fn log_path(name: &str) -> PathBuf {
+    logs_dir().join(format!("{name}.log"))
+}
+
+/// Starts a fresh `<name>.log`, keeping the previous run as `<name>.previous.log`.
+fn open_fresh_log(name: &str) -> Result<File, String> {
+    let dir = logs_dir();
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建日志目录: {error}"))?;
+    let path = log_path(name);
+    if path.exists() {
+        let _ = fs::rename(&path, dir.join(format!("{name}.previous.log")));
+    }
+    File::create(&path).map_err(|error| format!("无法写入日志 {}: {error}", path.display()))
+}
+
+fn service_log_stdio(name: &str) -> (Stdio, Stdio) {
+    // Logging must never prevent the service from starting.
+    match open_fresh_log(name).and_then(|file| {
+        let stderr = file
+            .try_clone()
+            .map_err(|error| format!("无法写入日志: {error}"))?;
+        Ok((file, stderr))
+    }) {
+        Ok((stdout, stderr)) => (Stdio::from(stdout), Stdio::from(stderr)),
+        Err(_) => (Stdio::null(), Stdio::null()),
+    }
+}
+
+fn log_excerpt(name: &str) -> String {
+    let path = log_path(name);
+    let excerpt = fs::read(&path)
+        .map(|bytes| last_lines(&String::from_utf8_lossy(&bytes), LOG_EXCERPT_LINES))
+        .unwrap_or_default();
+    if excerpt.is_empty() {
+        format!("（日志为空）完整日志：{}", path.display())
+    } else {
+        format!("{excerpt}\n完整日志：{}", path.display())
+    }
+}
+
+fn last_lines(text: &str, count: usize) -> String {
+    let lines = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
 fn apply_service_env(command: &mut Command, config: &LauncherConfig) {
@@ -469,17 +633,9 @@ fn apply_service_env(command: &mut Command, config: &LauncherConfig) {
 
 pub fn stop_project_services(state: &ServiceState) -> Result<(), String> {
     if let Some(child) = state
-        .api
+        .service
         .lock()
-        .map_err(|_| "API 状态锁失效".to_string())?
-        .take()
-    {
-        stop_child(child)?;
-    }
-    if let Some(child) = state
-        .web
-        .lock()
-        .map_err(|_| "Web 状态锁失效".to_string())?
+        .map_err(|_| "服务状态锁失效".to_string())?
         .take()
     {
         stop_child(child)?;
@@ -647,16 +803,6 @@ fn wait_for_configured_services_to_stop(config: &LauncherConfig) -> Result<(), S
     Err("已发送停止信号，但端口仍在监听；请稍后再检查或手动结束残留进程。".to_string())
 }
 
-fn wait_for_configured_services_to_start(config: &LauncherConfig) -> Result<(), String> {
-    for _ in 0..80 {
-        if configured_services_listening(config) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(150));
-    }
-    Err("端口未按预期启动".to_string())
-}
-
 #[cfg(windows)]
 fn stop_child(mut child: Child) -> Result<(), String> {
     if child
@@ -735,23 +881,36 @@ fn listening_pids(port: u16) -> Vec<u32> {
         .collect()
 }
 
+/// netstat answers in milliseconds where starting PowerShell takes seconds.
 #[cfg(windows)]
 fn listening_pids(port: u16) -> Vec<u32> {
-    let script = format!(
-        "Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"
-    );
-    let Ok(output) = hidden_command("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .output()
-    else {
+    let Ok(output) = hidden_command("netstat").arg("-ano").output() else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
+    let mut pids = listening_pids_in_netstat(&String::from_utf8_lossy(&output.stdout), port);
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Rows are `Proto Local Foreign State PID`. The state column is localized,
+/// so a listener is recognized by its unconnected foreign port 0 instead.
+#[cfg(any(windows, test))]
+fn listening_pids_in_netstat(output: &str, port: u16) -> Vec<u32> {
+    let port = port.to_string();
+    output
         .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let [proto, local, foreign, _state, pid] = fields.as_slice() else {
+                return None;
+            };
+            let local_port = local.rsplit_once(':')?.1;
+            let foreign_port = foreign.rsplit_once(':')?.1;
+            (proto.eq_ignore_ascii_case("TCP") && local_port == port && foreign_port == "0")
+                .then(|| pid.parse().ok())
+                .flatten()
+        })
         .collect()
 }
 
@@ -819,7 +978,9 @@ fn is_project_service_command_with_cwd(
     if !matches_project_root(command, cwd, config) {
         return false;
     }
-    if port == config.api_port
+    // The service now listens on the web port; older versions ran the API on
+    // the API port and Vite on the web port, and those leftovers are stopped too.
+    if (port == config.web_port || port == config.api_port)
         && command.contains("course_navigator.app:app")
         && command_contains_port(command, port)
     {
@@ -835,13 +996,38 @@ fn matches_project_root(command: &str, cwd: Option<&str>, config: &LauncherConfi
     if root.is_empty() {
         return false;
     }
-    if command.contains(root) {
+    if command_mentions_path(command, root) {
         return true;
     }
     let root_path = Path::new(root);
     cwd.is_some_and(|cwd| {
         let cwd_path = Path::new(cwd);
         cwd_path == root_path || cwd_path.starts_with(root_path)
+    })
+}
+
+/// True when `root` appears as a whole path in `command`, so `/app/project`
+/// does not match a process started from `/app/project-other`.
+fn command_mentions_path(command: &str, root: &str) -> bool {
+    let root = root.trim_end_matches(['/', '\\']);
+    if root.is_empty() {
+        return false;
+    }
+    let (command, root) = if cfg!(windows) {
+        (command.to_lowercase(), root.to_lowercase())
+    } else {
+        (command.to_string(), root.to_string())
+    };
+    command.match_indices(&root).any(|(start, _)| {
+        let starts_path = command[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|previous| matches!(previous, '"' | '\'' | '=') || previous.is_whitespace());
+        let ends_path = command[start + root.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| matches!(next, '/' | '\\' | '"' | '\'') || next.is_whitespace());
+        starts_path && ends_path
     })
 }
 
@@ -926,22 +1112,30 @@ fn command_exists(name: &str) -> bool {
     }
 }
 
-fn ensure_project_dependencies(project_root: &Path) -> Result<(), String> {
-    let missing_commands = ["node", "npm", "uv"]
-        .into_iter()
-        .filter(|name| !command_exists(name))
-        .collect::<Vec<_>>();
-    if !missing_commands.is_empty() {
-        return Err(format!(
-            "缺少运行依赖: {}。请安装后再启动。",
-            missing_commands.join(", ")
-        ));
+fn ensure_project_dependencies(
+    project_root: &Path,
+    state: &ServiceState,
+    progress: &dyn Fn(&str),
+) -> Result<(), String> {
+    if !command_exists("uv") {
+        return Err("缺少运行依赖: uv。请安装后再启动。".to_string());
     }
-    ensure_supported_node_version()?;
-    prepare_preferred_windows_tools();
+    // The download is large and failures are not fatal; never pay for it on
+    // every start when ffmpeg is already reachable on PATH.
+    if cfg!(windows) && !media_tools_available() {
+        progress("正在下载 ffmpeg / ffprobe...");
+        prepare_preferred_windows_tools(state);
+        if state.start_cancelled() {
+            return Err(START_CANCELLED.to_string());
+        }
+    }
 
-    for command in project_setup_commands(project_root) {
-        run_setup_command(project_root, &command)?;
+    let commands = project_setup_commands(project_root);
+    if !commands.is_empty() {
+        let log = open_fresh_log("setup")?;
+        for command in &commands {
+            run_setup_command(project_root, command, &log, state, progress)?;
+        }
     }
     write_dependency_marker(project_root)?;
     Ok(())
@@ -950,106 +1144,36 @@ fn ensure_project_dependencies(project_root: &Path) -> Result<(), String> {
 fn project_setup_commands(project_root: &Path) -> Vec<RuntimeCommand> {
     let mut commands = Vec::new();
     let python_fingerprint = dependency_fingerprint(project_root, &["pyproject.toml", "uv.lock"]);
-    let node_fingerprint =
-        dependency_fingerprint(project_root, &["package.json", "package-lock.json"]);
     if !project_root.join(".venv").exists()
         || !dependency_marker_matches(project_root, "python", &python_fingerprint)
     {
         commands.push(setup_uv_command());
-    }
-    if !project_root.join("node_modules").exists()
-        || !dependency_marker_matches(project_root, "node", &node_fingerprint)
-    {
-        commands.push(setup_npm_command(project_root));
     }
     commands
 }
 
 fn setup_uv_command() -> RuntimeCommand {
     if cfg!(windows) {
+        // --frozen keeps uv from rewriting uv.lock, which would change the
+        // dependency fingerprint and force another sync on the next start.
         RuntimeCommand {
             program: "uv".into(),
-            args: vec!["sync".into()],
+            args: vec!["sync".into(), "--frozen".into()],
         }
     } else {
         RuntimeCommand {
             program: LOGIN_SHELL_PATH.into(),
             args: vec![
                 "-lic".into(),
-                shell_command_with_bundled_tool_paths("uv sync"),
+                shell_command_with_bundled_tool_paths("uv sync --frozen"),
             ],
         }
-    }
-}
-
-fn setup_npm_command(project_root: &Path) -> RuntimeCommand {
-    let subcommand = if project_root.join("package-lock.json").exists() {
-        "ci"
-    } else {
-        "install"
-    };
-    if cfg!(windows) {
-        RuntimeCommand {
-            program: "npm.cmd".into(),
-            args: vec![subcommand.into()],
-        }
-    } else {
-        RuntimeCommand {
-            program: LOGIN_SHELL_PATH.into(),
-            args: vec![
-                "-lic".into(),
-                shell_command_with_bundled_tool_paths(
-                    "if [ -f package-lock.json ]; then npm ci; else npm install; fi",
-                ),
-            ],
-        }
-    }
-}
-
-fn ensure_supported_node_version() -> Result<(), String> {
-    let Some(version) = node_version() else {
-        return Err(
-            "无法读取 Node.js 版本。请安装 Node.js 20.19+（20 系列）或 22.12+（22 及更新版本）。"
-                .into(),
-        );
-    };
-    if node_version_supported(&version) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Node.js 版本过低: {version}。请安装 Node.js 20.19+（20 系列）或 22.12+（22 及更新版本）。"
-        ))
-    }
-}
-
-fn node_version() -> Option<String> {
-    let mut command = if cfg!(windows) {
-        let mut command = hidden_command("node");
-        command.args(["-p", "process.versions.node"]);
-        command
-    } else {
-        let version_command =
-            shell_command_with_bundled_tool_paths("node -p \"process.versions.node\"");
-        let mut command = hidden_command(LOGIN_SHELL_PATH);
-        command.args(["-lic", &version_command]);
-        command
-    };
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version)
     }
 }
 
 fn tool_command_name(name: &str) -> &str {
     if cfg!(windows) {
         match name {
-            "npm" => "npm.cmd",
             "uv" => "uv.exe",
             "ffmpeg" => "ffmpeg.exe",
             "ffprobe" => "ffprobe.exe",
@@ -1058,18 +1182,6 @@ fn tool_command_name(name: &str) -> &str {
     } else {
         name
     }
-}
-
-fn node_version_supported(version: &str) -> bool {
-    let parts = version
-        .trim_start_matches('v')
-        .split('.')
-        .filter_map(|part| part.parse::<u32>().ok())
-        .collect::<Vec<_>>();
-    let [major, minor, ..] = parts.as_slice() else {
-        return false;
-    };
-    (*major == 20 && *minor >= 19) || (*major == 22 && *minor >= 12) || *major > 22
 }
 
 fn dependency_marker_matches(project_root: &Path, key: &str, fingerprint: &str) -> bool {
@@ -1088,7 +1200,6 @@ fn dependency_marker_matches(project_root: &Path, key: &str, fingerprint: &str) 
 fn write_dependency_marker(project_root: &Path) -> Result<(), String> {
     let marker = serde_json::json!({
         "python": dependency_fingerprint(project_root, &["pyproject.toml", "uv.lock"]),
-        "node": dependency_fingerprint(project_root, &["package.json", "package-lock.json"]),
     });
     let raw = serde_json::to_string_pretty(&marker)
         .map_err(|error| format!("无法序列化依赖状态: {error}"))?;
@@ -1111,47 +1222,122 @@ fn dependency_fingerprint(project_root: &Path, files: &[&str]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn run_setup_command(project_root: &Path, command: &RuntimeCommand) -> Result<(), String> {
-    let output = hidden_command(&command.program)
+/// Runs one install step with output in setup.log, honoring cancel and a timeout.
+fn run_setup_command(
+    project_root: &Path,
+    command: &RuntimeCommand,
+    log: &File,
+    state: &ServiceState,
+    progress: &dyn Fn(&str),
+) -> Result<(), String> {
+    let label = "Python 依赖";
+    let log_error = |error: std::io::Error| format!("无法写入安装日志: {error}");
+    let mut header = log.try_clone().map_err(log_error)?;
+    let _ = writeln!(header, "\n$ {} {}", command.program, command.args.join(" "));
+    let mut setup = service_command(&command.program);
+    setup
         .args(&command.args)
         .current_dir(project_root)
-        .output()
-        .map_err(|error| format!("准备运行依赖失败: {error}"))?;
-    if output.status.success() {
-        return Ok(());
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().map_err(log_error)?)
+        .stderr(log.try_clone().map_err(log_error)?);
+    let mut child = spawn_managed(&mut setup).map_err(|error| format!("准备{label}失败: {error}"))?;
+
+    let mut last_report = None;
+    let waited = wait_managed_child(&mut child, state, SETUP_COMMAND_TIMEOUT, |elapsed| {
+        let seconds = elapsed.as_secs();
+        if last_report.map_or(true, |last| seconds >= last + 10) {
+            last_report = Some(seconds);
+            progress(&format!(
+                "正在安装{label}（已用时 {seconds} 秒），首次启动可能需要几分钟..."
+            ));
+        }
+    });
+    match waited {
+        Ok(ChildWait::Exited(status)) if status.success() => Ok(()),
+        Ok(ChildWait::Exited(status)) => Err(format!(
+            "准备{label}失败（{status}）。\n{}",
+            log_excerpt("setup")
+        )),
+        Ok(ChildWait::Cancelled) => Err(START_CANCELLED.to_string()),
+        Ok(ChildWait::TimedOut) => Err(format!(
+            "准备{label}超过 {} 分钟仍未完成，已停止。请检查网络后重试。\n{}",
+            SETUP_COMMAND_TIMEOUT.as_secs() / 60,
+            log_excerpt("setup")
+        )),
+        Err(error) => Err(format!("检查{label}安装状态失败: {error}")),
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(format!(
-        "准备运行依赖失败: {}",
-        command_failure_summary(&stderr, &stdout)
-    ))
 }
 
-fn command_failure_summary(stderr: &str, stdout: &str) -> String {
-    let summary = stderr
-        .lines()
-        .chain(stdout.lines())
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    if summary.is_empty() {
-        "命令没有返回错误详情".to_string()
-    } else {
-        summary
+enum ChildWait {
+    Exited(std::process::ExitStatus),
+    Cancelled,
+    TimedOut,
+}
+
+/// Polls a managed child until it exits, the start is cancelled or the timeout
+/// passes. Cancellation, timeout and polling errors stop its whole tree.
+fn wait_managed_child(
+    child: &mut Child,
+    state: &ServiceState,
+    timeout: Duration,
+    mut on_tick: impl FnMut(Duration),
+) -> std::io::Result<ChildWait> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(ChildWait::Exited(status)),
+            Ok(None) => {}
+            Err(error) => {
+                kill_child_tree(child);
+                return Err(error);
+            }
+        }
+        if state.start_cancelled() {
+            kill_child_tree(child);
+            return Ok(ChildWait::Cancelled);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            kill_child_tree(child);
+            return Ok(ChildWait::TimedOut);
+        }
+        on_tick(elapsed);
+        thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(windows)]
+    let _ = stop_pid(child.id(), StopSignal::Kill);
+    // service_command puts the child in its own process group (pgid == pid).
+    #[cfg(not(windows))]
+    let _ = stop_process_group(child.id(), StopSignal::Kill);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn service_command(program: &str) -> Command {
     let mut command = hidden_command(program);
     set_service_process_group(&mut command);
     command
+}
+
+/// Spawns a service or setup process; on Windows it joins the launcher's
+/// kill-on-close job so it cannot outlive the launcher.
+fn spawn_managed(command: &mut Command) -> std::io::Result<Child> {
+    #[cfg(windows)]
+    {
+        crate::job::spawn_in_job(command, CREATE_NO_WINDOW)
+    }
+    #[cfg(not(windows))]
+    {
+        command.spawn()
+    }
+}
+
+fn web_build_present(project_root: &Path) -> bool {
+    project_root.join(WEB_BUILD_INDEX).is_file()
 }
 
 fn hidden_command(program: &str) -> Command {
@@ -1201,6 +1387,7 @@ fn bundled_tool_paths() -> Vec<PathBuf> {
 
 fn tool_path_entries_from_root(root: &Path) -> Vec<PathBuf> {
     if cfg!(windows) {
+        // node is only the JavaScript runtime yt-dlp needs; npm is not shipped.
         ["node", "uv", "ffmpeg"]
             .into_iter()
             .map(|name| root.join(name))
@@ -1252,6 +1439,20 @@ fn bundled_tools_root_from_exe(exe: &Path, platform_dir: &str) -> Option<PathBuf
     }
 }
 
+/// Removes what older versions left in the user's tool folder: a standalone
+/// yt-dlp (now a Python dependency) and temp folders of interrupted downloads.
+pub fn remove_legacy_tool_files() {
+    remove_legacy_tool_files_in(&installed_tools_root());
+}
+
+fn remove_legacy_tool_files_in(root: &Path) {
+    for name in LEGACY_TOOL_DIRS {
+        let _ = fs::remove_dir_all(root.join(name));
+    }
+}
+
+const LEGACY_TOOL_DIRS: [&str; 2] = ["ytdlp", ".tmp"];
+
 fn installed_tools_root() -> PathBuf {
     crate::config::application_support_dir()
         .join("runtime-tools")
@@ -1294,6 +1495,7 @@ fn shell_command_with_bundled_tool_paths(command: &str) -> String {
     command.to_string()
 }
 
+#[cfg(not(windows))]
 fn shell_command_with_tool_paths(command: &str, paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         return command.to_string();
@@ -1307,7 +1509,9 @@ fn shell_command_with_tool_paths(command: &str, paths: &[PathBuf]) -> String {
 }
 
 pub fn endpoint_listening(host: &str, port: u16) -> bool {
-    let Ok(addresses) = (host, port).to_socket_addrs() else {
+    // Connecting to a wildcard address fails on Windows; a service bound there
+    // also answers on loopback.
+    let Ok(addresses) = (service_connect_host(host), port).to_socket_addrs() else {
         return false;
     };
     addresses
@@ -1316,7 +1520,7 @@ pub fn endpoint_listening(host: &str, port: u16) -> bool {
 }
 
 fn course_api_ready(config: &LauncherConfig) -> bool {
-    http_get(&config.api_host, config.api_port, "/api/health").is_some_and(|response| {
+    http_get(&config.web_host, config.web_port, "/api/health").is_some_and(|response| {
         http_response_ok(&response)
             && (response.contains("\"name\":\"Course Navigator\"")
                 || response.contains("\"name\": \"Course Navigator\""))
@@ -1333,10 +1537,64 @@ fn http_response_ok(response: &str) -> bool {
     response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
 }
 
+/// A wildcard bind address accepts connections but cannot be connected to.
+fn service_connect_host(host: &str) -> &str {
+    match host.trim() {
+        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        host => host,
+    }
+}
+
+/// Sends a JSON request to the running service, which serves the API on the
+/// web port.
+pub(crate) fn send_service_json(
+    config: &LauncherConfig,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let host = service_connect_host(&config.web_host);
+    let addr = (host, config.web_port)
+        .to_socket_addrs()
+        .map_err(|error| format!("无法解析服务地址: {error}"))?
+        .next()
+        .ok_or_else(|| "无法解析服务地址".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+        .map_err(|error| format!("无法连接服务: {error}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(1200)));
+
+    let raw = body
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("无法序列化服务请求: {error}"))?
+        .unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        config.web_port,
+        raw.len(),
+        raw
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("无法写入服务请求: {error}"))?;
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    if response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2") {
+        Ok(())
+    } else {
+        let status = response.lines().next().unwrap_or("无响应");
+        Err(format!("服务请求 {path} 失败: {status}"))
+    }
+}
+
 fn http_get(host: &str, port: u16, path: &str) -> Option<String> {
+    let host = service_connect_host(host);
     let address = (host, port).to_socket_addrs().ok()?.next()?;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(220)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    // A closed port fails at connect; a live dev server can take over half a
+    // second to answer its first requests, which must not read as "down".
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).ok()?;
@@ -1372,38 +1630,150 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(windows))]
-    fn api_command_uses_configured_port() {
-        let command = api_command(&config());
-        assert_eq!(command.program, LOGIN_SHELL_PATH);
-        assert!(command
-            .args
-            .iter()
-            .any(|arg| arg.contains("uv run uvicorn")));
-        assert!(command.args.iter().any(|arg| arg.contains("--port 8100")));
+    fn project_root_matches_only_whole_paths() {
+        let config = config();
+        assert!(matches_project_root("python /repo/.venv/bin/python -m x", None, &config));
+        assert!(matches_project_root("node \"/repo\" --port 5188", None, &config));
+        assert!(matches_project_root("node /repo", None, &config));
+        assert!(!matches_project_root("python /repo-other/.venv/bin/python", None, &config));
+        assert!(!matches_project_root("python /repository/app.py", None, &config));
+        assert!(!matches_project_root("node /archive/repo/node_modules/.bin/vite --port 15173", None, &config));
+        assert!(matches_project_root("uvicorn app --app-dir=/repo/backend", None, &config));
+        assert!(matches_project_root("python app.py", Some("/repo/backend"), &config));
+        assert!(!matches_project_root("python app.py", Some("/repo-other"), &config));
+    }
+
+    #[test]
+    fn an_unresponsive_service_still_counts_as_running_for_destructive_work() {
+        // Accepts connections but never answers, like a busy or stuck service.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind web port");
+        let mut config = config();
+        config.web_port = listener.local_addr().expect("web addr").port();
+
+        assert!(!configured_services_listening(&config));
+        assert!(service_may_be_running(None, &config));
+        assert!(crate::asr_cache::cleanup(None, &config).is_err());
+
+        drop(listener);
+        assert!(!service_may_be_running(Some(&ServiceState::new()), &config));
+    }
+
+    #[test]
+    fn a_silent_service_on_a_wildcard_address_blocks_cleanup_and_model_save() {
+        let listener = TcpListener::bind("0.0.0.0:0").expect("bind wildcard web port");
+        let (root, audio) = project_with_cached_audio("wildcard");
+
+        let mut config = config();
+        config.project_root = root.to_string_lossy().to_string();
+        config.web_host = "0.0.0.0".into();
+        config.web_port = listener.local_addr().expect("web addr").port();
+
+        assert!(endpoint_listening(&config.web_host, config.web_port));
+        assert!(!configured_services_listening(&config));
+        assert!(service_may_be_running(None, &config));
+        let error = crate::asr_cache::cleanup(None, &config).expect_err("cleanup refused");
+        assert!(error.contains("服务没有响应"), "{error}");
+        assert_eq!(std::fs::read(&audio).expect("cached audio kept"), b"audio");
+        let error = crate::model_config::set_online_asr_provider(None, &config, "openai")
+            .expect_err("save reports the unsynced service");
+        assert!(error.contains("服务没有响应"), "{error}");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_live_child_counts_as_running_before_its_port_listens() {
+        let (root, audio) = project_with_cached_audio("live-child");
+
+        let mut config = config();
+        config.project_root = root.to_string_lossy().to_string();
+        config.web_port = unused_local_port();
+
+        #[cfg(windows)]
+        let mut command = Command::new("ping");
+        #[cfg(windows)]
+        command.args(["-n", "60", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let mut command = Command::new("sleep");
+        #[cfg(not(windows))]
+        command.arg("60");
+        let child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn long-running child");
+        let state = ServiceState::new();
+        *state.service.lock().expect("service lock") = Some(child);
+
+        assert!(!any_configured_service_listening(&config));
+        assert!(service_may_be_running(Some(&state), &config));
+        let error = crate::asr_cache::cleanup(Some(&state), &config).expect_err("cleanup refused");
+        assert!(error.contains("服务没有响应"), "{error}");
+        assert_eq!(std::fs::read(&audio).expect("cached audio kept"), b"audio");
+        let error = crate::model_config::set_online_asr_provider(Some(&state), &config, "openai")
+            .expect_err("save reports the unsynced service");
+        assert!(error.contains("服务没有响应"), "{error}");
+
+        if let Some(mut child) = state.service.lock().expect("service lock").take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_requests_never_connect_to_a_wildcard_address() {
+        assert_eq!(service_connect_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(service_connect_host("::"), "127.0.0.1");
+        assert_eq!(service_connect_host("localhost"), "localhost");
+    }
+
+    #[test]
+    fn service_requests_use_the_web_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind web port");
+        let mut config = config();
+        config.web_port = listener.local_addr().expect("web addr").port();
+        config.api_port = unused_local_port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let size = stream.read(&mut buffer).expect("read request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .expect("write response");
+            String::from_utf8_lossy(&buffer[..size]).to_string()
+        });
+
+        send_service_json(&config, "PUT", "/api/settings/model", Some(&serde_json::json!({})))
+            .expect("request reaches the web port");
+        assert!(server.join().expect("server").starts_with("PUT /api/settings/model HTTP/1.1"));
     }
 
     #[test]
     #[cfg(not(windows))]
-    fn web_command_uses_configured_port() {
-        let command = web_command(&config());
+    fn app_command_serves_on_the_web_port() {
+        let command = app_command(&config());
         assert_eq!(command.program, LOGIN_SHELL_PATH);
-        assert!(command.args.iter().any(|arg| arg.contains("npm run dev")));
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg.contains("uv run --frozen uvicorn")));
         assert!(command.args.iter().any(|arg| arg.contains("--port 5188")));
     }
 
     #[test]
     #[cfg(windows)]
-    fn windows_runtime_commands_do_not_depend_on_unix_shell() {
-        let api = api_command(&config());
-        let web = web_command(&config());
+    fn windows_app_command_does_not_depend_on_unix_shell() {
+        let app = app_command(&config());
 
-        assert_ne!(api.program, LOGIN_SHELL_PATH);
-        assert_eq!(api.program, "uv");
+        assert_ne!(app.program, LOGIN_SHELL_PATH);
+        assert_eq!(app.program, "uv");
         assert_eq!(
-            api.args,
+            app.args,
             vec![
                 "run",
+                "--frozen",
                 "uvicorn",
                 "course_navigator.app:app",
                 "--app-dir",
@@ -1411,14 +1781,34 @@ mod tests {
                 "--host",
                 "127.0.0.1",
                 "--port",
-                "8100"
+                "5188"
             ]
         );
-        assert_eq!(web.program, "npm.cmd");
-        assert_eq!(
-            web.args,
-            vec!["run", "dev", "--", "--host", "127.0.0.1", "--port", "5188"]
-        );
+    }
+
+    #[test]
+    fn pages_and_api_share_the_web_origin() {
+        assert_eq!(web_url(&config()), "http://127.0.0.1:5188");
+        assert_eq!(api_url(&config()), "http://127.0.0.1:5188/api");
+    }
+
+    #[test]
+    fn start_requires_the_built_web_pages() {
+        let root = temp_project_dir("missing-web-build");
+        let mut config = config();
+        config.project_root = root.display().to_string();
+        config.web_port = unused_local_port();
+        let state = ServiceState::new();
+
+        let error = start_project_services(&state, &config, &|_| {}).expect_err("no build");
+
+        assert!(error.contains("frontend"));
+        assert!(error.contains("npm run build"));
+        assert!(!owns_services(&state));
+        std::fs::create_dir_all(root.join("frontend/dist")).expect("dist");
+        std::fs::write(root.join(WEB_BUILD_INDEX), "<title>Course Navigator</title>").expect("index");
+        assert!(web_build_present(&root));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1447,6 +1837,174 @@ mod tests {
         let joined = runtime_tool_paths_env_value_from(&paths).expect("join tool paths");
 
         assert_eq!(env::split_paths(&joined).collect::<Vec<_>>(), paths);
+    }
+
+    #[test]
+    fn only_one_start_or_stop_runs_at_a_time() {
+        let state = ServiceState::new();
+        let guard = state.begin_operation("starting", "正在检查运行依赖...");
+        assert!(guard.is_some());
+        assert!(state.begin_operation("stopping", "正在停止").is_none());
+        assert_eq!(state.current_operation().map(|op| op.state), Some("starting"));
+        drop(guard);
+        assert!(state.current_operation().is_none());
+        assert!(state.begin_operation("stopping", "正在停止").is_some());
+    }
+
+    #[test]
+    fn stop_request_cancels_only_a_running_start() {
+        let state = ServiceState::new();
+        assert!(!state.request_start_cancel());
+        assert!(!state.start_cancelled());
+
+        let guard = state.begin_operation("starting", "正在启动");
+        assert!(state.request_start_cancel());
+        assert!(state.start_cancelled());
+        assert_eq!(
+            state.current_operation().map(|op| op.message),
+            Some("正在取消启动...".to_string())
+        );
+        drop(guard);
+
+        // A new start clears the previous cancellation.
+        let _guard = state.begin_operation("starting", "正在启动");
+        assert!(!state.start_cancelled());
+    }
+
+    fn long_running_command() -> Command {
+        let mut command = if cfg!(windows) {
+            let mut command = service_command("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = service_command("sleep");
+            command.arg("30");
+            command
+        };
+        command.stdout(Stdio::null());
+        command
+    }
+
+    #[test]
+    fn waiting_on_a_child_stops_it_on_timeout_or_cancelled_start() {
+        let state = ServiceState::new();
+        let _guard = state.begin_operation("starting", "正在启动");
+
+        let mut child = spawn_managed(&mut long_running_command()).unwrap();
+        let started = Instant::now();
+        let waited = wait_managed_child(&mut child, &state, Duration::from_millis(300), |_| {});
+        assert!(matches!(waited, Ok(ChildWait::TimedOut)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.try_wait().unwrap().is_some());
+
+        let mut child = spawn_managed(&mut long_running_command()).unwrap();
+        assert!(state.request_start_cancel());
+        let waited = wait_managed_child(&mut child, &state, Duration::from_secs(60), |_| {});
+        assert!(matches!(waited, Ok(ChildWait::Cancelled)));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn netstat_rows_yield_only_listeners_on_the_port() {
+        let output = "\
+活动连接
+
+  协议  本地地址          外部地址        状态           PID
+  TCP    0.0.0.0:15173          0.0.0.0:0              侦听           4100
+  TCP    127.0.0.1:15173        127.0.0.1:52000        ESTABLISHED     4100
+  TCP    127.0.0.1:52000        127.0.0.1:15173        ESTABLISHED     7300
+  TCP    0.0.0.0:151730         0.0.0.0:0              LISTENING       8800
+  TCP    0.0.0.0:5173           0.0.0.0:0              LISTENING       8801
+  TCP    [::]:15173             [::]:0                 LISTENING       4200
+  UDP    0.0.0.0:15173          *:*                                    9900
+";
+        assert_eq!(listening_pids_in_netstat(output, 15173), vec![4100, 4200]);
+        assert!(listening_pids_in_netstat(output, 8000).is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn listening_pids_finds_a_live_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(listening_pids(port), vec![std::process::id()]);
+    }
+
+    #[test]
+    fn waiting_for_idle_reports_a_stuck_operation() {
+        let state = ServiceState::new();
+        assert!(state.wait_for_idle(Duration::from_millis(10)));
+        let _guard = state.begin_operation("starting", "正在启动");
+        assert!(!state.wait_for_idle(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn log_excerpt_keeps_the_last_non_empty_lines() {
+        let text = "one\n\ntwo\r\nthree  \n   \nfour\n";
+        assert_eq!(last_lines(text, 3), "two\nthree\nfour");
+        assert_eq!(last_lines(text, 10), "one\ntwo\nthree\nfour");
+        assert_eq!(last_lines("", 3), "");
+    }
+
+    /// Real start/stop against a prepared project copy with installed
+    /// dependencies. Opt-in: set COURSE_NAVIGATOR_E2E_PROJECT and run with
+    /// `cargo test --lib real_start -- --ignored --nocapture`. APPDATA is
+    /// redirected so logs and the dependency marker stay out of the user's data.
+    #[test]
+    #[ignore]
+    fn real_start_reports_ready_services_and_exited_processes() {
+        let Some(project) = env::var_os("COURSE_NAVIGATOR_E2E_PROJECT") else {
+            return;
+        };
+        let project = PathBuf::from(project);
+        let support = project.join(".e2e-appdata");
+        env::set_var("APPDATA", &support);
+        env::set_var("HOME", &support);
+        write_dependency_marker(&project).expect("dependency marker");
+
+        let mut config = config();
+        config.project_root = project.display().to_string();
+        config.workspace_dir = project.join("workspace").display().to_string();
+        config.api_port = unused_local_port();
+        config.web_port = unused_local_port();
+        let state = ServiceState::new();
+        // Stop the services even when an assertion fails, or they outlive the test.
+        struct StopOnDrop<'a>(&'a ServiceState, &'a LauncherConfig);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                let _ = stop_configured_services(self.0, self.1);
+            }
+        }
+        let _stop = StopOnDrop(&state, &config);
+        let messages = Mutex::new(Vec::<String>::new());
+        let progress = |message: &str| messages.lock().unwrap().push(message.to_string());
+
+        let started = Instant::now();
+        let result = start_project_services(&state, &config, &progress);
+        println!("start: {:?} after {:?}", result, started.elapsed());
+        println!("progress: {:?}", messages.lock().unwrap());
+        assert!(result.is_ok());
+        assert!(configured_services_listening(&config));
+        assert!(fs::read_to_string(log_path(SERVICE_LOG)).unwrap().contains("Uvicorn running"));
+        // Launcher requests pass the service's host check. A read keeps the
+        // project's .env and caches untouched.
+        send_service_json(&config, "GET", "/api/settings/asr-cache", None).expect("launcher request");
+        assert!(stop_configured_services(&state, &config).expect("stop"));
+        assert!(!any_configured_service_listening(&config));
+
+        // A service that exits during startup is reported at once with its log.
+        let backend = project.join("backend");
+        let hidden = project.join("backend-hidden");
+        fs::rename(&backend, &hidden).expect("hide backend");
+        let started = Instant::now();
+        let result = start_project_services(&state, &config, &progress);
+        fs::rename(&hidden, &backend).expect("restore backend");
+        let _ = stop_configured_services(&state, &config);
+        println!("broken start: {:?} after {:?}", result, started.elapsed());
+        let error = result.expect_err("start without backend must fail");
+        assert!(error.contains("服务进程已退出"));
+        assert!(error.contains("完整日志"));
+        assert!(started.elapsed() < SERVICE_START_TIMEOUT);
     }
 
     #[test]
@@ -1481,18 +2039,29 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let occupied_port = listener.local_addr().expect("read listener address").port();
         let mut config = config();
-        config.api_port = occupied_port;
+        config.web_port = occupied_port;
+
+        let (resolved, messages) = resolve_available_ports(&config);
+
+        assert_ne!(resolved.web_port, occupied_port);
+        assert!(!endpoint_listening("127.0.0.1", resolved.web_port));
+        assert_eq!(resolved.api_port, config.api_port);
+        assert!(messages
+            .iter()
+            .any(|message| message.contains(&format!("网页端口 {occupied_port} 被占用"))));
+    }
+
+    #[test]
+    fn resolve_available_ports_ignores_the_unused_api_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let mut config = config();
+        config.api_port = listener.local_addr().expect("read listener address").port();
         config.web_port = unused_local_port();
 
         let (resolved, messages) = resolve_available_ports(&config);
 
-        assert_ne!(resolved.api_port, occupied_port);
-        assert!(!endpoint_listening("127.0.0.1", resolved.api_port));
-        assert_ne!(resolved.api_port, resolved.web_port);
-        assert!(!endpoint_listening("127.0.0.1", resolved.web_port));
-        assert!(messages
-            .iter()
-            .any(|message| message.contains(&format!("API 端口 {occupied_port} 被占用"))));
+        assert_eq!(resolved, config);
+        assert!(messages.is_empty());
     }
 
     #[test]
@@ -1505,6 +2074,18 @@ mod tests {
             None,
             &config(),
             8100
+        ));
+    }
+
+    #[test]
+    fn project_service_command_matches_app_on_web_port() {
+        let command = "uv run --frozen uvicorn course_navigator.app:app --app-dir backend --host 127.0.0.1 --port 5188";
+
+        assert!(is_project_service_command_with_cwd(
+            command,
+            Some("/repo"),
+            &config(),
+            5188
         ));
     }
 
@@ -1589,16 +2170,6 @@ mod tests {
             parse_lsof_cwd(raw),
             Some("/Users/example/Course Navigator".to_string())
         );
-    }
-
-    #[test]
-    fn node_version_gate_matches_vite_requirement() {
-        assert!(!node_version_supported("20.18.1"));
-        assert!(node_version_supported("20.19.0"));
-        assert!(!node_version_supported("21.7.0"));
-        assert!(!node_version_supported("22.11.0"));
-        assert!(node_version_supported("22.12.0"));
-        assert!(node_version_supported("23.0.0"));
     }
 
     #[test]
@@ -1744,7 +2315,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn project_setup_commands_install_missing_python_and_node_dependencies() {
+    fn project_setup_commands_install_missing_python_dependencies_only() {
         let root = temp_project_dir("setup-missing");
         std::fs::write(root.join("package-lock.json"), "{}").expect("package lock");
 
@@ -1752,19 +2323,10 @@ mod tests {
 
         assert_eq!(
             commands,
-            vec![
-                RuntimeCommand {
-                    program: LOGIN_SHELL_PATH.into(),
-                    args: vec!["-lic".into(), "uv sync".into()],
-                },
-                RuntimeCommand {
-                    program: LOGIN_SHELL_PATH.into(),
-                    args: vec![
-                        "-lic".into(),
-                        "if [ -f package-lock.json ]; then npm ci; else npm install; fi".into()
-                    ],
-                },
-            ]
+            vec![RuntimeCommand {
+                program: LOGIN_SHELL_PATH.into(),
+                args: vec!["-lic".into(), "uv sync --frozen".into()],
+            }]
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1777,18 +2339,13 @@ mod tests {
 
         let commands = project_setup_commands(&root);
 
+        // The web pages ship prebuilt; npm is never needed at runtime.
         assert_eq!(
             commands,
-            vec![
-                RuntimeCommand {
-                    program: "uv".into(),
-                    args: vec!["sync".into()],
-                },
-                RuntimeCommand {
-                    program: "npm.cmd".into(),
-                    args: vec!["ci".into()],
-                },
-            ]
+            vec![RuntimeCommand {
+                program: "uv".into(),
+                args: vec!["sync".into(), "--frozen".into()],
+            }]
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1800,6 +2357,22 @@ mod tests {
 
         assert!(args.iter().any(|arg| arg == "/T"));
         assert!(args.iter().any(|arg| arg == "/F"));
+    }
+
+    #[test]
+    fn legacy_tool_files_are_removed_but_media_tools_stay() {
+        let root = temp_project_dir("legacy-tools");
+        for dir in LEGACY_TOOL_DIRS {
+            std::fs::create_dir_all(root.join(dir).join("leftover")).expect("legacy dir");
+        }
+        std::fs::create_dir_all(root.join("ffmpeg")).expect("ffmpeg dir");
+        std::fs::write(root.join("ffmpeg/ffmpeg.exe"), "ffmpeg").expect("ffmpeg");
+
+        remove_legacy_tool_files_in(&root);
+
+        assert!(LEGACY_TOOL_DIRS.iter().all(|dir| !root.join(dir).exists()));
+        assert!(root.join("ffmpeg/ffmpeg.exe").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1832,6 +2405,9 @@ mod tests {
         assert!(dependencies
             .iter()
             .all(|dependency| !dependency.purpose.contains("准备")));
+        assert!(dependencies
+            .iter()
+            .all(|dependency| dependency.name != "node" && dependency.name != "npm"));
     }
 
     #[test]
@@ -1899,25 +2475,34 @@ mod tests {
         std::fs::write(root.join("package-lock.json"), "{\"version\":1}").expect("package lock");
         write_dependency_marker(&root).expect("marker");
 
-        std::fs::write(root.join("uv.lock"), "uv-v2").expect("update uv lock");
         std::fs::write(root.join("package-lock.json"), "{\"version\":2}")
             .expect("update package lock");
+        assert!(project_setup_commands(&root).is_empty());
 
+        std::fs::write(root.join("uv.lock"), "uv-v2").expect("update uv lock");
         let commands = project_setup_commands(&root);
 
-        assert_eq!(commands.len(), 2);
-        let expected_uv_arg = if cfg!(windows) { "sync" } else { "uv sync" };
-        let expected_npm_arg = if cfg!(windows) { "ci" } else { "npm ci" };
-        assert!(commands[0].args.iter().any(|arg| arg == expected_uv_arg));
-        assert!(commands[1]
-            .args
-            .iter()
-            .any(|arg| arg.contains(expected_npm_arg)));
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], setup_uv_command());
         let _ = std::fs::remove_dir_all(root);
     }
 
-    fn temp_project_dir(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
+    /// A project with one model profile and one cached audio file.
+    fn project_with_cached_audio(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = temp_project_dir(label);
+        std::fs::write(
+            root.join(".env"),
+            r#"COURSE_NAVIGATOR_MODEL_PROFILES="[{\"id\":\"default\",\"name\":\"Test\",\"provider_type\":\"openai\",\"base_url\":\"https://api.example.com/v1\",\"model\":\"test\",\"api_key\":\"sk-test\"}]"
+"#,
+        )
+        .expect("write project env");
+        let audio = root.join(".course-navigator/subtitles/item/audio.mp3");
+        std::fs::create_dir_all(audio.parent().expect("audio dir")).expect("create cache dir");
+        std::fs::write(&audio, b"audio").expect("write cached audio");
+        (root, audio)
+    }
+
+    fn temp_project_dir(label: &str) -> std::path::PathBuf {        let root = std::env::temp_dir().join(format!(
             "course-navigator-runtime-{label}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

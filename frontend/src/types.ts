@@ -22,6 +22,11 @@ export type OutlineNode = {
 };
 
 export type StudyMaterial = {
+  output_language?: OutputLanguage | null;
+  input_fingerprint?: string | null;
+  generation_version?: number | null;
+  learning_complete?: boolean;
+  translation_complete?: boolean;
   one_line: string;
   translated_title?: string | null;
   context_summary?: string | null;
@@ -257,6 +262,9 @@ export type VideoMetadata = {
 };
 
 export type CourseItem = {
+  instance_id?: string;
+  source_identity?: string | null;
+  media_revision?: number;
   id: string;
   source_url: string;
   title: string;
@@ -269,6 +277,7 @@ export type CourseItem = {
   created_at: string;
   transcript: TranscriptSegment[];
   transcript_source?: TranscriptSource | null;
+  transcript_language?: string | null;
   metadata?: VideoMetadata | null;
   study: StudyMaterial | null;
   video_source_type?: VideoSourceType;
@@ -288,6 +297,7 @@ export type CourseShareItem = {
   created_at?: string | null;
   transcript: TranscriptSegment[];
   transcript_source?: TranscriptSource | null;
+  transcript_language?: string | null;
   metadata?: VideoMetadata | null;
   study?: StudyMaterial | null;
 };
