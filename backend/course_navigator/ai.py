@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1528,55 +1529,14 @@ def _normalize_language_code(language: str | None) -> str:
     return language_family(language)
 
 
-def _looks_like_short_latin_text(value: str) -> bool:
-    tokens = re.findall(r"[A-Za-z][A-Za-z']*", value)
-    if not tokens:
-        return False
-    ignored = {
-        "ai",
-        "api",
-        "asr",
-        "gpt",
-        "llm",
-        "rag",
-        "url",
-        "chatgpt",
-        "gemini",
-        "claude",
-        "youtube",
-        "deeplearning",
-        "deeplearningai",
-    }
-    for token in tokens:
-        normalized = token.lower().replace("'", "")
-        if normalized in ignored:
-            continue
-        if token.isupper() and len(token) <= 6:
-            continue
-        return True
-    return False
-
-
 def _text_needs_output_language_repair(value: str, output_language: OutputLanguage) -> bool:
+    # Only decides whether to ask the model; the repair call itself keeps names,
+    # acronyms and identifiers, so a field that is just "RAG" costs one call.
     text = value.strip()
-    if not text:
-        return False
-    if output_language == "zh-CN":
-        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
-        latin_count = len(re.findall(r"[A-Za-z]", text))
-        if cjk_count >= 2 or not latin_count:
-            return False
-        return _looks_like_short_latin_text(text)
-    if output_language == "ja":
-        kana_count = len(re.findall(r"[\u3040-\u30ff]", text))
-        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
-        latin_count = len(re.findall(r"[A-Za-z]", text))
-        if kana_count >= 2 or cjk_count >= 2 or not latin_count:
-            return False
-        return _looks_like_short_latin_text(text)
-    cjk_or_kana_count = len(re.findall(r"[\u3040-\u30ff\u4e00-\u9fff]", text))
-    latin_word_count = len(re.findall(r"[A-Za-z][A-Za-z']+", text))
-    return cjk_or_kana_count >= 4 and latin_word_count < 4
+    has_cjk_or_kana = re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", text) is not None
+    if output_language in ("zh-CN", "ja"):
+        return re.search(r"[A-Za-z]", text) is not None and not has_cjk_or_kana
+    return has_cjk_or_kana
 
 
 def _chunk_indices(indices: list[int], target_size: int) -> list[list[int]]:
@@ -1623,7 +1583,9 @@ def _translate_chunk_with_provider(
                     "Use the course title, course summary, and context reference as background "
                     "context for term consistency. "
                     "Return strict JSON only: {\"translated_transcript\":[{\"start\":number,\"end\":number,\"text\":string}]}. "
-                    "Preserve the segment count, order, start, and end values exactly. Do not summarize."
+                    "Preserve the segment count, order, start, and end values exactly. Do not summarize. "
+                    "A sentence often spans several segments: translate it as a whole, then split the "
+                    "translation over those segments in order so each holds the part spoken in its time."
                 ),
             },
             {
@@ -1664,8 +1626,8 @@ def _generate_translation_context(
     output_language: OutputLanguage,
     metadata: VideoMetadata | None = None,
 ) -> str:
-    transcript_text = _full_transcript_for_prompt(transcript)
     metadata_reference = _metadata_prompt_reference(metadata)
+    transcript_text = _whole_course_transcript_for_prompt(transcript, provider, f"{title}\n{metadata_reference}")
     payload = _chat_json(
         provider,
         [
@@ -1684,7 +1646,7 @@ def _generate_translation_context(
                 "content": (
                     f"Title: {title}\n"
                     f"{metadata_reference}"
-                    f"Full transcript:\n{transcript_text}"
+                    f"{transcript_text}"
                 ),
             },
         ],
@@ -1704,7 +1666,7 @@ def _generate_guidance_with_provider(
     provider: LlmProvider,
     output_language: OutputLanguage,
 ) -> dict[str, object]:
-    transcript_text = _full_transcript_for_prompt(transcript)
+    transcript_text = _whole_course_transcript_for_prompt(transcript, provider, f"{title}\n{context_summary}")
     target_language = _target_language_name(output_language)
     payload = _chat_json(
         provider,
@@ -1730,7 +1692,7 @@ def _generate_guidance_with_provider(
                 "content": (
                     f"Title: {title}\n"
                     f"Summary: {context_summary}\n"
-                    f"Full transcript:\n{transcript_text}"
+                    f"{transcript_text}"
                 ),
             },
         ],
@@ -1822,9 +1784,10 @@ def _generate_semantic_ranges_with_provider(
                             "This call only discovers structure; do not summarize every block in detail. "
                             "Use real teaching-topic boundaries, not fixed line counts. Prefer boundaries at "
                             "concept shifts, new examples, transitions, exercises, or conclusion markers. "
-                            "Return strict JSON only: {\"blocks\":[{\"start\":number,\"end\":number,"
-                            "\"title\":string,\"summary\":string,\"priority\":\"focus|skim|skip|review\","
-                            "\"boundary_reason\":string,\"confidence\":number}]}. "
+                            "Return strict JSON only: {\"blocks\":[{\"start\":seconds,\"end\":seconds,"
+                            "\"title\":string,\"summary\":string}]}. "
+                            "start and end are seconds from the start of the video, read from the [mm:ss] "
+                            "timestamps; they are not line numbers. "
                             f"All user-visible strings except proper nouns, product names, code identifiers, and "
                             f"short abbreviations must be written in {target_language}. "
                             f"Target block duration is about {_duration_label(strategy.target_block_seconds)}; "
@@ -1880,23 +1843,21 @@ def _validate_semantic_ranges(
         except (TypeError, ValueError):
             continue
         title = str(raw.get("title") or "").strip()
-        summary = str(raw.get("summary") or raw.get("boundary_reason") or "").strip()
+        summary = str(raw.get("summary") or "").strip()
         if not title:
             title = _fallback_range_title(index, output_language)
         if not summary:
             summary = title
-        priority = _normalize_time_range({"priority": raw.get("priority", "skim")})["priority"]
-        ranges.append(
-            TimeRange(
-                start=start,
-                end=end,
-                title=title,
-                summary=summary,
-                priority=priority,
-            )
-        )
+        ranges.append(TimeRange(start=start, end=end, title=title, summary=summary, priority="skim"))
     if not ranges:
         raise ValueError("Semantic segmentation returned no blocks")
+    # Line numbers or minutes given in place of seconds end far from the real
+    # timeline end; repairing them would silently become fixed-length blocks.
+    timeline_start = transcript[0].start
+    duration = _transcript_duration(transcript)
+    covered_until = max(time_range.end for time_range in ranges)
+    if covered_until - timeline_start < duration * 0.8 or covered_until > transcript[-1].end + max(60, duration * 0.2):
+        raise ValueError("Semantic segmentation times do not match the transcript timeline")
     repaired = _repair_time_ranges(ranges, transcript, output_language, strategy)
     if not repaired:
         raise ValueError("Semantic segmentation could not be repaired")
@@ -2081,9 +2042,36 @@ def _neighbor_context(ranges: list[TimeRange], index: int) -> str:
 
 
 def _full_transcript_for_prompt(transcript: list[TranscriptSegment]) -> str:
-    return "\n".join(
+    return "\n".join(_transcript_prompt_lines(transcript))
+
+
+def _transcript_prompt_lines(transcript: list[TranscriptSegment]) -> list[str]:
+    return [
         f"{index + 1}. [{_format_time(segment.start)}-{_format_time(segment.end)}] {segment.text}"
         for index, segment in enumerate(transcript)
+    ]
+
+
+def _whole_course_transcript_for_prompt(
+    transcript: list[TranscriptSegment],
+    provider: LlmProvider,
+    other_text: str,
+) -> str:
+    """The full transcript, or evenly spaced lines of it when the full one
+    would overflow the model's context window and fail the request."""
+    lines = _transcript_prompt_lines(transcript)
+    full = "\n".join(lines)
+    if not provider.context_window:
+        return f"Full transcript:\n{full}"
+    budget = max(1000, int(provider.context_window * 0.72) - _estimate_text_tokens(other_text) - 2400)
+    tokens = _estimate_text_tokens(full)
+    if tokens <= budget:
+        return f"Full transcript:\n{full}"
+    step = math.ceil(tokens / budget)
+    excerpt = "\n".join(lines[::step])
+    return (
+        f"Transcript excerpt (1 line in every {step}; the full transcript is longer than the model's context window):\n"
+        f"{excerpt}"
     )
 
 
@@ -2419,7 +2407,6 @@ def _generate_existing_range_block_with_provider(
             translated_chunk=translated_chunk,
             context_summary=context_summary,
             structure=structure,
-            detailed_notes=detailed_notes,
             provider=provider,
             output_language=output_language,
             detail_level=detail_level,
@@ -2503,13 +2490,12 @@ def _generate_learning_block_with_provider(
         translated_chunk=translated_chunk,
         context_summary=context_summary,
         structure=structure,
-        detailed_notes=detailed_notes,
         provider=provider,
         output_language=output_language,
         detail_level=detail_level,
     )
 
-    priority = str(structure.get("priority") or fallback["priority"]).lower()
+    priority =str(structure.get("priority") or fallback["priority"]).lower()
     if priority not in {"focus", "skim", "skip", "review"}:
         priority = fallback["priority"]
     key_points = _normalize_key_points(structure.get("key_points"))
@@ -2553,6 +2539,9 @@ def _generate_learning_block_structure_with_provider(
                     f"All user-visible strings except proper nouns, product names, code identifiers, and short "
                     f"abbreviations must be written in {target_language}. The title should be short. "
                     "The summary should explain the block in one or two sentences. "
+                    "priority tells the learner how to treat the block: focus carries the course's main ideas; "
+                    "skim is supporting detail; skip has little learning value, such as greetings, logistics, "
+                    "or repetition; review is dense or easy to forget and worth revisiting. "
                     "key_points must extract concrete concepts, claims, methods, examples, steps, warnings, "
                     "definitions, comparisons, transitions, or uncertainties rather than generic topic names. "
                     "Use evidence to briefly identify what transcript content supports each point. "
@@ -2713,7 +2702,6 @@ def _generate_learning_block_high_fidelity_with_provider(
     translated_chunk: list[TranscriptSegment],
     context_summary: str,
     structure: dict,
-    detailed_notes: str,
     provider: LlmProvider,
     output_language: OutputLanguage,
     detail_level: StudyDetailLevel,
@@ -2727,7 +2715,7 @@ def _generate_learning_block_high_fidelity_with_provider(
                 "role": "system",
                 "content": (
                     f"Write the high-fidelity detailed layer for one course learning block in {target_language}. "
-                    "Use only the provided transcript, course context, learning-block structure, and interpretation. "
+                    "Use only the provided transcript, course context, and learning-block structure. "
                     "Do not add facts outside the transcript. Do not flatten several distinct claims into one "
                     "generic sentence. Do not output a raw subtitle dump. "
                     "Return strict JSON only: {\"high_fidelity_text\": string}. "
@@ -2747,8 +2735,6 @@ def _generate_learning_block_high_fidelity_with_provider(
                     _learning_block_user_context(title, index, source_chunk, translated_chunk, context_summary)
                     + "\n\nLearning block structure:\n"
                     + json.dumps(_serializable_learning_block_structure(structure), ensure_ascii=False)
-                    + "\n\nInterpretation detailed_notes:\n"
-                    + detailed_notes
                 ),
             },
         ],
@@ -2864,10 +2850,10 @@ def _generate_outline_with_provider(
                     "Use only the block index. Merge adjacent blocks when they form one topic. "
                     "Create up to three visible levels whenever the material supports it: "
                     "level 1 for major topics, level 2 for subtopics, and level 3 for concrete "
-                    "concepts, examples, claims, caveats, or steps. If the course is short, still "
-                    "prefer topic -> subtopic -> concrete point instead of stopping at two levels. "
-                    "Return strict JSON only: {\"outline\":[{\"id\":string,\"start\":number,\"end\":number,"
+                    "concepts, examples, claims, caveats, or steps. "
+                    "Return strict JSON only: {\"outline\":[{\"id\":string,\"start\":seconds,\"end\":seconds,"
                     "\"title\":string,\"summary\":string,\"children\":array}]}. "
+                    "start and end are seconds from the start of the video. "
                     "Include source block ids such as block-2 or block-2_block-3 inside every id so "
                     "timestamps can be calibrated."
                 ),
@@ -3418,20 +3404,6 @@ def _trim_for_json_repair(content: str, limit: int = 24000) -> str:
     if len(content) <= limit:
         return content
     return f"{content[: limit // 2]}\n...truncated middle...\n{content[-limit // 2 :]}"
-
-
-def _normalize_time_range(payload: dict) -> dict:
-    normalized = dict(payload)
-    priority = str(normalized.get("priority", "skim")).lower()
-    normalized["priority"] = {
-        "high": "focus",
-        "important": "focus",
-        "must": "focus",
-        "medium": "skim",
-        "low": "skip",
-        "hard": "review",
-    }.get(priority, priority if priority in {"focus", "skim", "skip", "review"} else "skim")
-    return normalized
 
 
 def _normalize_outline_node(payload: dict) -> dict:

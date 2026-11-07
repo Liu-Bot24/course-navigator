@@ -586,17 +586,17 @@ def test_learning_block_layers_reject_empty_model_output(monkeypatch):
     with pytest.raises(ValueError):
         ai._generate_learning_block_interpretation_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful")
     with pytest.raises(ValueError):
-        ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, "notes", provider, "zh-CN", "faithful")
+        ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful")
 
     monkeypatch.setattr(ai, "_chat_json", lambda *args, **kwargs: {"detailed_notes": ["解读"], "high_fidelity_text": {"error": "generation failed"}})
     with pytest.raises(ValueError):
         ai._generate_learning_block_interpretation_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful")
     with pytest.raises(ValueError):
-        ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, "notes", provider, "zh-CN", "faithful")
+        ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful")
 
     monkeypatch.setattr(ai, "_chat_json", lambda *args, **kwargs: {"detailed_notes": "解读", "high_fidelity_text": "详解"})
     assert ai._generate_learning_block_interpretation_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful") == "解读"
-    assert ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, "notes", provider, "zh-CN", "faithful") == "详解"
+    assert ai._generate_learning_block_high_fidelity_with_provider("Lesson", 0, chunk, chunk, "", {}, provider, "zh-CN", "faithful") == "详解"
 
 
 def test_long_transcript_uses_role_specific_model_slots(monkeypatch):
@@ -1395,7 +1395,7 @@ def test_regenerate_high_reuses_existing_structure_and_interpretation(monkeypatc
 
     def fake_high(**kwargs):
         calls["structure_payload"] = kwargs["structure"]
-        calls["detailed_notes"] = kwargs["detailed_notes"]
+        calls["high_kwargs"] = set(kwargs)
         return "新详解内容。"
 
     monkeypatch.setattr(ai, "_generate_learning_block_structure_with_provider", fail_structure)
@@ -1414,7 +1414,7 @@ def test_regenerate_high_reuses_existing_structure_and_interpretation(monkeypatc
     assert calls["structure"] == 0
     assert calls["interpretation"] == 0
     assert calls["structure_payload"]["title"] == "旧结构标题"
-    assert calls["detailed_notes"] == "已有解读内容。"
+    assert "detailed_notes" not in calls["high_kwargs"]
     assert study.detailed_notes == existing.detailed_notes
     assert "新详解内容" in study.high_fidelity_text
 
@@ -1577,6 +1577,68 @@ def test_semantic_segmentation_repairs_gaps_and_overlaps(monkeypatch):
     assert [item.title for item in ranges] == ["开场", "第二主题"]
 
 
+@pytest.mark.parametrize(
+    "returned_ends",
+    [
+        [31, 61, 90],  # line numbers
+        [5, 10, 15],  # minutes
+    ],
+)
+def test_semantic_segmentation_rejects_times_that_are_not_seconds(monkeypatch, returned_ends):
+    transcript = [TranscriptSegment(start=index * 10, end=index * 10 + 10, text=f"line {index}") for index in range(90)]
+    prompts = []
+
+    def fake_chat_json(provider, messages, temperature, max_tokens, timeout, task_key=None):
+        prompts.append(messages[0]["content"])
+        starts = [0, *returned_ends[:-1]]
+        return {"blocks": [{"start": start, "end": end, "title": "块", "summary": "摘要"} for start, end in zip(starts, returned_ends)]}
+
+    monkeypatch.setattr(ai, "_chat_json", fake_chat_json)
+
+    with pytest.raises(ValueError, match="timeline"):
+        ai._generate_semantic_ranges_with_provider(
+            title="Lesson",
+            transcript=transcript,
+            context_summary="summary",
+            provider=LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model"),
+            output_language="zh-CN",
+            strategy=ai._study_strategy("standard"),
+        )
+    assert len(prompts) == 2
+    assert "they are not line numbers" in prompts[0]
+
+
+def test_whole_course_prompts_send_an_excerpt_only_beyond_the_context_window():
+    transcript = [TranscriptSegment(start=index, end=index + 1, text=f"spoken line number {index} " * 5) for index in range(600)]
+    small = LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="small", context_window=8000)
+    large = LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="large", context_window=200000)
+
+    excerpt = ai._whole_course_transcript_for_prompt(transcript, small, "title")
+    full = ai._whole_course_transcript_for_prompt(transcript, large, "title")
+
+    assert excerpt.startswith("Transcript excerpt")
+    assert "1. [00:00-00:01]" in excerpt
+    assert ai._estimate_text_tokens(excerpt) < 8000 * 0.72
+    assert full.startswith("Full transcript:")
+    assert "600. [" in full
+
+
+@pytest.mark.parametrize(
+    "text,output_language,expected",
+    [
+        ("AI Prompting Evolution", "zh-CN", True),
+        ("RAG", "zh-CN", True),
+        ("使用 RAG 做检索", "zh-CN", False),
+        ("プロンプトの改善", "ja", False),
+        ("Prompt iteration", "ja", True),
+        ("提示词迭代", "en", True),
+        ("Prompt iteration with RAG", "en", False),
+    ],
+)
+def test_language_repair_asks_the_model_whenever_a_field_lacks_the_output_script(text, output_language, expected):
+    assert ai._text_needs_output_language_repair(text, output_language) is expected
+
+
 def test_task_parameter_overrides_are_applied_and_capped():
     provider = LlmProvider(
         base_url="https://example.test/v1",
@@ -1699,7 +1761,7 @@ def test_learning_block_generation_splits_structure_interpretation_and_high_fide
     assert "detailed_notes" not in calls[0][1]
     assert "high_fidelity_text" not in calls[0][1]
     assert "Learning block structure" in calls[1][2]
-    assert "detailed_notes" in calls[2][2]
+    assert "detailed_notes" not in calls[2][2]
     assert "Opening idea corrected." in calls[0][2]
     assert block["title"] == "提示词版本对比"
     assert block["key_points"] == ["比较两个提示词版本。"]

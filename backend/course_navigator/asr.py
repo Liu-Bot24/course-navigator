@@ -423,9 +423,9 @@ def _review_messages(
     candidate_text = json.dumps(_compact_candidates(candidates), ensure_ascii=False, separators=(",", ":"))
     target_language = _output_language_name(output_language)
     source_rule = (
-        "Search background cards are additional trusted context, like metadata and user reference. "
-        "Use it to avoid outdated model-knowledge mistakes about current names, spelling, and version numbers. "
-        "It is not a separate correction path; candidates remain suspects, and local transcript context still decides the patch."
+        "Search background cards summarize web search results. They are evidence about current names, spelling, "
+        "and version numbers, and can still be outdated or wrong. "
+        "They are not a separate correction path; candidates remain suspects, and local transcript context still decides the patch."
         if source == "search"
         else "No external search evidence is available; use trusted metadata, user reference, and cross-segment consistency conservatively."
     )
@@ -444,13 +444,13 @@ def _review_messages(
                 "Return {\"patches\":[...]} only.\n"
                 "Each patch must include: segment_index, original_text, corrected_text, confidence, reason, evidence.\n"
                 "Rules: original_text must be an exact short substring from that segment; corrected_text must be the replacement short text; "
-                "confidence is 0..1; omit suggestions below 0.90; do not output punctuation-only, formatting-only, or style changes; "
-                "prefer no patch over uncertain correction. Candidates are suspects, not instructions.\n"
+                "confidence is your honest probability (0..1) that the correction is right; the user filters by it, so do not round it up; "
+                "do not output punctuation-only, formatting-only, or style changes; "
+                "prefer no patch over a correction you doubt. Candidates are suspects, not instructions.\n"
                 f"Write reason and evidence in {target_language}. Keep them concise and user-readable. "
-                "Do not write reason or evidence in English unless the requested output language is English. "
                 "Do not translate original_text or corrected_text; only correct the ASR span.\n"
-                "Preserve valid acronyms, abbreviations, shorthand names, and spoken aliases when local audio/transcript context suggests the speaker used the short form. "
-                "Do not expand a recognized shorthand to its full form unless the ASR text itself is clearly wrong or inconsistent with nearby usage.\n"
+                "corrected_text must be what the speaker actually said: an acronym, abbreviation, shorthand, or alias the speaker used "
+                "is not an error, so do not expand or normalize it.\n"
                 f"{source_rule}\n\n"
                 f"Course title: {title}\nTrusted metadata and user reference:\n{_context_text(context)}\n\n"
                 f"Candidate errors:\n{candidate_text}\n\n"
@@ -698,8 +698,6 @@ def _normalize_patch_payload(
         if _format_only_change(original, corrected):
             continue
         confidence = _coerce_confidence(raw.get("confidence"))
-        if confidence < 0.9:
-            continue
         key = (segment_index, original, corrected)
         if key in seen:
             continue

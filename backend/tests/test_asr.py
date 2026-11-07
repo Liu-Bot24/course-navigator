@@ -23,8 +23,8 @@ def test_direct_asr_correction_uses_few_scan_batches_and_final_patch_review(monk
             assert '"candidates"' not in user_message
             assert '"asr_text"' not in user_message
             assert "Write reason and evidence in Simplified Chinese" in user_message
-            assert "Do not write reason or evidence in English" in user_message
-            assert "Preserve valid acronyms, abbreviations, shorthand names, and spoken aliases" in user_message
+            assert "corrected_text must be what the speaker actually said" in user_message
+            assert "below 0.90" not in user_message
             return '{"patches":[{"segment_index":0,"original_text":"noba dek","corrected_text":"NovaDeck","confidence":0.94,"reason":"附加参考信息和上下文都指向 NovaDeck。","evidence":"用户参考信息。"}]}'
         match = re.search(r"\[(\d+) \|", user_message)
         segment_index = int(match.group(1)) if match else 0
@@ -117,7 +117,7 @@ def test_asr_correction_prompt_preserves_valid_spoken_abbreviations(monkeypatch)
         user_message = messages[-1]["content"]
         chat_calls.append(user_message)
         if "Candidate errors:" in user_message:
-            assert "Do not expand a recognized shorthand to its full form" in user_message
+            assert "is not an error, so do not expand or normalize it" in user_message
             return '{"patches":[]}'
         assert "Do not flag a valid acronym, abbreviation, shorthand, or spoken alias" in user_message
         return '{"c":[{"i":0,"f":"ND","t":"NovaDeck","k":"acronym","r":"possible shorthand","c":0.95,"q":[],"p":1}]}'
@@ -186,7 +186,7 @@ def test_search_correction_deduplicates_queries_and_uses_search_as_background(mo
             )
         if "Candidate errors:" in user_message:
             assert "Search background cards:" in user_message
-            assert "additional trusted context" in user_message
+            assert "trusted" not in user_message.split("Course title:")[0]
             assert "AtlasLM 9.8 is a current model family" in user_message
             assert "AtlasLM 9.8 release notes" not in user_message
             return '{"patches":[{"segment_index":0,"original_text":"AtlisLM 9.8","corrected_text":"AtlasLM 9.8","confidence":0.98,"reason":"搜索背景确认 AtlasLM 9.8 是有效模型名。","evidence":"搜索结果确认 AtlasLM 9.8。"}]}'
@@ -319,6 +319,24 @@ def test_asr_correction_repairs_malformed_model_json(monkeypatch):
 
     assert any("Malformed payload:" in call for call in calls)
     assert suggestions[0].corrected_text == "NovaDeck"
+
+
+def test_asr_correction_keeps_the_model_confidence_for_the_user_to_filter(monkeypatch):
+    def fake_chat_text(provider, messages, **kwargs):
+        if "Candidate errors:" in messages[-1]["content"]:
+            return '{"patches":[{"segment_index":0,"original_text":"noba dek","corrected_text":"NovaDeck","confidence":0.62,"reason":"r","evidence":"e"}]}'
+        return '{"c":[{"i":0,"f":"noba dek","t":"NovaDeck","k":"product","r":"reference","c":0.6,"q":[],"p":1}]}'
+
+    monkeypatch.setattr("course_navigator.asr._chat_text", fake_chat_text)
+
+    suggestions = suggest_asr_corrections(
+        title="NovaDeck interview",
+        transcript=[TranscriptSegment(start=0, end=1, text="noba dek")],
+        provider=LlmProvider(base_url="https://api.example.com/v1", api_key="sk-test", model="model"),
+        search_config=AsrCorrectionSearchConfig(enabled=False),
+    )
+
+    assert [(suggestion.corrected_text, suggestion.confidence) for suggestion in suggestions] == [("NovaDeck", 0.62)]
 
 
 def test_asr_correction_drops_mojibake_patch_text(monkeypatch):
