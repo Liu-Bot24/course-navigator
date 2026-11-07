@@ -47,6 +47,7 @@ class AsrSearchSettings(BaseModel):
     enabled: bool = False
     provider: AsrSearchProvider = "tavily"
     result_limit: int = Field(default=5, ge=1, le=10)
+    min_confidence: int = Field(default=80, ge=0, le=100)
     tavily: AsrSearchServiceConfig = Field(
         default_factory=lambda: AsrSearchServiceConfig(base_url="https://api.tavily.com")
     )
@@ -241,6 +242,7 @@ def _load_asr_search_settings() -> AsrSearchSettings:
         enabled=_env_bool("COURSE_NAVIGATOR_ASR_SEARCH_ENABLED", False),
         provider=provider,  # type: ignore[arg-type]
         result_limit=_env_int("COURSE_NAVIGATOR_ASR_SEARCH_RESULT_LIMIT", 5, minimum=1, maximum=10),
+        min_confidence=_env_int("COURSE_NAVIGATOR_ASR_MIN_CONFIDENCE", 80, minimum=0, maximum=100),
         tavily=AsrSearchServiceConfig(
             base_url=os.getenv("COURSE_NAVIGATOR_TAVILY_BASE_URL") or "https://api.tavily.com",
             api_key=os.getenv("COURSE_NAVIGATOR_TAVILY_API_KEY") or os.getenv("TAVILY_API_KEY"),

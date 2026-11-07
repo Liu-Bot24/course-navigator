@@ -41,6 +41,7 @@ def suggest_asr_corrections(
     transcript: list[TranscriptSegment],
     provider: LlmProvider,
     search_config: AsrCorrectionSearchConfig,
+    min_confidence: float = 0.8,
     context: dict[str, object] | None = None,
     output_language: OutputLanguage = "zh-CN",
     progress: ProgressCallback | None = None,
@@ -93,7 +94,7 @@ def suggest_asr_corrections(
             source="search",
             should_cancel=should_cancel,
         )
-        return _normalize_patch_payload(raw_patches, transcript, source="search")
+        return _normalize_patch_payload(raw_patches, transcript, source="search", min_confidence=min_confidence)
 
     _report(progress, "review", 48, "正在统一审核候选错误并生成补丁")
     raw_patches = _review_candidate_patches(
@@ -108,7 +109,7 @@ def suggest_asr_corrections(
         source="model",
         should_cancel=should_cancel,
     )
-    return _normalize_patch_payload(raw_patches, transcript, source="model")
+    return _normalize_patch_payload(raw_patches, transcript, source="model", min_confidence=min_confidence)
 
 
 def _extract_candidate_items(
@@ -677,6 +678,7 @@ def _normalize_patch_payload(
     transcript: list[TranscriptSegment],
     *,
     source: str,
+    min_confidence: float = 0.8,
 ) -> list[AsrCorrectionSuggestion]:
     suggestions: list[AsrCorrectionSuggestion] = []
     seen: set[tuple[int, str, str]] = set()
@@ -698,6 +700,8 @@ def _normalize_patch_payload(
         if _format_only_change(original, corrected):
             continue
         confidence = _coerce_confidence(raw.get("confidence"))
+        if confidence < min_confidence:
+            continue
         key = (segment_index, original, corrected)
         if key in seen:
             continue

@@ -154,6 +154,7 @@ export type AsrSearchSettings = {
   enabled: boolean;
   provider: AsrSearchProvider;
   result_limit: number;
+  min_confidence: number;
   tavily: AsrSearchServiceSettings;
   firecrawl: AsrSearchServiceSettings;
 };
@@ -167,6 +168,7 @@ export type AsrSearchSettingsInput = {
   enabled?: boolean;
   provider?: AsrSearchProvider;
   result_limit?: number;
+  min_confidence?: number;
   tavily?: AsrSearchServiceSettingsInput;
   firecrawl?: AsrSearchServiceSettingsInput;
 };

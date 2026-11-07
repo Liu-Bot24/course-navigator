@@ -190,6 +190,7 @@ class AsrSearchSettingsResponse(BaseModel):
     enabled: bool = False
     provider: AsrSearchProvider = "tavily"
     result_limit: int = Field(default=5, ge=1, le=10)
+    min_confidence: int = Field(default=80, ge=0, le=100)
     tavily: AsrSearchServiceSettingsResponse = Field(default_factory=AsrSearchServiceSettingsResponse)
     firecrawl: AsrSearchServiceSettingsResponse = Field(default_factory=AsrSearchServiceSettingsResponse)
 
@@ -203,6 +204,7 @@ class AsrSearchSettingsUpdate(BaseModel):
     enabled: bool | None = None
     provider: AsrSearchProvider | None = None
     result_limit: int | None = Field(default=None, ge=1, le=10)
+    min_confidence: int | None = Field(default=None, ge=0, le=100)
     tavily: AsrSearchServiceSettingsUpdate | None = None
     firecrawl: AsrSearchServiceSettingsUpdate | None = None
 
@@ -266,6 +268,7 @@ class AsrCorrectionRequest(BaseModel):
     model_id: str | None = None
     user_context: str | None = Field(default=None, max_length=8000)
     search: AsrCorrectionSearchConfig = Field(default_factory=AsrCorrectionSearchConfig)
+    min_confidence: int | None = Field(default=None, ge=0, le=100)
 
 
 class AsrCorrectionSuggestion(BaseModel):

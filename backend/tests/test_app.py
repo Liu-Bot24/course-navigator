@@ -2635,6 +2635,7 @@ def test_asr_correction_job_uses_saved_search_credentials(tmp_path, monkeypatch)
 
     def fake_suggest(**kwargs):
         captured["search_config"] = kwargs["search_config"]
+        captured["min_confidence"] = kwargs["min_confidence"]
         return []
 
     monkeypatch.setattr("course_navigator.app.suggest_asr_corrections", fake_suggest)
@@ -2658,6 +2659,7 @@ def test_asr_correction_job_uses_saved_search_credentials(tmp_path, monkeypatch)
             asr_search={
                 "provider": "firecrawl",
                 "result_limit": 7,
+                "min_confidence": 70,
                 "firecrawl": {"base_url": "http://firecrawl.local:43123", "api_key": "fc-secret"},
             },
         ),
@@ -2682,6 +2684,7 @@ def test_asr_correction_job_uses_saved_search_credentials(tmp_path, monkeypatch)
     assert payload["status"] == "succeeded"
     assert captured["search_config"].base_url == "http://firecrawl.local:43123"
     assert captured["search_config"].api_key == "fc-secret"
+    assert captured["min_confidence"] == 0.7
 
 
 def test_model_settings_can_be_read_and_updated(tmp_path):
@@ -2860,6 +2863,7 @@ def test_asr_search_settings_can_be_read_and_updated_without_exposing_keys(tmp_p
     assert payload["enabled"] is True
     assert payload["provider"] == "tavily"
     assert payload["result_limit"] == 6
+    assert payload["min_confidence"] == 80
     assert payload["tavily"]["has_api_key"] is True
     assert payload["tavily"]["api_key_preview"] != "tvly-secret-value"
     assert "api_key" not in payload["tavily"]
@@ -2870,17 +2874,22 @@ def test_asr_search_settings_can_be_read_and_updated_without_exposing_keys(tmp_p
             "enabled": True,
             "provider": "firecrawl",
             "result_limit": 4,
+            "min_confidence": 65,
             "firecrawl": {"base_url": "http://127.0.0.1:43123", "api_key": "fc-secret-value"},
         },
     )
 
     assert updated.status_code == 200
     assert updated.json()["provider"] == "firecrawl"
+    assert updated.json()["min_confidence"] == 65
+    assert client.put("/api/settings/asr-search", json={"enabled": False}).json()["min_confidence"] == 65
+    assert client.put("/api/settings/asr-search", json={"min_confidence": 101}).status_code == 422
     assert updated.json()["firecrawl"]["base_url"] == "http://127.0.0.1:43123"
     assert updated.json()["firecrawl"]["has_api_key"] is True
     written = env_path.read_text(encoding="utf-8")
     assert "COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER=\"firecrawl\"" in written
     assert "COURSE_NAVIGATOR_FIRECRAWL_BASE_URL=\"http://127.0.0.1:43123\"" in written
+    assert "COURSE_NAVIGATOR_ASR_MIN_CONFIDENCE=\"65\"" in written
 
 
 def test_online_asr_settings_can_be_read_and_updated_without_exposing_keys(tmp_path):

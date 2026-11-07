@@ -321,22 +321,42 @@ def test_asr_correction_repairs_malformed_model_json(monkeypatch):
     assert suggestions[0].corrected_text == "NovaDeck"
 
 
-def test_asr_correction_keeps_the_model_confidence_for_the_user_to_filter(monkeypatch):
+@pytest.mark.parametrize(
+    ("floor", "expected"),
+    [
+        (None, [("NovaDeck", 0.8), ("Kubernetes", 0.93)]),
+        (0.6, [("NovaDeck", 0.62), ("NovaDeck", 0.8), ("Kubernetes", 0.93)]),
+        (0.95, []),
+    ],
+)
+def test_asr_correction_drops_suggestions_below_the_minimum_confidence(monkeypatch, floor, expected):
     def fake_chat_text(provider, messages, **kwargs):
         if "Candidate errors:" in messages[-1]["content"]:
-            return '{"patches":[{"segment_index":0,"original_text":"noba dek","corrected_text":"NovaDeck","confidence":0.62,"reason":"r","evidence":"e"}]}'
+            return (
+                '{"patches":['
+                '{"segment_index":0,"original_text":"noba dek","corrected_text":"NovaDeck","confidence":0.62,"reason":"r","evidence":"e"},'
+                '{"segment_index":1,"original_text":"noba dek","corrected_text":"NovaDeck","confidence":0.8,"reason":"r","evidence":"e"},'
+                '{"segment_index":2,"original_text":"cooper netties","corrected_text":"Kubernetes","confidence":0.93,"reason":"r","evidence":"e"}'
+                "]}"
+            )
         return '{"c":[{"i":0,"f":"noba dek","t":"NovaDeck","k":"product","r":"reference","c":0.6,"q":[],"p":1}]}'
 
     monkeypatch.setattr("course_navigator.asr._chat_text", fake_chat_text)
+    floor_kwargs = {} if floor is None else {"min_confidence": floor}
 
     suggestions = suggest_asr_corrections(
         title="NovaDeck interview",
-        transcript=[TranscriptSegment(start=0, end=1, text="noba dek")],
+        transcript=[
+            TranscriptSegment(start=0, end=1, text="noba dek"),
+            TranscriptSegment(start=1, end=2, text="noba dek again"),
+            TranscriptSegment(start=2, end=3, text="cooper netties"),
+        ],
         provider=LlmProvider(base_url="https://api.example.com/v1", api_key="sk-test", model="model"),
         search_config=AsrCorrectionSearchConfig(enabled=False),
+        **floor_kwargs,
     )
 
-    assert [(suggestion.corrected_text, suggestion.confidence) for suggestion in suggestions] == [("NovaDeck", 0.62)]
+    assert [(suggestion.corrected_text, suggestion.confidence) for suggestion in suggestions] == expected
 
 
 def test_asr_correction_drops_mojibake_patch_text(monkeypatch):

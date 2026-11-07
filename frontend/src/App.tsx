@@ -205,6 +205,7 @@ type AsrSearchDraft = {
   api_key_preview: string | null;
   base_url: string;
   result_limit: string;
+  min_confidence: string;
 };
 type OnlineAsrDraft = {
   provider: OnlineAsrProvider;
@@ -456,6 +457,8 @@ const COPY = {
     asrUserContext: "附加参考信息",
     asrUserContextHelp: "写入你已经确认的术语、人名、产品名和常见误识别，模型会把它作为高优先级参考。",
     asrUserContextPlaceholder: "",
+    asrMinConfidence: "最低置信度（%）",
+    asrMinConfidenceHelp: "低于这个值的建议不会出现在列表里。",
     noModelProfiles: "还没有模型档案",
     configureModelProfiles: "管理 ASR 模型档案",
     asrCorrectionApiUnavailable: "ASR 校正接口暂不可用。请重启后端服务后再生成建议。",
@@ -828,6 +831,8 @@ const COPY = {
     asrUserContext: "Additional reference info",
     asrUserContextHelp: "Add confirmed terms, names, products, and recurring ASR mistakes. The model treats this as high-priority context.",
     asrUserContextPlaceholder: "",
+    asrMinConfidence: "Minimum confidence (%)",
+    asrMinConfidenceHelp: "Suggestions below this value are not listed.",
     noModelProfiles: "No model profiles yet",
     configureModelProfiles: "Manage ASR model profiles",
     asrCorrectionApiUnavailable: "The ASR correction API is not available. Restart the backend service and try again.",
@@ -1029,6 +1034,7 @@ const TIME_MAP_AUTO_OPEN_STORAGE_KEY = "course-navigator-time-map-auto-open";
 const SELECTED_COURSE_STORAGE_KEY = "course-navigator-last-selected-course";
 const ASR_SAVE_ACCEPTED_CHANGES_STORAGE_KEY = "course-navigator-asr-save-accepted-changes";
 const ASR_SORT_BY_CONFIDENCE_STORAGE_KEY = "course-navigator-asr-sort-by-confidence";
+const DEFAULT_ASR_MIN_CONFIDENCE = 80;
 const STUDY_DETAIL_LEVEL_STORAGE_KEY = "course-navigator-study-detail-level";
 const TASK_PARAMETER_KEYS: TaskParameterKey[] = [
   "title_translation",
@@ -4768,6 +4774,7 @@ function AsrWorkbench({
     api_key_preview: null,
     base_url: "",
     result_limit: "5",
+    min_confidence: String(DEFAULT_ASR_MIN_CONFIDENCE),
   });
   const mountedRef = useRef(true);
 
@@ -5464,6 +5471,19 @@ function AsrWorkbench({
                   placeholder={copy.asrUserContextPlaceholder}
                 />
                 <small>{copy.asrUserContextHelp}</small>
+              </label>
+              <label className="settings-field asr-min-confidence-field">
+                <span>{copy.asrMinConfidence}</span>
+                <input
+                  inputMode="numeric"
+                  value={searchDraft.min_confidence}
+                  onBlur={(event) => {
+                    const value = String(normalizedMinConfidence(event.currentTarget.value));
+                    setSearchDraft((current) => ({ ...current, min_confidence: value }));
+                  }}
+                  onChange={(event) => setSearchDraft((current) => ({ ...current, min_confidence: event.target.value }))}
+                />
+                <small>{copy.asrMinConfidenceHelp}</small>
               </label>
               <div className="asr-config-actions">
                 <button className="secondary-action" type="button" onClick={onOpenSettings}>
@@ -7570,6 +7590,7 @@ function settingsToSearchDraft(settings: AsrSearchSettings): AsrSearchDraft {
     api_key_preview: service.api_key_preview,
     base_url: settings.provider === "firecrawl" ? settings.firecrawl.base_url ?? "" : "",
     result_limit: String(settings.result_limit || 5),
+    min_confidence: String(settings.min_confidence ?? DEFAULT_ASR_MIN_CONFIDENCE),
   };
 }
 
@@ -7580,6 +7601,7 @@ function searchDraftToSettingsInput(draft: AsrSearchDraft): AsrSearchSettingsInp
     enabled: draft.enabled,
     provider: draft.provider,
     result_limit: resultLimit,
+    min_confidence: normalizedMinConfidence(draft.min_confidence),
   };
   if (draft.provider === "firecrawl") {
     input.firecrawl = {
@@ -8458,6 +8480,12 @@ function getOutlineMaxDepth(nodes: OutlineNode[]): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function normalizedMinConfidence(value: string): number {
+  const parsed = parseNullableNumberInput(value);
+  if (parsed === null) return DEFAULT_ASR_MIN_CONFIDENCE;
+  return Math.round(clamp(parsed, 0, 100));
 }
 
 function normalizedConfidenceThreshold(value: string): number {

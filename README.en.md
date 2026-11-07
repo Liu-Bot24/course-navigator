@@ -146,6 +146,7 @@ The app also reads optional environment settings:
 | `COURSE_NAVIGATOR_ASR_SEARCH_ENABLED` | Enables search-assisted ASR correction | `false` |
 | `COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER` | Search provider for ASR validation | `tavily` |
 | `COURSE_NAVIGATOR_ASR_SEARCH_RESULT_LIMIT` | Search results per query | `5` |
+| `COURSE_NAVIGATOR_ASR_MIN_CONFIDENCE` | Minimum confidence (0–100) for ASR correction suggestions; lower ones are not shown | `80` |
 | `COURSE_NAVIGATOR_TAVILY_API_KEY` | Tavily API key | Empty |
 | `COURSE_NAVIGATOR_FIRECRAWL_BASE_URL` | Firecrawl API address | Empty |
 | `COURSE_NAVIGATOR_FIRECRAWL_API_KEY` | Firecrawl API key | Empty |
@@ -243,6 +244,7 @@ You can:
 - compare the original text and corrected preview side by side,
 - hover highlighted changes to see the reason, evidence, and accept/reject controls,
 - review all suggestions in the side panel,
+- set a minimum confidence so low-certainty suggestions stay out of the list (80% by default),
 - sort by confidence,
 - accept all suggestions above a confidence threshold,
 - auto-save accepted suggestions when enabled,

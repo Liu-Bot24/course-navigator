@@ -10,6 +10,7 @@ import {
   deleteLocalVideo,
   extractCourse,
   getAsrCacheSettings,
+  getAsrSearchSettings,
   getOnlineAsrSettings,
   getLibraryState,
   getLibraryErrors,
@@ -100,6 +101,7 @@ vi.mock("./api", () => ({
     enabled: false,
     provider: "tavily",
     result_limit: 5,
+    min_confidence: 80,
     tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
     firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
   })),
@@ -1113,6 +1115,7 @@ describe("App language defaults", () => {
       enabled: false,
       provider: "tavily",
       result_limit: 5,
+      min_confidence: 80,
       tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
       firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
     });
@@ -1188,6 +1191,60 @@ describe("App language defaults", () => {
     expect(screen.getByText("1/1")).toBeTruthy();
   });
 
+  it("keeps the ASR minimum confidence as an editable saved setting", async () => {
+    const item: CourseItem = {
+      id: "asr-lesson",
+      source_url: "https://example.com/asr-lesson",
+      title: "ASR Lesson",
+      duration: 12,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "我是林毅" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    const savedSettings = {
+      enabled: false,
+      provider: "tavily" as const,
+      result_limit: 5,
+      min_confidence: 70,
+      tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
+      firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(getAsrSearchSettings).mockResolvedValueOnce(savedSettings);
+    vi.mocked(saveAsrSearchSettings).mockResolvedValue({ ...savedSettings, min_confidence: 65 });
+    vi.mocked(startAsrCorrectionJob).mockResolvedValueOnce({
+      job_id: "asr-job",
+      item_id: "asr-lesson",
+      status: "running",
+      progress: 10,
+      phase: "model",
+      message: "正在生成 ASR 校正建议",
+      error: null,
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getAllByText("ASR Lesson").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "ASR 校正" }));
+    const field = (await screen.findByLabelText(/最低置信度/)) as HTMLInputElement;
+    await waitFor(() => expect(field.value).toBe("70"));
+
+    fireEvent.change(field, { target: { value: "150" } });
+    fireEvent.blur(field);
+    expect(field.value).toBe("100");
+    fireEvent.change(field, { target: { value: "not a number" } });
+    fireEvent.blur(field);
+    expect(field.value).toBe("80");
+
+    fireEvent.change(field, { target: { value: "65" } });
+    fireEvent.click(screen.getByRole("button", { name: "生成校正建议" }));
+
+    await waitFor(() =>
+      expect(saveAsrSearchSettings).toHaveBeenCalledWith(expect.objectContaining({ min_confidence: 65 })),
+    );
+  });
   it("shows a cancel action while ASR correction suggestions are being generated", async () => {
     const item: CourseItem = {
       id: "asr-lesson",
@@ -1208,6 +1265,7 @@ describe("App language defaults", () => {
       enabled: false,
       provider: "tavily",
       result_limit: 5,
+      min_confidence: 80,
       tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
       firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
     });

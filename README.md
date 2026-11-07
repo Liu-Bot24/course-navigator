@@ -146,6 +146,7 @@ Release 页面同时提供 `.sha256` 校验文件，可用于核对下载完整�
 | `COURSE_NAVIGATOR_ASR_SEARCH_ENABLED` | 是否启用搜索辅助 ASR 校正 | `false` |
 | `COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER` | ASR 搜索校验服务 | `tavily` |
 | `COURSE_NAVIGATOR_ASR_SEARCH_RESULT_LIMIT` | 每次查询返回的搜索结果数 | `5` |
+| `COURSE_NAVIGATOR_ASR_MIN_CONFIDENCE` | ASR 校正建议的最低置信度（0–100），低于它的建议不显示 | `80` |
 | `COURSE_NAVIGATOR_TAVILY_API_KEY` | Tavily API Key | 空 |
 | `COURSE_NAVIGATOR_FIRECRAWL_BASE_URL` | Firecrawl API 地址 | 空 |
 | `COURSE_NAVIGATOR_FIRECRAWL_API_KEY` | Firecrawl API Key | 空 |
@@ -243,6 +244,7 @@ ASR 校正工作台用于处理自动语音识别生成的字幕，并使用与�
 - 并排查看原文和修改后预览，
 - 在高亮修改上悬停查看理由、证据，并接受或拒绝，
 - 在右侧建议区集中审阅所有建议，
+- 设定最低置信度，把把握不足的建议挡在列表外（默认 80%），
 - 按置信度排序，
 - 一键接受高于指定置信度的建议，
 - 开启接受后自动保存，

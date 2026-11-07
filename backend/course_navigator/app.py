@@ -1088,6 +1088,8 @@ def create_app(
         if not provider:
             raise HTTPException(status_code=400, detail="请先为 ASR 校正配置可用模型")
         active_request.search = _effective_asr_search_config(active_request.search, settings_state["value"])
+        if active_request.min_confidence is None:
+            active_request.min_confidence = settings_state["value"].asr_search.min_confidence
         job_id = uuid4().hex
         now = datetime.now(timezone.utc).isoformat()
         job = StudyJobStatus(
@@ -1724,6 +1726,7 @@ def create_app(
                 transcript=transcript,
                 provider=provider,
                 search_config=request.search,
+                min_confidence=(request.min_confidence if request.min_confidence is not None else 80) / 100,
                 context=_asr_context_for_item(item, request.user_context),
                 output_language=request.output_language,
                 progress=update_progress,
@@ -3270,6 +3273,7 @@ def _asr_search_settings_response(settings: Settings) -> AsrSearchSettingsRespon
         enabled=search.enabled,
         provider=search.provider,
         result_limit=search.result_limit,
+        min_confidence=search.min_confidence,
         tavily=_asr_search_service_response(search.tavily),
         firecrawl=_asr_search_service_response(search.firecrawl),
     )
@@ -3314,11 +3318,13 @@ def _updated_asr_search_settings(current: AsrSearchSettings, request: AsrSearchS
     provider = request.provider if "provider" in request.model_fields_set and request.provider else current.provider
     result_limit = request.result_limit if "result_limit" in request.model_fields_set and request.result_limit else current.result_limit
     enabled = request.enabled if "enabled" in request.model_fields_set and request.enabled is not None else current.enabled
+    min_confidence = request.min_confidence if request.min_confidence is not None else current.min_confidence
     return current.model_copy(
         update={
             "enabled": enabled,
             "provider": provider,
             "result_limit": result_limit,
+            "min_confidence": min_confidence,
             "tavily": _updated_asr_search_service(current.tavily, request.tavily, "tavily"),
             "firecrawl": _updated_asr_search_service(current.firecrawl, request.firecrawl, "firecrawl"),
         }
@@ -3449,6 +3455,7 @@ def _write_model_env(path: Path, settings: Settings) -> None:
         "COURSE_NAVIGATOR_ASR_SEARCH_ENABLED": "true" if settings.asr_search.enabled else "false",
         "COURSE_NAVIGATOR_ASR_SEARCH_PROVIDER": settings.asr_search.provider,
         "COURSE_NAVIGATOR_ASR_SEARCH_RESULT_LIMIT": str(settings.asr_search.result_limit),
+        "COURSE_NAVIGATOR_ASR_MIN_CONFIDENCE": str(settings.asr_search.min_confidence),
         "COURSE_NAVIGATOR_TAVILY_BASE_URL": settings.asr_search.tavily.base_url or "",
         "COURSE_NAVIGATOR_TAVILY_API_KEY": settings.asr_search.tavily.api_key or "",
         "COURSE_NAVIGATOR_FIRECRAWL_BASE_URL": settings.asr_search.firecrawl.base_url or "",
