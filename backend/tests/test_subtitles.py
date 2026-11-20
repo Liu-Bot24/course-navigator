@@ -89,6 +89,42 @@ changing the way we work and live, and this non-technical course will teach you
     ]
 
 
+def test_parse_webvtt_youtube_rollup_with_transition_cues_keeps_each_phrase_once():
+    # YouTube's real layout: a long cue, a 10 ms transition cue that repeats it,
+    # then the next long cue whose first line repeats it again.
+    raw = """WEBVTT
+Kind: captions
+Language: en
+
+00:00:02.000 --> 00:00:04.470 align:start position:0%
+
+Hello,<00:00:02.480><c> this</c><00:00:02.720><c> is</c><00:00:03.360><c> the</c><00:00:03.600><c> first</c><00:00:03.840><c> line</c>
+
+00:00:04.470 --> 00:00:04.480 align:start position:0%
+Hello, this is the first line
+
+
+00:00:04.480 --> 00:00:07.749 align:start position:0%
+Hello, this is the first line
+and<00:00:04.640><c> here</c><00:00:04.960><c> comes</c><00:00:05.440><c> the</c><00:00:05.920><c> second</c><00:00:06.560><c> one</c>
+
+00:00:07.749 --> 00:00:07.759 align:start position:0%
+and here comes the second one
+
+
+00:00:07.759 --> 00:00:09.350 align:start position:0%
+and here comes the second one
+followed<00:00:08.320><c> by</c><00:00:08.559><c> a</c><00:00:08.800><c> third</c><00:00:09.120><c> line</c>
+"""
+
+    segments = parse_subtitle_text(raw, "vtt")
+    words = " ".join(segment.text for segment in segments).split()
+
+    assert words == (
+        "Hello, this is the first line and here comes the second one followed by a third line".split()
+    )
+
+
 def test_parse_srt_keeps_numeric_text_and_cues_without_blank_lines():
     raw = """1
 00:00:01,000 --> 00:00:02,000

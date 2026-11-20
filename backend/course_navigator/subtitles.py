@@ -77,7 +77,13 @@ def _dedupe_rollup_segments(segments: list[TranscriptSegment]) -> list[Transcrip
             previous = collapsed[-1]
             near_same_start = abs(segment.start - previous.start) <= 0.2
             if near_same_start and segment.text.startswith(previous.text):
-                collapsed[-1] = segment
+                # The longer cue replaces the shorter one but keeps the earlier
+                # start, so the cue still touches the one it repeats.
+                collapsed[-1] = TranscriptSegment(
+                    start=previous.start,
+                    end=max(previous.end, segment.end),
+                    text=segment.text,
+                )
                 continue
             if near_same_start and previous.text.startswith(segment.text):
                 continue
