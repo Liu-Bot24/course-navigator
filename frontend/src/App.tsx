@@ -89,6 +89,7 @@ import {
   filterAsrSuggestionsByConfidence,
   previewTextToEditorText,
   reconcilePreviewEditedSuggestions,
+  sameTranscript,
   sortAsrNavigationSuggestions,
   sortAsrReviewSuggestions,
   transcriptToEditorText,
@@ -451,6 +452,8 @@ const COPY = {
     sourceTranscriptEditor: "原字幕编辑区",
     saveTranscript: "保存字幕",
     transcriptSaved: "字幕已保存",
+    transcriptSaveClearsTranslationConfirm: "这门课已有字幕译文。保存改动后的字幕会清空整份译文和翻译用的上下文摘要，需要时再重新翻译。确定保存吗？",
+    localSubtitleReplaceConfirm: "当前课程已经有字幕。上传的字幕会替换现有字幕，已有的字幕译文也会被清空。确定继续吗？",
     runAsrCorrection: "生成校正建议",
     asrModel: "ASR 校正模型",
     asrModelHelp: "选择用于校正字幕的模型档案。",
@@ -825,6 +828,8 @@ const COPY = {
     sourceTranscriptEditor: "Source transcript editor",
     saveTranscript: "Save transcript",
     transcriptSaved: "Transcript saved",
+    transcriptSaveClearsTranslationConfirm: "This course has a subtitle translation. Saving the changed transcript clears the whole translation and its context summary; translate again when needed. Save anyway?",
+    localSubtitleReplaceConfirm: "This course already has subtitles. The uploaded file replaces them and clears the existing subtitle translation. Continue?",
     runAsrCorrection: "Generate suggestions",
     asrModel: "ASR correction model",
     asrModelHelp: "Choose the model profile used for subtitle correction.",
@@ -1745,8 +1750,9 @@ export function App() {
       if (!transcript.length) {
         throw new Error(copy.localSubtitleEmpty);
       }
+      if (target.transcript.length && !window.confirm(copy.localSubtitleReplaceConfirm)) return;
       // An uploaded file replaces the track; its language is not known.
-      await handleSaveWorkbenchTranscript(target.id, transcript, null);
+      await persistTranscript(target.id, transcript, null);
       setSubtitleSource("local_upload");
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
@@ -2816,7 +2822,7 @@ export function App() {
     }
   }
 
-  async function handleSaveWorkbenchTranscript(
+  async function persistTranscript(
     itemId: string,
     transcript: TranscriptSegment[],
     language?: string | null,
@@ -2824,6 +2830,20 @@ export function App() {
     const next = await saveTranscript(itemId, transcript, language);
     upsertCourseItem(next);
     return next;
+  }
+
+  async function handleSaveWorkbenchTranscript(
+    itemId: string,
+    transcript: TranscriptSegment[],
+    language?: string | null,
+  ): Promise<CourseItem | null> {
+    const target = items.find((entry) => entry.id === itemId) ?? (selected?.id === itemId ? selected : null);
+    // Saving a changed transcript drops the whole translation, which is aligned line by line.
+    if (target?.study?.translated_transcript?.length && !sameTranscript(target.transcript, transcript)
+      && !window.confirm(copy.transcriptSaveClearsTranslationConfirm)) {
+      return null;
+    }
+    return persistTranscript(itemId, transcript, language);
   }
 
   function handleAddModelProfile() {
@@ -4740,7 +4760,7 @@ function AsrWorkbench({
   onBack: () => void;
   onOpenSettings: () => void;
   onAsrModelChange: (profileId: string) => Promise<void>;
-  onSaveTranscript: (itemId: string, transcript: TranscriptSegment[], language?: string | null) => Promise<CourseItem>;
+  onSaveTranscript: (itemId: string, transcript: TranscriptSegment[], language?: string | null) => Promise<CourseItem | null>;
 }) {
   const editorRef = useRef<HTMLTextAreaElement | null>(null);
   const previewRef = useRef<HTMLTextAreaElement | null>(null);
@@ -5026,6 +5046,7 @@ function AsrWorkbench({
     if (!item) return;
     const transcript = editorTextToTranscript(nextEditorText);
     const next = await onSaveTranscript(item.id, transcript, item.transcript_language ?? null);
+    if (!next) return;
     // Edits typed while the save was in flight stay in the editor.
     setEditorText((current) => (current === nextEditorText ? transcriptToEditorText(next.transcript) : current));
     setMessage(copy.transcriptSaved);

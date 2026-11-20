@@ -2381,6 +2381,25 @@ def test_transcript_update_saves_corrected_source_and_clears_cached_translation(
     assert payload["study"]["translated_transcript"] == []
 
 
+def test_saving_an_unchanged_transcript_keeps_the_translation(tmp_path):
+    client = make_client(tmp_path)
+    client.post("/api/extract", json={"url": "https://www.youtube.com/watch?v=abc123"})
+    library = CourseLibrary(tmp_path)
+    item = library.get("abc123")
+    item.study = StudyMaterial(
+        one_line="Lesson", time_map=[], outline=[], detailed_notes="", high_fidelity_text="",
+        context_summary="Context",
+        translated_transcript=[segment.model_copy(update={"text": f"译文 {segment.text}"}) for segment in item.transcript],
+    )
+    library.save(item)
+    unchanged = [{"start": s.start, "end": s.end, "text": f" {s.text} "} for s in item.transcript]
+
+    payload = client.put("/api/items/abc123/transcript", json={"transcript": unchanged}).json()
+
+    assert len(payload["study"]["translated_transcript"]) == len(item.transcript)
+    assert payload["study"]["context_summary"] == "Context"
+
+
 def test_study_generation_uses_saved_corrected_transcript(tmp_path, monkeypatch):
     captured = {}
 

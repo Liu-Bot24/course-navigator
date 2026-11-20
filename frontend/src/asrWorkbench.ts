@@ -31,6 +31,14 @@ export function editorTextToTranscript(value: string): TranscriptSegment[] {
     });
 }
 
+/** Equal as the editor shows them: times to the millisecond, text without outer spaces. */
+export function sameTranscript(left: TranscriptSegment[], right: TranscriptSegment[]): boolean {
+  const sameTime = (a: number, b: number) => Math.round(a * 1000) === Math.round(b * 1000);
+  return left.length === right.length && left.every((segment, index) =>
+    sameTime(segment.start, right[index].start) && sameTime(segment.end, right[index].end)
+    && segment.text.trim() === right[index].text.trim());
+}
+
 export function applyAsrSuggestion(
   transcript: TranscriptSegment[],
   suggestion: AsrCorrectionSuggestion,

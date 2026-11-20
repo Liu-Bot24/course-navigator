@@ -7,6 +7,7 @@ import os
 import inspect
 import ipaddress
 import hashlib
+import math
 import socket
 from functools import wraps
 import re
@@ -860,7 +861,8 @@ def create_app(
         # null for a replacement of unknown language) changes it.
         if "language" in request.model_fields_set:
             updates["transcript_language"] = request.language
-        if item.study:
+        # The translation is aligned line by line, so only a changed text drops it.
+        if item.study and not _same_transcript_as_edited(transcript, item.transcript):
             updates["study"] = item.study.model_copy(
                 update={
                     "translated_transcript": [],
@@ -2379,6 +2381,17 @@ def _same_transcript(left: list[TranscriptSegment], right: list[TranscriptSegmen
         and abs(first.end - second.end) <= 0.001
         and first.text == second.text
         for first, second in zip(left, right)
+    )
+
+
+def _same_transcript_as_edited(left: list[TranscriptSegment], right: list[TranscriptSegment]) -> bool:
+    """Equal as the editor shows them: times to the millisecond, text without outer spaces."""
+    def ms(value: float) -> int:
+        return math.floor(value * 1000 + 0.5)  # the editor's Math.round
+
+    return len(left) == len(right) and all(
+        ms(a.start) == ms(b.start) and ms(a.end) == ms(b.end) and a.text.strip() == b.text.strip()
+        for a, b in zip(left, right)
     )
 
 

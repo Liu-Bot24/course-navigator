@@ -1191,6 +1191,48 @@ describe("App language defaults", () => {
     expect(screen.getByText("1/1")).toBeTruthy();
   });
 
+  it("asks before a transcript save clears an existing translation", async () => {
+    const item: CourseItem = {
+      id: "translated-edit-course",
+      source_url: "https://example.com/translated-video",
+      title: "Translated Course",
+      duration: 4,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 4, text: "first version" }],
+      metadata: null,
+      study: {
+        one_line: "Lesson",
+        time_map: [],
+        outline: [],
+        detailed_notes: "",
+        high_fidelity_text: "",
+        translated_transcript: [{ start: 0, end: 4, text: "第一版" }],
+        prerequisites: [],
+        thought_prompts: [],
+        review_suggestions: [],
+        beginner_focus: [],
+        experienced_guidance: [],
+      } as unknown as CourseItem["study"],
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveTranscript).mockResolvedValue(item);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    const { container } = render(<App />);
+    fireEvent.click(await screen.findByTitle("打开 ASR 校正工作台"));
+    fireEvent.click(await screen.findByRole("button", { name: "保存字幕" }));
+    await waitFor(() => expect(saveTranscript).toHaveBeenCalledTimes(1));
+    expect(confirmSpy).not.toHaveBeenCalled();
+
+    const editor = container.querySelector("textarea.asr-editor") as HTMLTextAreaElement;
+    fireEvent.change(editor, { target: { value: editor.value.replace("first version", "second version") } });
+    fireEvent.click(screen.getByRole("button", { name: "保存字幕" }));
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    expect(saveTranscript).toHaveBeenCalledTimes(1);
+    confirmSpy.mockRestore();
+  });
+
   it("keeps the ASR minimum confidence as an editable saved setting", async () => {
     const item: CourseItem = {
       id: "asr-lesson",
