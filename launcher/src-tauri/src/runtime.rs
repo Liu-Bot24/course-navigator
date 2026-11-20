@@ -2050,7 +2050,8 @@ mod tests {
 
     /// Offline run of the media-tools install against a local zip. Opt-in
     /// (it redirects APPDATA for the process): `cargo test --lib
-    /// media_tools_install_logs -- --ignored`.
+    /// media_tools_install_logs -- --ignored --show-output`. The output says
+    /// whether the PowerShell 7 module-path case ran.
     #[cfg(windows)]
     #[test]
     #[ignore]
