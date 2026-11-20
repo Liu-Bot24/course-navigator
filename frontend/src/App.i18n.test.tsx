@@ -17,6 +17,7 @@ import {
   getModelSettings,
   getAsrCorrectionResult,
   getStudyJob,
+  importCoursePackage,
   importLocalVideo,
   importWorkspaceVideoFromPicker,
   listItems,
@@ -1261,6 +1262,21 @@ describe("App language defaults", () => {
     expect(confirmSpy).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("button", { name: "返回主工作台" })).toBeTruthy();
     confirmSpy.mockRestore();
+
+    // While the draft can't be read, accepting (even with auto-save on) neither
+    // saves nor changes the source.
+    const autoSave = screen.getByLabelText("接受后自动保存字幕") as HTMLInputElement;
+    if (!autoSave.checked) fireEvent.click(autoSave);
+    fireEvent.click(screen.getByRole("button", { name: "全部接受" }));
+    expect(saveTranscript).not.toHaveBeenCalled();
+    expect(source().value).toBe(sourceBefore);
+    expect(screen.getByText("1/2")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "放弃预览里的改动" }));
+    expect(screen.queryByRole("button", { name: "放弃预览里的改动" })).toBeNull();
+    const restored = document.querySelector(".asr-transcript-pane.preview textarea") as HTMLTextAreaElement;
+    expect(restored.value).toContain("我是林亦");
+    fireEvent.click(autoSave);
   });
 
   it("asks before a transcript save clears an existing translation", async () => {
@@ -1425,6 +1441,93 @@ describe("App language defaults", () => {
       expect(screen.queryByRole("button", { name: "停止 ASR 校正" })).toBeNull();
     });
     await waitFor(() => expect(screen.getByText("ASR 校正已取消")).toBeTruthy());
+  });
+
+  it("asks before leaving while a correction is starting and stops a job created after leaving", async () => {
+    const item: CourseItem = {
+      id: "asr-late-lesson",
+      source_url: "https://example.com/asr-late-lesson",
+      title: "ASR Late Lesson",
+      duration: 4,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "我是林毅" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveAsrSearchSettings).mockResolvedValue({
+      enabled: false,
+      provider: "tavily",
+      result_limit: 5,
+      min_confidence: 80,
+      tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
+      firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
+    });
+    let createJob: (status: Awaited<ReturnType<typeof startAsrCorrectionJob>>) => void = () => undefined;
+    vi.mocked(startAsrCorrectionJob).mockImplementationOnce(() => new Promise((resolve) => { createJob = resolve; }));
+    vi.mocked(cancelJob).mockReset();
+    vi.mocked(cancelJob).mockResolvedValue({
+      job_id: "late-job", item_id: item.id, status: "cancelling", progress: 0, phase: "cancelling",
+      message: "正在取消", error: null,
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByText("ASR Late Lesson").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "ASR 校正" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成校正建议" }));
+    await waitFor(() => expect(startAsrCorrectionJob).toHaveBeenCalledTimes(1));
+
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+    fireEvent.click(screen.getByRole("button", { name: "返回主工作台" }));
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    confirmSpy.mockRestore();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "返回主工作台" })).toBeNull());
+
+    createJob({ job_id: "late-job", item_id: item.id, status: "running", progress: 1, phase: "model",
+      message: "正在生成", error: null });
+    await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("late-job"));
+  });
+
+  it("keeps the course open in the ASR workbench when a package import finishes", async () => {
+    const lesson = (id: string, text: string): CourseItem => ({
+      id,
+      source_url: `https://example.com/${id}`,
+      title: id,
+      duration: 2,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    });
+    const editing = lesson("editing-course", "正在校对的那一句");
+    const imported = lesson("imported-course", "导入课程的第一句");
+    vi.mocked(listItems).mockResolvedValueOnce([editing]).mockResolvedValueOnce([editing, imported]);
+    let finishImport: (value: Awaited<ReturnType<typeof importCoursePackage>>) => void = () => undefined;
+    vi.mocked(importCoursePackage).mockImplementationOnce(() => new Promise((resolve) => { finishImport = resolve; }));
+
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByText("editing-course").length).toBeGreaterThan(0));
+    const file = new File(["{}"], "share.course-nav.json", { type: "application/json" });
+    Object.defineProperty(file, "text", { value: async () => "{}" });
+    const input = document.querySelector('input[type="file"][accept*="course-nav"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [file] } });
+    await waitFor(() => expect(importCoursePackage).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "ASR 校正" }));
+    const source = await waitFor(() => {
+      const editor = document.querySelector(".asr-manual-editor textarea") as HTMLTextAreaElement | null;
+      expect(editor).toBeTruthy();
+      return editor!;
+    });
+    fireEvent.change(source, { target: { value: `${source.value}\n` } });
+    finishImport({ items: [imported], message: "" } as Awaited<ReturnType<typeof importCoursePackage>>);
+    await waitFor(() => expect(listItems).toHaveBeenCalledTimes(2));
+
+    const editor = document.querySelector(".asr-manual-editor textarea") as HTMLTextAreaElement;
+    expect(editor.value).toContain("正在校对的那一句");
+    expect(editor.value).not.toContain("导入课程的第一句");
   });
 
   it("does not embed Bilibili by default and offers force streaming", async () => {

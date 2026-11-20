@@ -456,6 +456,7 @@ const COPY = {
     transcriptSaveClearsTranslationConfirm: "这门课已有字幕译文。保存改动后的字幕会清空整份译文和翻译用的上下文摘要，需要时再重新翻译。确定保存吗？",
     localSubtitleReplaceConfirm: "当前课程已经有字幕。上传的字幕会替换现有字幕，已有的字幕译文也会被清空。确定继续吗？",
     asrPreviewInvalid: "修改后预览里有一行无法识别，原字幕没有改动",
+    asrDiscardPreviewDraft: "放弃预览里的改动",
     asrLeaveConfirm: "工作台里有未保存的字幕修改或还没处理的校正建议，离开后会丢失；正在进行的校正也会停止。确定返回主工作台吗？",
     runAsrCorrection: "生成校正建议",
     asrModel: "ASR 校正模型",
@@ -834,6 +835,7 @@ const COPY = {
     transcriptSaveClearsTranslationConfirm: "This course has a subtitle translation. Saving the changed transcript clears the whole translation and its context summary; translate again when needed. Save anyway?",
     localSubtitleReplaceConfirm: "This course already has subtitles. The uploaded file replaces them and clears the existing subtitle translation. Continue?",
     asrPreviewInvalid: "A line in the after preview can't be read; the source transcript is unchanged",
+    asrDiscardPreviewDraft: "Discard preview edits",
     asrLeaveConfirm: "The workbench has unsaved transcript edits or unreviewed suggestions that will be lost, and a running correction will be stopped. Go back to the main workspace?",
     runAsrCorrection: "Generate suggestions",
     asrModel: "ASR correction model",
@@ -1433,6 +1435,13 @@ export function App() {
   }, [selected?.id, selectedHasStudy, timeMapAutoOpen]);
 
   function selectCourse(item: CourseItem | null) {
+    if (viewRef.current === "asr") {
+      // The ASR workbench shows no course list, so any selection made while it
+      // is open comes from work finishing in the background (an import, an
+      // extraction). Keep the course being edited.
+      setSelected((current) => (current && item?.id !== current.id ? current : item));
+      return;
+    }
     setSelected(item);
     if (item?.source_url) {
       setUrl(item.source_url);
@@ -4804,6 +4813,8 @@ function AsrWorkbench({
   const [userContext, setUserContext] = useState("");
   // Text typed into the after preview that does not parse yet; never written to the source.
   const [previewDraft, setPreviewDraft] = useState<string | null>(null);
+  // From pressing Run until the job exists: no job id to cancel yet.
+  const [correctionStarting, setCorrectionStarting] = useState(false);
   const [searchSettings, setSearchSettings] = useState<AsrSearchSettings | null>(null);
   const [searchDraft, setSearchDraft] = useState<AsrSearchDraft>({
     enabled: false,
@@ -4930,7 +4941,7 @@ function AsrWorkbench({
   // Everything here lives only in this view: edits, accepted or unreviewed
   // suggestions, and a running correction whose result would be lost.
   const hasUnsavedWork = editorText !== savedEditorText || previewDraft !== null
-    || pendingSuggestions.length > 0 || canCancelCorrectionJob;
+    || pendingSuggestions.length > 0 || canCancelCorrectionJob || correctionStarting;
 
   useEffect(() => {
     if (!hasUnsavedWork) return;
@@ -5003,8 +5014,11 @@ function AsrWorkbench({
     try {
       const transcript = editorTextToTranscript(editorText);
       setBusy(`${copy.runAsrCorrection} 0%`);
+      setCorrectionStarting(true);
       const searchConfig = searchDraftToConfig(searchDraft);
       const nextSearchSettings = await saveAsrSearchSettings(searchDraftToSettingsInput(searchDraft));
+      // Left while the settings were saving: never start a job nobody follows.
+      if (!mountedRef.current) return;
       setSearchSettings(nextSearchSettings);
       const firstStatus = await startAsrCorrectionJob(item.id, {
         output_language: outputLanguage,
@@ -5013,6 +5027,12 @@ function AsrWorkbench({
         user_context: userContext.trim() || undefined,
         search: searchConfig,
       });
+      if (!mountedRef.current) {
+        // The job was created after the workbench closed; stop its model calls.
+        void cancelJob(firstStatus.job_id).catch(() => undefined);
+        return;
+      }
+      setCorrectionStarting(false);
       setJobStatus(firstStatus);
       let current = firstStatus;
       while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
@@ -5037,6 +5057,7 @@ function AsrWorkbench({
     } catch (err) {
       setError(asrCorrectionErrorMessage(err, copy));
     } finally {
+      if (mountedRef.current) setCorrectionStarting(false);
       setBusy(null);
     }
   }
@@ -5091,6 +5112,9 @@ function AsrWorkbench({
 
   async function saveTranscriptText(nextEditorText: string) {
     if (!item) return;
+    // Every save path, including auto-save after accepting, waits for the
+    // after preview to read again.
+    if (previewDraft !== null) throw new Error(copy.asrPreviewInvalid);
     const transcript = editorTextToTranscript(nextEditorText);
     const next = await onSaveTranscript(item.id, transcript, item.transcript_language ?? null);
     if (!next) return;
@@ -5101,7 +5125,7 @@ function AsrWorkbench({
 
   async function acceptSuggestion(suggestionId: string) {
     const suggestion = suggestions.find((entry) => entry.id === suggestionId);
-    if (!suggestion) return;
+    if (!suggestion || suggestionsFrozenByDraft()) return;
     try {
       const transcript = editorTextToTranscript(editorText);
       const nextTranscript = applyAsrSuggestion(transcript, suggestion);
@@ -5118,7 +5142,21 @@ function AsrWorkbench({
     }
   }
 
+  // The unreadable preview draft was typed over the current suggestions;
+  // accepting or rejecting one now would change what the draft means.
+  function suggestionsFrozenByDraft() {
+    if (previewDraft === null) return false;
+    setError(copy.asrPreviewInvalid);
+    return true;
+  }
+
+  function discardPreviewDraft() {
+    setPreviewDraft(null);
+    setError(null);
+  }
+
   function rejectSuggestion(suggestionId: string) {
+    if (suggestionsFrozenByDraft()) return;
     setSuggestions((current) =>
       current.map((entry) => (entry.id === suggestionId ? { ...entry, status: "rejected" } : entry)),
     );
@@ -5135,7 +5173,7 @@ function AsrWorkbench({
   }
 
   async function acceptSuggestionBatch(targetSuggestions: AsrCorrectionSuggestion[]) {
-    if (!targetSuggestions.length) return;
+    if (!targetSuggestions.length || suggestionsFrozenByDraft()) return;
     try {
       const acceptedIds = new Set(targetSuggestions.map((suggestion) => suggestion.id));
       const transcript = targetSuggestions.reduce(
@@ -5440,7 +5478,7 @@ function AsrWorkbench({
                 {copy.saveTranscript}
               </button>
             </div>
-            {hasCorrectionSuggestions ? (
+            {hasCorrectionSuggestions || previewDraft !== null ? (
               <div className="asr-transcript-compare">
                 <div className="asr-transcript-pane source">
                   <div className="asr-pane-label">{copy.asrBeforeTranscript}</div>
@@ -5460,6 +5498,12 @@ function AsrWorkbench({
                 <div className="asr-transcript-pane preview">
                   <div className="asr-pane-label with-nav">
                     <span>{copy.asrAfterTranscript}</span>
+                    {previewDraft !== null ? (
+                      <button type="button" onClick={discardPreviewDraft}>
+                        <X size={13} />
+                        {copy.asrDiscardPreviewDraft}
+                      </button>
+                    ) : null}
                     <div className="asr-pane-review-nav" aria-label={copy.correctionSuggestions}>
                       <button
                         type="button"
