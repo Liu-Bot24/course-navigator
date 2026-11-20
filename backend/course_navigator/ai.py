@@ -3363,10 +3363,16 @@ def _first_words(text: str, count: int) -> str:
 
 def _loads_json_content(content: str) -> object:
     stripped = content.strip()
-    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", stripped, flags=re.DOTALL)
-    if fence_match:
-        stripped = fence_match.group(1).strip()
-    return json.loads(stripped)
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        # Fenced output: the payload runs from the first fence to the last one,
+        # since string values (notes on code) may hold fences of their own.
+        opening = re.search(r"```(?:json)?[ \t]*\r?\n?", stripped)
+        closing = stripped.rfind("```")
+        if not opening or closing < opening.end():
+            raise
+        return json.loads(stripped[opening.end():closing].strip())
 
 
 def _repair_json_content(

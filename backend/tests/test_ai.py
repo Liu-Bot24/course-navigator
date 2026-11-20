@@ -1,3 +1,4 @@
+import json
 from threading import Event, Lock
 from time import sleep
 
@@ -7,6 +8,23 @@ import pytest
 import course_navigator.ai as ai
 from course_navigator.ai import LlmProvider, _chat_text, generate_study_material
 from course_navigator.models import OutlineNode, StudyMaterial, TimeRange, TranscriptSegment, VideoMetadata
+
+
+@pytest.mark.parametrize("wrap", [
+    lambda payload: payload,
+    lambda payload: f"```json\n{payload}\n```",
+    lambda payload: f"Here is the result:\n```\n{payload}\n```\nDone.",
+])
+def test_model_json_with_code_fences_inside_string_values_parses(wrap):
+    notes = "Run it like this:\n```python\nprint('hi')\n```\nThen compare outputs."
+    payload = json.dumps({"detailed_notes": notes, "items": [1, 2]})
+
+    assert ai._loads_json_content(wrap(payload)) == {"detailed_notes": notes, "items": [1, 2]}
+
+
+def test_model_json_that_is_not_json_still_reports_a_decode_error():
+    with pytest.raises(json.JSONDecodeError):
+        ai._loads_json_content("```json\n{not json}\n```")
 
 
 def test_generate_study_material_fallback_preserves_transcript_detail():
