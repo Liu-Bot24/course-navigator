@@ -1126,9 +1126,9 @@ export function App() {
   selectedRef.current = selected;
   const itemsRef = useRef(items);
   itemsRef.current = items;
-  // Course lists are numbered as they are asked for; each deleted course keeps
-  // the last number asked for before its deletion finished, so a list that was
-  // already on its way cannot bring it back.
+  // Course lists and single-course fetches are numbered as they are asked for;
+  // each deleted course keeps the last number asked for before its deletion
+  // finished, so a response that was already on its way cannot bring it back.
   const listRequestCountRef = useRef(0);
   const deletedCourseListMarksRef = useRef(new Map<string, number>());
   const viewRef = useRef(view);
@@ -1482,8 +1482,10 @@ export function App() {
   }
 
   async function refreshItemInList(itemId: string) {
+    const requestNumber = ++listRequestCountRef.current;
     const updated = await getItem(itemId);
-    if (!updated) return;
+    // Asked for before the course's deletion finished: it is gone now.
+    if (!updated || requestNumber <= (deletedCourseListMarksRef.current.get(updated.id) ?? 0)) return;
     setItems((current) => {
       const exists = current.some((item) => item.id === updated.id);
       return exists ? current.map((item) => (item.id === updated.id ? updated : item)) : [updated, ...current];

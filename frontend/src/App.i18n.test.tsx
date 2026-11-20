@@ -2348,6 +2348,49 @@ describe("App language defaults", () => {
     expect(listItems).toHaveBeenCalledTimes(1);
   });
 
+  it("does not bring back a course deleted while its translation progress was being fetched", async () => {
+    const lesson = (id: string): CourseItem => ({
+      id, source_url: `https://example.com/${id}`, title: id, duration: 2,
+      created_at: new Date().toISOString(), transcript: [{ start: 0, end: 2, text: "Source" }],
+      metadata: null, study: null, local_video_path: null,
+    });
+    const doomed = lesson("translating-course");
+    const kept = lesson("kept-course");
+    const running: StudyJobStatus = {
+      job_id: "doomed-job", item_id: doomed.id, status: "running", progress: 30,
+      phase: "translation", message: "Translating", error: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([doomed, kept]);
+    vi.mocked(startTranslationJob).mockResolvedValueOnce(running);
+    vi.mocked(getStudyJob).mockResolvedValueOnce(running).mockResolvedValueOnce({
+      ...running, status: "failed", progress: 100, phase: "failed", error: "Course not found",
+    });
+    let sendStaleCourse: (item: CourseItem) => void = () => undefined;
+    apiMocks.getItem
+      .mockImplementationOnce(() => new Promise((resolve) => { sendStaleCourse = resolve; }))
+      .mockResolvedValueOnce(null);
+    vi.mocked(deleteCourse).mockResolvedValueOnce(undefined as never);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const listed = () => [...document.querySelectorAll(".library-entry .library-title-line > span")].map((el) => el.textContent).sort();
+
+    render(<App />);
+    await waitFor(() => expect(listed()).toEqual(["kept-course", "translating-course"]));
+    fireEvent.click(screen.getAllByText("translating-course").find((element) => element.closest(".library-item"))!);
+    fireEvent.click(await screen.findByRole("button", { name: "翻译字幕" }));
+    await waitFor(() => expect(apiMocks.getItem).toHaveBeenCalledTimes(1), { timeout: 4000 });
+
+    vi.mocked(listItems).mockResolvedValueOnce([kept]);
+    fireEvent.click(screen.getByRole("button", { name: "删除课程 translating-course" }));
+    await waitFor(() => expect(listed()).toEqual(["kept-course"]));
+
+    await act(async () => {
+      sendStaleCourse(doomed);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(listed()).toEqual(["kept-course"]);
+    confirmSpy.mockRestore();
+  });
+
   it("shows a cancel action while translating subtitles", async () => {
     const item = {
       id: "translation-lesson",
