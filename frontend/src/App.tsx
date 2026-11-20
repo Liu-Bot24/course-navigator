@@ -6064,12 +6064,17 @@ function isBlankModelProfileDraft(profile: ModelProfileDraft): boolean {
 }
 
 function settingsDraftToInput(draft: SettingsDraft): ModelSettingsInput {
+  const profiles = modelProfileDraftsToInput(draft.profiles);
+  const savedIds = new Set(profiles.map((profile) => profile.id));
+  // Blank profiles are not saved (the starter one on a fresh install); a role
+  // still pointing at one moves to the first profile that is saved.
+  const savedRole = (id: string) => (savedIds.has(id) || !profiles.length ? id : profiles[0].id);
   return {
-    profiles: modelProfileDraftsToInput(draft.profiles),
-    translation_model_id: draft.translation_model_id,
-    learning_model_id: draft.learning_model_id,
-    global_model_id: draft.global_model_id,
-    asr_model_id: draft.asr_model_id,
+    profiles,
+    translation_model_id: savedRole(draft.translation_model_id),
+    learning_model_id: savedRole(draft.learning_model_id),
+    global_model_id: savedRole(draft.global_model_id),
+    asr_model_id: savedRole(draft.asr_model_id),
     study_detail_level: draft.study_detail_level,
     task_parameters: taskParameterDraftsToInput(draft.task_parameters),
   };

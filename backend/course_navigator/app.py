@@ -1240,7 +1240,7 @@ def create_app(
                                 == llm_service_identity(base_url, profile.provider_type))
                 api_key = profile.api_key.strip() if profile.api_key else (previous.api_key if same_service else None)
                 if not profile_id or not base_url or not model:
-                    raise HTTPException(status_code=400, detail="Profile id, Base URL, and model are required")
+                    raise HTTPException(status_code=400, detail="模型档案要填写 Base URL 和模型名 / A model profile needs a Base URL and a model")
                 profiles.append(
                     ModelProfileConfig(
                         id=profile_id,
@@ -1254,7 +1254,7 @@ def create_app(
                     )
                 )
             if not profiles:
-                raise HTTPException(status_code=400, detail="At least one model profile is required")
+                raise HTTPException(status_code=400, detail="至少需要一个模型档案 / At least one model profile is required")
             profile_ids = {profile.id for profile in profiles}
             translation_model_id = request.translation_model_id.strip()
             learning_model_id = request.learning_model_id.strip()
@@ -1264,7 +1264,7 @@ def create_app(
                 asr_model_id = global_model_id if global_model_id in profile_ids else profiles[0].id
             role_ids = {translation_model_id, learning_model_id, global_model_id, asr_model_id}
             if not role_ids <= profile_ids:
-                raise HTTPException(status_code=400, detail="Every model slot must reference an existing profile")
+                raise HTTPException(status_code=400, detail="每个模型用途都要选一个已保存的模型档案 / Every model role must use a saved profile")
             default_profile = next((profile for profile in profiles if profile.id == learning_model_id), profiles[0])
             next_settings = current.model_copy(
                 update={
