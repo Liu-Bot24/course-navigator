@@ -2798,6 +2798,11 @@ export function App() {
   async function handleSaveModelRole(role: ModelRoleKey, profileId: string) {
     const previousRoleId = settingsDraft[role];
     setSettingsDraft((current) => ({ ...current, [role]: profileId }));
+    if (!modelSettings?.profiles.some((profile) => profile.id === profileId)) {
+      // A profile not saved yet (the first one on a fresh install): the choice
+      // stays in the draft and is saved together with the profile.
+      return;
+    }
     setRoleSettingsBusy(true);
     setRoleSettingsMessage(copy.modelRolesSaving);
     try {

@@ -2449,6 +2449,51 @@ describe("App language defaults", () => {
       .toEqual([savedId, savedId, savedId, savedId]);
   });
 
+  it("keeps a role picked for the first, unsaved profile and saves it with that profile", async () => {
+    vi.mocked(getModelSettings).mockResolvedValueOnce({
+      profiles: [],
+      translation_model_id: "",
+      learning_model_id: "",
+      global_model_id: "",
+      asr_model_id: "",
+      study_detail_level: "standard",
+      task_parameters: {},
+    });
+    vi.mocked(saveModelSettings).mockImplementationOnce(async (input) => ({
+      profiles: input.profiles.map((profile) => ({
+        id: profile.id, name: profile.name, provider_type: profile.provider_type, base_url: profile.base_url,
+        model: profile.model, context_window: null, max_tokens: null, has_api_key: true, api_key_preview: "sk...test",
+      })),
+      translation_model_id: input.translation_model_id,
+      learning_model_id: input.learning_model_id,
+      global_model_id: input.global_model_id,
+      asr_model_id: input.asr_model_id,
+      study_detail_level: input.study_detail_level,
+      task_parameters: input.task_parameters,
+    }));
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "模型设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "新增档案" }));
+    fireEvent.change(screen.getByLabelText("档案名称"), { target: { value: "First model" } });
+    fireEvent.change(screen.getByLabelText("接口地址"), { target: { value: "https://api.first.example/v1" } });
+    fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-test" } });
+    fireEvent.change(screen.getByLabelText("模型"), { target: { value: "provider/first-chat" } });
+    // The label also holds the field's help text.
+    const learningRole = screen.getByLabelText(/^详解模型/) as HTMLSelectElement;
+    const firstModel = [...learningRole.options].find((option) => option.textContent?.includes("First model"));
+    expect(firstModel).toBeDefined();
+    fireEvent.change(learningRole, { target: { value: firstModel!.value } });
+
+    expect(saveModelSettings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "保存档案" }));
+
+    await waitFor(() => expect(saveModelSettings).toHaveBeenCalledTimes(1));
+    const payload = vi.mocked(saveModelSettings).mock.calls[0][0];
+    expect(payload.profiles.map((profile) => profile.id)).toEqual([firstModel!.value]);
+    expect(payload.learning_model_id).toBe(firstModel!.value);
+  });
+
   it("ignores untouched blank model profile drafts when saving settings", async () => {
     vi.mocked(saveModelSettings).mockImplementationOnce(async (input) => ({
       profiles: input.profiles.map((profile) => ({
