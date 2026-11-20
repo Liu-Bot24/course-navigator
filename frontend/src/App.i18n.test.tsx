@@ -2030,6 +2030,8 @@ describe("App language defaults", () => {
       exportedBlob = null;
       vi.mocked(listItems).mockResolvedValueOnce([item]);
       const view = render(<App />);
+      // The export dialog lists what is loaded, so wait for the course first.
+      await waitFor(() => expect(screen.getAllByText(item.title).length).toBeGreaterThan(0));
       fireEvent.click(await screen.findByRole("button", { name: "导出课程" }));
       fireEvent.click(await screen.findByRole("button", { name: "导出所选" }));
       await waitFor(() => expect(exportedBlob).toBeTruthy());
