@@ -82,7 +82,10 @@ def _dedupe_rollup_segments(segments: list[TranscriptSegment]) -> list[Transcrip
     for segment in sorted(segments, key=lambda item: (item.start, item.end, len(item.text))):
         if collapsed:
             previous = collapsed[-1]
-            near_same_start = abs(segment.start - last_member_starts[-1]) <= 0.2
+            # Rolling cues touch or overlap the cue they grow from; a cue that
+            # starts after a gap is new speech even when it repeats the words.
+            touches = segment.start <= previous.end + 0.001
+            near_same_start = touches and abs(segment.start - last_member_starts[-1]) <= 0.2
             if near_same_start and segment.text.startswith(previous.text):
                 # The longer cue replaces the shorter one but keeps the earlier
                 # start, so the cue still touches the one it repeats.

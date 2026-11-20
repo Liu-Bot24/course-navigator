@@ -150,6 +150,24 @@ hello world again
     assert [(segment.start, segment.text) for segment in segments] == [(0.0, "hello world again")]
 
 
+def test_parse_subtitles_keeps_short_cues_that_repeat_a_word_after_gaps():
+    raw = """WEBVTT
+
+00:00:00.000 --> 00:00:00.100
+go
+
+00:00:00.150 --> 00:00:00.250
+go
+
+00:00:00.300 --> 00:00:00.400
+go
+"""
+
+    segments = parse_subtitle_text(raw, "vtt")
+
+    assert [segment.start for segment in segments] == [0.0, 0.15, 0.3]
+
+
 def test_parse_srt_keeps_numeric_text_and_cues_without_blank_lines():
     raw = """1
 00:00:01,000 --> 00:00:02,000
