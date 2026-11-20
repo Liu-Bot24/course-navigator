@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import Event
 from time import sleep
 
+import pytest
 from fastapi.testclient import TestClient
 
 import course_navigator.app as app_module
@@ -354,6 +355,23 @@ def test_import_course_package_saves_finished_course_without_local_artifacts(tmp
     assert client.get("/api/items/abc123-imported").json()["transcript"][1]["text"] == "Corrected detail."
     assert not (tmp_path / "subtitles" / "abc123-imported").exists()
     assert not (tmp_path / "downloads").exists()
+
+
+@pytest.mark.parametrize("source_url", ["--version", " --config-locations=C:/x.conf", "-f"])
+def test_import_course_package_rejects_a_source_that_reads_as_a_downloader_option(tmp_path, source_url):
+    client = make_client(tmp_path)
+
+    response = client.post(
+        "/api/import",
+        json={
+            "format": "course-navigator-share",
+            "items": [{"source_url": source_url, "title": "Shared lesson",
+                       "transcript": [{"start": 0, "end": 2, "text": "Opening."}]}],
+        },
+    )
+
+    assert response.status_code == 422
+    assert client.get("/api/items").json() == []
 
 
 def test_import_course_package_writes_course_record_to_workspace_only(tmp_path):

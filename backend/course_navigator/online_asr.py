@@ -108,6 +108,8 @@ def _extract_audio(
             output_template,
             *build_runtime_args(),
             *build_auth_args(active_request),
+            # Everything after this marker is a source, never an option.
+            "--",
             str(active_request.url),
         ]
 

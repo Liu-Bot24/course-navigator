@@ -126,6 +126,7 @@ import type {
   TranscriptSource,
   TranscriptSegment,
   UiLanguage,
+  VideoMetadata,
   VideoSourceBindingInput,
 } from "./types";
 import { buildWebVttTrack, canonicalSourceKey, formatTime, getBilibiliVideoId, getYouTubeVideoId } from "./utils";
@@ -1939,7 +1940,7 @@ export function App() {
         transcript: item.transcript,
         transcript_source: "imported" as const,
         transcript_language: item.transcript_language ?? null,
-        metadata: item.metadata ?? null,
+        metadata: sharedCourseMetadata(item),
         study: item.study ?? null,
       };
     });
@@ -8120,6 +8121,19 @@ function downloadJsonFile(payload: unknown, fileName: string) {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+/**
+ * YouTube and Bilibili lessons play through the site's own embed, so their
+ * downloaded stream addresses are useless to a receiver and carry the
+ * exporter's network address and a signature; other sites play from them.
+ */
+function sharedCourseMetadata(item: CourseItem): VideoMetadata | null {
+  const metadata = item.metadata ?? null;
+  if (!metadata) return null;
+  const playsThroughEmbed = Boolean(getYouTubeVideoId(item.source_url) || getBilibiliVideoId(item.source_url)
+    || getBilibiliVideoId(metadata.webpage_url ?? ""));
+  return playsThroughEmbed ? { ...metadata, stream_url: null, hls_manifest_url: null } : metadata;
 }
 
 function coursePackageFileName(items: CourseSharePackage["items"]): string {

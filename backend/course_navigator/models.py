@@ -414,6 +414,9 @@ class CourseShareItem(BaseModel):
     metadata: VideoMetadata | None = None
     study: StudyMaterial | None = None
 
+    # A package comes from someone else; its sources get the same check as typed ones.
+    _validate_source_url = field_validator("source_url")(validate_source_url)
+
 
 class CourseSharePackage(BaseModel):
     format: Literal["course-navigator-share"] = "course-navigator-share"

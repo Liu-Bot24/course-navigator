@@ -1625,6 +1625,64 @@ describe("App language defaults", () => {
     createObjectUrl.mockRestore();
   });
 
+  it("leaves out stream addresses that a receiver plays through the site's embed", async () => {
+    let exportedBlob: Blob | null = null;
+    const createObjectUrl = vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
+      // The player also makes caption-track blobs; only the package is JSON.
+      if ((blob as Blob).type.startsWith("application/json")) exportedBlob = blob as Blob;
+      return "blob:course-package";
+    });
+    const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const course = (id: string, sourceUrl: string, streamUrl: string): CourseItem => ({
+      id,
+      source_url: sourceUrl,
+      title: id,
+      duration: 60,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "Opening." }],
+      metadata: {
+        id,
+        title: id,
+        duration: 60,
+        webpage_url: sourceUrl,
+        extractor: "generic",
+        stream_url: streamUrl,
+        hls_manifest_url: streamUrl,
+        language: "en",
+        subtitles: [],
+        automatic_captions: [],
+      },
+      study: null,
+      local_video_path: null,
+    });
+    async function exportOnly(item: CourseItem) {
+      exportedBlob = null;
+      vi.mocked(listItems).mockResolvedValueOnce([item]);
+      const view = render(<App />);
+      fireEvent.click(await screen.findByRole("button", { name: "导出课程" }));
+      fireEvent.click(await screen.findByRole("button", { name: "导出所选" }));
+      await waitFor(() => expect(exportedBlob).toBeTruthy());
+      const exported = JSON.parse(await readBlobText(exportedBlob!));
+      view.unmount();
+      return exported;
+    }
+
+    const youtube = await exportOnly(course("youtube-course", "https://www.youtube.com/watch?v=abc123",
+      "https://rr1.googlevideo.com/videoplayback?ip=203.0.113.7&sig=x"));
+    expect(JSON.stringify(youtube)).not.toContain("203.0.113.7");
+    expect(youtube.items[0].metadata.stream_url).toBeNull();
+    expect(youtube.items[0].metadata.hls_manifest_url).toBeNull();
+
+    const hls = await exportOnly(course("hls-course", "https://learn.deeplearning.ai/courses/example",
+      "https://video.deeplearning.ai/example/master.m3u8"));
+    expect(hls.items[0].metadata.stream_url).toBe("https://video.deeplearning.ai/example/master.m3u8");
+
+    anchorClick.mockRestore();
+    revokeObjectUrl.mockRestore();
+    createObjectUrl.mockRestore();
+  });
+
   it("falls back to transcript duration and shows translated title when available", async () => {
     vi.mocked(listItems).mockResolvedValueOnce([
       {

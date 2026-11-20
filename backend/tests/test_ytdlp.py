@@ -148,6 +148,30 @@ def test_default_ytdlp_runner_uses_current_python_module(monkeypatch):
     assert calls[0][:3] == [sys.executable, "-m", "yt_dlp"]
 
 
+def test_downloader_commands_end_options_before_the_source(monkeypatch, tmp_path):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = json.dumps({"id": "abc123", "title": "A Lesson", "extractor": "youtube"})
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, check, **_kwargs):
+        calls.append(cmd)
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    source = "https://www.youtube.com/watch?v=-abc"
+    request = ExtractRequest(url=source)
+
+    YtDlpRunner().fetch_metadata(request)
+    with pytest.raises(YtDlpError):
+        YtDlpRunner().extract_subtitles(request, tmp_path / "subs")
+
+    assert len(calls) == 2
+    assert all(cmd[-2:] == ["--", source] and cmd.count("--") == 1 for cmd in calls)
+
+
 def test_metadata_and_subtitle_queries_fail_instead_of_hanging(monkeypatch, tmp_path):
     timeouts = []
 

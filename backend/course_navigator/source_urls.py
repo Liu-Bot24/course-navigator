@@ -4,6 +4,9 @@ from urllib.parse import ParseResult, urlparse
 
 def validate_source_url(value: str) -> str:
     value = value.strip()
+    # A leading dash would be read by yt-dlp as an option, not as a source.
+    if value.startswith("-"):
+        raise ValueError("Source URL cannot start with '-'")
     parse_source_url(value)
     return value
 

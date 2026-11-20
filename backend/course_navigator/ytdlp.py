@@ -117,6 +117,8 @@ class YtDlpRunner:
                 "--sub-format",
                 "vtt/srt/best",
                 *build_auth_args(active_request),
+                # Everything after this marker is a source, never an option.
+                "--",
                 str(active_request.url),
             ]
 
@@ -175,6 +177,8 @@ class YtDlpRunner:
                 output_template,
                 *build_runtime_args(),
                 *build_auth_args(active_request),
+                # Everything after this marker is a source, never an option.
+                "--",
                 str(active_request.url),
             ]
 
@@ -221,6 +225,8 @@ class YtDlpRunner:
                 output_template,
                 *build_runtime_args(),
                 *build_auth_args(command_request),
+                # Everything after this marker is a source, never an option.
+                "--",
                 str(command_request.url),
             ]
             process = popen_hidden(
@@ -298,6 +304,8 @@ class YtDlpRunner:
                 audio_template,
                 *build_runtime_args(),
                 *build_auth_args(active_request),
+                # Everything after this marker is a source, never an option.
+                "--",
                 str(active_request.url),
             ]
 
