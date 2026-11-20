@@ -3219,7 +3219,9 @@ def _loads_json_content(content: str) -> object:
         # Fenced output: the payload runs from the first fence to the last one,
         # since string values (notes on code) may hold fences of their own.
         opening = re.search(r"```(?:json)?[ \t]*\r?\n?", stripped)
-        closing = stripped.rfind("```")
+        # A closing fence ends its line; "```text" opens another block.
+        closings = list(re.finditer(r"```[ \t]*(?=\r?\n|$)", stripped))
+        closing = closings[-1].start() if closings else -1
         if not opening or closing < opening.end():
             raise
         try:
