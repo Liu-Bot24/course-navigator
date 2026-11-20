@@ -61,6 +61,8 @@ _CURRENT_CANCEL_CALLBACK: ContextVar[CancelCallback | None] = ContextVar("course
 STUDY_GENERATION_VERSION = 3
 NO_LEARNING_MODEL_MESSAGE = "未配置可用的学习模型，请先在模型设置里添加模型档案并填写 API Key。"
 NO_TRANSCRIPT_MESSAGE = "这门课还没有字幕，请先获取字幕再生成学习材料。"
+# The summary the app writes into a record that only holds a title translation.
+TITLE_TRANSLATION_PLACEHOLDER_SUFFIX = "已更新标题译文。"
 
 
 def study_cache_matches(study: StudyMaterial | None, title: str, transcript: list[TranscriptSegment],
@@ -86,12 +88,15 @@ def study_learning_usable(study: StudyMaterial | None, title: str, transcript: l
     if not study:
         return False
     if study_has_no_provenance(study):
-        # A record made only to hold a hand-typed title translation has a
-        # one-line summary but no learning content; it was never generated.
-        # 0.1.6 could also generate the guide alone, so guide fields count too.
+        # 0.1.6 could generate the guide alone, even just its one-line summary,
+        # so any learning content or a generated summary counts. A record made
+        # only to hold a hand-typed title translation carries a fixed summary
+        # and was never generated.
+        one_line = study.one_line.strip()
         return bool(study.time_map or study.outline or study.detailed_notes.strip()
                     or study.high_fidelity_text.strip() or study.prerequisites or study.thought_prompts
-                    or study.review_suggestions or study.beginner_focus or study.experienced_guidance)
+                    or study.review_suggestions or study.beginner_focus or study.experienced_guidance
+                    or (one_line and not one_line.endswith(TITLE_TRANSLATION_PLACEHOLDER_SUFFIX)))
     return study.learning_complete and study_cache_matches(study, title, transcript, output_language,
                                                            source_language, metadata)
 

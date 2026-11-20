@@ -103,12 +103,15 @@ def test_a_record_holding_only_a_title_translation_is_not_usable_material():
                                time_map=[], outline=[], detailed_notes="", high_fidelity_text="")
     legacy = title_only.model_copy(update={"outline": [OutlineNode(id="o1", start=0, end=1, title="Intro", summary="")]})
 
-    # 0.1.6 could generate the guide alone on top of a title-only record.
+    # 0.1.6 could generate the guide alone on top of a title-only record,
+    # sometimes with nothing but its one-line summary.
     guide_only = title_only.model_copy(update={"thought_prompts": ["为什么要先做实验？"]})
+    summary_only = title_only.model_copy(update={"one_line": "这节课讲怎样设计对照实验。"})
 
     assert not ai.study_learning_usable(title_only, "Lesson", transcript, "zh-CN")
     assert ai.study_learning_usable(legacy, "Lesson", transcript, "zh-CN")
     assert ai.study_learning_usable(guide_only, "Lesson", transcript, "zh-CN")
+    assert ai.study_learning_usable(summary_only, "Lesson", transcript, "zh-CN")
 
 
 def test_long_transcript_provider_path_builds_layered_study_material(monkeypatch):

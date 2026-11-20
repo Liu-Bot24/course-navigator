@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .ai import stamp_study_cache, study_cache_matches, study_learning_usable, LlmCancelled, _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
+from .ai import TITLE_TRANSLATION_PLACEHOLDER_SUFFIX, stamp_study_cache, study_cache_matches, study_learning_usable, LlmCancelled, _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
 from . import artifacts
 from .asr import search_endpoint, suggest_asr_corrections
 from .config import (
@@ -824,7 +824,7 @@ def create_app(
                 updates["study"] = item.study.model_copy(update={"translated_title": translated_title or None})
             elif translated_title:
                 updates["study"] = StudyMaterial(
-                    one_line=f"{item.title} 已更新标题译文。",
+                    one_line=f"{item.title} {TITLE_TRANSLATION_PLACEHOLDER_SUFFIX}",
                     translated_title=translated_title,
                     time_map=[],
                     outline=[],
