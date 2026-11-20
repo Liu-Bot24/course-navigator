@@ -2073,6 +2073,11 @@ mod tests {
             .unwrap();
         assert!(status.success());
         env::set_var("APPDATA", &support);
+        // The case that broke Expand-Archive: a PowerShell 7 module path passed on.
+        let ps7_modules = Path::new(r"C:\Program Files\PowerShell\7\Modules");
+        if ps7_modules.is_dir() {
+            env::set_var("PSModulePath", ps7_modules);
+        }
         let url = format!("file:///{}", zip.display().to_string().replace('\\', "/"));
         env::set_var("COURSE_NAVIGATOR_WINDOWS_FFMPEG_URL", &url);
 
