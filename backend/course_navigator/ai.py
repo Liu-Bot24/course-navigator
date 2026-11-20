@@ -3215,7 +3215,15 @@ def _loads_json_content(content: str) -> object:
         closing = stripped.rfind("```")
         if not opening or closing < opening.end():
             raise
-        return json.loads(stripped[opening.end():closing].strip())
+        try:
+            return json.loads(stripped[opening.end():closing].strip())
+        except json.JSONDecodeError:
+            # A complete JSON block followed by a separate fenced block.
+            value, end = json.JSONDecoder().raw_decode(stripped[opening.end():].lstrip())
+            rest = stripped[opening.end():].lstrip()[end:].lstrip()
+            if not rest.startswith("```"):
+                raise
+            return value
 
 
 def _repair_json_content(

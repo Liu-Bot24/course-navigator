@@ -14,6 +14,7 @@ from course_navigator.models import OutlineNode, StudyMaterial, TimeRange, Trans
     lambda payload: payload,
     lambda payload: f"```json\n{payload}\n```",
     lambda payload: f"Here is the result:\n```\n{payload}\n```\nDone.",
+    lambda payload: f"```json\n{payload}\n```\nNotes:\n```text\nchecked twice\n```",
 ])
 def test_model_json_with_code_fences_inside_string_values_parses(wrap):
     notes = "Run it like this:\n```python\nprint('hi')\n```\nThen compare outputs."
