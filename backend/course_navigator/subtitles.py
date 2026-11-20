@@ -31,6 +31,10 @@ def parse_subtitle_text(raw: str, subtitle_format: str) -> list[TranscriptSegmen
         end = _timestamp_to_seconds(match.group("end"))
         text_lines: list[str] = []
         index += 1
+        # YouTube opens a block of rolling captions with a line holding only a
+        # space. In WebVTT only an empty line ends a cue, so it must not end this one.
+        if normalized_format == "vtt" and index < len(lines) and lines[index] and not lines[index].strip():
+            index += 1
 
         while index < len(lines) and lines[index].strip():
             candidate = lines[index].strip()
@@ -72,10 +76,13 @@ def _dedupe_rollup_segments(segments: list[TranscriptSegment]) -> list[Transcrip
         return []
 
     collapsed: list[TranscriptSegment] = []
+    # Start of the last cue merged into each collapsed entry: a chain of growing
+    # cues is compared step by step, not against the first cue of the chain.
+    last_member_starts: list[float] = []
     for segment in sorted(segments, key=lambda item: (item.start, item.end, len(item.text))):
         if collapsed:
             previous = collapsed[-1]
-            near_same_start = abs(segment.start - previous.start) <= 0.2
+            near_same_start = abs(segment.start - last_member_starts[-1]) <= 0.2
             if near_same_start and segment.text.startswith(previous.text):
                 # The longer cue replaces the shorter one but keeps the earlier
                 # start, so the cue still touches the one it repeats.
@@ -84,10 +91,12 @@ def _dedupe_rollup_segments(segments: list[TranscriptSegment]) -> list[Transcrip
                     end=max(previous.end, segment.end),
                     text=segment.text,
                 )
+                last_member_starts[-1] = segment.start
                 continue
             if near_same_start and previous.text.startswith(segment.text):
                 continue
         collapsed.append(segment)
+        last_member_starts.append(segment.start)
 
     incremental: list[TranscriptSegment] = []
     recent_words: list[str] = []
