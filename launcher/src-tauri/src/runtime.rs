@@ -2462,7 +2462,9 @@ mod tests {
         let state = ServiceState::new();
         let mut config = config();
         config.project_root = project_root.to_string_lossy().to_string();
+        // The single service listens on the web port, the one the stop waits on.
         config.api_port = port;
+        config.web_port = port;
 
         assert!(stop_configured_services(&state, &config).expect("stop listener"));
         assert!(!endpoint_listening("127.0.0.1", port));
