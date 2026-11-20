@@ -1663,6 +1663,61 @@ describe("App language defaults", () => {
     confirmSpy.mockRestore();
   });
 
+  it("drops a deleted course even when the list refresh fails or a stale list arrives late", async () => {
+    const lesson = (id: string): CourseItem => ({
+      id,
+      source_url: `https://example.com/${id}`,
+      title: id,
+      duration: 2,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "一句话" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    });
+    const kept = lesson("kept-course");
+    const early = lesson("early-course");
+    const late = lesson("late-course");
+    vi.mocked(listItems).mockResolvedValueOnce([early, late, kept]);
+    let finishEarly: () => void = () => undefined;
+    let finishLate: () => void = () => undefined;
+    vi.mocked(deleteCourse)
+      .mockImplementationOnce(() => new Promise((resolve) => { finishEarly = () => resolve(undefined as never); }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishLate = () => resolve(undefined as never); }));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const listed = () => [...document.querySelectorAll(".library-entry .library-title-line > span")].map((el) => el.textContent).sort();
+    const activeTitle = () => document.querySelector(".library-entry.active .library-title-line > span")?.textContent;
+
+    render(<App />);
+    await waitFor(() => expect(listed()).toEqual(["early-course", "kept-course", "late-course"]));
+    fireEvent.click(screen.getAllByText("early-course").find((element) => element.closest(".library-item"))!);
+    fireEvent.click(screen.getByRole("button", { name: "删除课程 early-course" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除课程 late-course" }));
+    await waitFor(() => expect(deleteCourse).toHaveBeenCalledTimes(2));
+
+    // The late course's deletion ends first; its refresh is slow and still lists the early course.
+    let sendStaleList: (items: CourseItem[]) => void = () => undefined;
+    vi.mocked(listItems).mockImplementationOnce(() => new Promise((resolve) => { sendStaleList = resolve; }));
+    finishLate();
+    await waitFor(() => expect(listItems).toHaveBeenCalledTimes(2));
+    expect(listed()).toEqual(["early-course", "kept-course"]);
+
+    // The early course's deletion succeeds but its own refresh fails.
+    vi.mocked(listItems).mockRejectedValueOnce(new Error("network down"));
+    finishEarly();
+    await waitFor(() => expect(listItems).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(listed()).toEqual(["kept-course"]));
+    expect(activeTitle()).toBe("kept-course");
+
+    await act(async () => {
+      sendStaleList([early, kept]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(listed()).toEqual(["kept-course"]);
+    expect((screen.getByRole("button", { name: "ASR 校正" }) as HTMLButtonElement).disabled).toBe(false);
+    confirmSpy.mockRestore();
+  });
+
   it("keeps the course open in the ASR workbench when a package import finishes", async () => {
     const lesson = (id: string, text: string): CourseItem => ({
       id,

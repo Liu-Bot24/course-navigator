@@ -1124,6 +1124,13 @@ export function App() {
   const deletingCourseIdsRef = useRef(new Set<string>());
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  // Course lists are numbered as they are asked for; each deleted course keeps
+  // the last number asked for before its deletion finished, so a list that was
+  // already on its way cannot bring it back.
+  const listRequestCountRef = useRef(0);
+  const deletedCourseListMarksRef = useRef(new Map<string, number>());
   const viewRef = useRef(view);
   viewRef.current = view;
   const [forcedBilibiliEmbedIds, setForcedBilibiliEmbedIds] = useState<string[]>([]);
@@ -1253,8 +1260,14 @@ export function App() {
     libraryStateSaveInFlightRef.current = false;
   }
 
+  async function loadItems(): Promise<CourseItem[]> {
+    const requestNumber = ++listRequestCountRef.current;
+    const loaded = await listItems();
+    return loaded.filter((item) => requestNumber > (deletedCourseListMarksRef.current.get(item.id) ?? 0));
+  }
+
   useEffect(() => {
-    listItems()
+    loadItems()
       .then((loaded) => {
         setItems(loaded);
         selectCourse(initialSelectedCourse(loaded));
@@ -1457,7 +1470,7 @@ export function App() {
   }
 
   async function refreshItems(nextSelectedId?: string) {
-    const loaded = await listItems();
+    const loaded = await loadItems();
     setItems(loaded);
     if (!nextSelectedId) return;
     if (viewRef.current === "asr") {
@@ -1983,7 +1996,7 @@ export function App() {
       const raw = await file.text();
       const payload = JSON.parse(raw) as CourseSharePackage;
       const response = await importCoursePackage(payload);
-      const loaded = await listItems();
+      const loaded = await loadItems();
       setItems(loaded);
       const firstImported = response.items[0];
       selectCourse(firstImported ? loaded.find((item) => item.id === firstImported.id) ?? firstImported : initialSelectedCourse(loaded));
@@ -2183,12 +2196,15 @@ export function App() {
     setDeletingCourseIds(new Set(deletingCourseIdsRef.current));
     try {
       await deleteCourse(item.id);
-      const loaded = await listItems();
-      setItems(loaded);
+      // Gone on the server: drop it here at once, so a failed or late list
+      // refresh cannot leave it open for editing.
+      deletedCourseListMarksRef.current.set(item.id, listRequestCountRef.current);
+      setItems((current) => current.filter((course) => course.id !== item.id));
       // The course may have been selected while the deletion ran.
       if (selectedRef.current?.id === item.id) {
-        selectCourse(initialSelectedCourse(loaded));
+        selectCourse(initialSelectedCourse(itemsRef.current.filter((course) => course.id !== item.id)));
       }
+      setItems(await loadItems());
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
     } finally {
