@@ -877,7 +877,25 @@ def test_course_title_can_be_renamed_and_is_preserved_on_refresh(tmp_path):
     assert refreshed.json()["title"] == "我自己的标题"
 
 
-def test_course_translated_title_can_be_edited_and_cleared_with_title_change(tmp_path):
+def _fake_study_generation(monkeypatch, captured=None):
+    """Stands in for a configured learning model; tests without one see a refusal."""
+
+    def fake_generate_study_material(**kwargs):
+        if captured is not None:
+            captured.update(kwargs)
+        return StudyMaterial(
+            one_line=f"学习地图：{kwargs['title']}",
+            time_map=[],
+            outline=[],
+            detailed_notes="解读",
+            high_fidelity_text="详解",
+        )
+
+    monkeypatch.setattr("course_navigator.app.generate_study_material", fake_generate_study_material)
+
+
+def test_course_translated_title_can_be_edited_and_cleared_with_title_change(tmp_path, monkeypatch):
+    _fake_study_generation(monkeypatch)
     client = make_client(tmp_path)
     client.post(
         "/api/extract",
@@ -1568,7 +1586,8 @@ def test_extract_uses_safe_id_for_subtitle_directory(tmp_path):
     assert response.json()["id"] == "---odd-id"
 
 
-def test_generate_study_route_updates_item(tmp_path):
+def test_generate_study_route_updates_item(tmp_path, monkeypatch):
+    _fake_study_generation(monkeypatch)
     client = make_client(tmp_path)
     client.post(
         "/api/extract",
@@ -1582,6 +1601,32 @@ def test_generate_study_route_updates_item(tmp_path):
 
     item_response = client.get("/api/items/abc123")
     assert item_response.json()["study"]["high_fidelity_text"]
+
+
+def test_generate_study_without_a_model_says_why_and_keeps_the_material(tmp_path):
+    client = make_client(tmp_path)
+    client.post(
+        "/api/extract",
+        json={"url": "https://www.youtube.com/watch?v=abc123", "mode": "normal"},
+    )
+    client.patch("/api/items/abc123", json={"translated_title": "示例课"})
+    before = client.get("/api/items/abc123").json()["study"]
+
+    response = client.post("/api/items/abc123/study", json={"output_language": "zh-CN"})
+
+    assert response.status_code == 400
+    assert "未配置可用的学习模型" in response.json()["detail"]
+    assert client.get("/api/items/abc123").json()["study"] == before
+
+    job = client.post("/api/items/abc123/study-jobs", json={"output_language": "zh-CN"}).json()
+    for _ in range(50):
+        job = client.get(f"/api/jobs/{job['job_id']}").json()
+        if job["status"] in {"succeeded", "failed"}:
+            break
+        sleep(0.02)
+    assert job["status"] == "failed"
+    assert "未配置可用的学习模型" in job["error"]
+    assert client.get("/api/items/abc123").json()["study"] == before
 
 
 def test_generate_study_route_passes_saved_metadata_to_ai(tmp_path, monkeypatch):
@@ -1740,7 +1785,9 @@ def test_running_study_job_passes_cancel_signal_to_ai(tmp_path, monkeypatch):
     assert payload["status"] == "cancelled"
 
 
-def test_generate_study_route_accepts_chinese_output_language(tmp_path):
+def test_generate_study_route_accepts_chinese_output_language(tmp_path, monkeypatch):
+    captured = {}
+    _fake_study_generation(monkeypatch, captured)
     client = make_client(tmp_path)
     client.post(
         "/api/extract",
@@ -1750,10 +1797,11 @@ def test_generate_study_route_accepts_chinese_output_language(tmp_path):
     response = client.post("/api/items/abc123/study", json={"output_language": "zh-CN"})
 
     assert response.status_code == 200
-    assert "包含" in response.json()["one_line"]
+    assert captured["output_language"] == "zh-CN"
 
 
-def test_study_job_generates_in_background(tmp_path):
+def test_study_job_generates_in_background(tmp_path, monkeypatch):
+    _fake_study_generation(monkeypatch)
     client = make_client(tmp_path)
     client.post(
         "/api/extract",

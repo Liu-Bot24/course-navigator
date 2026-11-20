@@ -27,45 +27,32 @@ def test_model_json_that_is_not_json_still_reports_a_decode_error():
         ai._loads_json_content("```json\n{not json}\n```")
 
 
-def test_generate_study_material_fallback_preserves_transcript_detail():
+@pytest.mark.parametrize("output_language", ["en", "zh-CN"])
+def test_generate_study_material_without_a_model_refuses_instead_of_dumping_subtitles(output_language):
     transcript = [
         TranscriptSegment(start=0, end=10, text="This lesson starts with novices."),
         TranscriptSegment(start=10, end=20, text="Power users iterate on prompts."),
-        TranscriptSegment(start=20, end=30, text="The key is to refine context."),
     ]
 
-    study = generate_study_material(
-        title="Prompting Lesson",
-        transcript=transcript,
-        provider=None,
-    )
-
-    assert "Prompting Lesson" in study.one_line
-    assert len(study.time_map) >= 1
-    assert study.time_map[0].start == 0
-    assert study.outline[0].children
-    assert "Power users iterate on prompts." in study.high_fidelity_text
-    assert "00:10" in study.high_fidelity_text
+    with pytest.raises(ValueError, match="未配置可用的学习模型"):
+        generate_study_material(title="Prompting Lesson", transcript=transcript, provider=None,
+                                output_language=output_language)
 
 
-def test_generate_study_material_fallback_can_use_chinese_output():
-    transcript = [
-        TranscriptSegment(start=0, end=8, text="This lesson explains prompt iteration."),
-        TranscriptSegment(start=8, end=16, text="Examples help users compare outputs."),
-    ]
+def test_regenerate_section_without_a_model_refuses_and_keeps_the_material():
+    transcript = [TranscriptSegment(start=0, end=10, text="Opening idea.")]
+    existing = ai.stamp_study_cache(StudyMaterial(
+        one_line="旧导览", context_summary="已有上下文摘要",
+        time_map=[TimeRange(start=0, end=10, title="旧时间块", summary="旧摘要", priority="focus")],
+        outline=[OutlineNode(id="block-1", start=0, end=10, title="旧大纲", summary="旧摘要", children=[])],
+        detailed_notes="旧解读", high_fidelity_text="旧详解",
+    ), "Lesson", transcript, "zh-CN")
+    before = existing.model_copy(deep=True)
 
-    study = generate_study_material(
-        title="Prompting Lesson",
-        transcript=transcript,
-        provider=None,
-        output_language="zh-CN",
-    )
-
-    assert "包含" in study.one_line
-    assert study.time_map[0].title.startswith("第 1 段")
-    assert "思考" in study.thought_prompts[0]
-    assert "未配置模型" in study.high_fidelity_text
-    assert study.translated_transcript == []
+    with pytest.raises(ValueError, match="未配置可用的学习模型"):
+        ai.regenerate_study_section(title="Lesson", transcript=transcript, existing_study=existing,
+                                    provider=None, output_language="zh-CN", section="outline")
+    assert existing == before
 
 
 def test_generate_study_material_provider_failure_does_not_return_fallback(monkeypatch):

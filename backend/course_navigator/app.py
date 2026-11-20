@@ -912,32 +912,36 @@ def create_app(
             output_language = request.output_language if request else "zh-CN"
             section = request.section if request else "all"
             detail_level = request.detail_level if request and request.detail_level else settings_state["value"].study_detail_level
-            if section == "all":
-                study = generate_study_material(
-                    title=item.title,
-                    transcript=item.transcript,
-                    provider=settings_state["value"].provider_set,
-                    output_language=output_language,
-                    detail_level=detail_level,
-                    existing_translation=item.study.translated_transcript if item.study else None,
-                    existing_context_summary=item.study.context_summary if item.study else None,
-                    existing_translated_title=item.study.translated_title if item.study else None,
-                    existing_study=item.study,
-                    source_language=item.transcript_language,
-                    metadata=item.metadata,
-                )
-            else:
-                study = regenerate_study_section(
-                    title=item.title,
-                    transcript=item.transcript,
-                    existing_study=item.study,
-                    provider=settings_state["value"].provider_set,
-                    output_language=output_language,
-                    section=section,
-                    detail_level=detail_level,
-                    source_language=item.transcript_language,
-                    metadata=item.metadata,
-                )
+            try:
+                if section == "all":
+                    study = generate_study_material(
+                        title=item.title,
+                        transcript=item.transcript,
+                        provider=settings_state["value"].provider_set,
+                        output_language=output_language,
+                        detail_level=detail_level,
+                        existing_translation=item.study.translated_transcript if item.study else None,
+                        existing_context_summary=item.study.context_summary if item.study else None,
+                        existing_translated_title=item.study.translated_title if item.study else None,
+                        existing_study=item.study,
+                        source_language=item.transcript_language,
+                        metadata=item.metadata,
+                    )
+                else:
+                    study = regenerate_study_section(
+                        title=item.title,
+                        transcript=item.transcript,
+                        existing_study=item.study,
+                        provider=settings_state["value"].provider_set,
+                        output_language=output_language,
+                        section=section,
+                        detail_level=detail_level,
+                        source_language=item.transcript_language,
+                        metadata=item.metadata,
+                    )
+            except ValueError as exc:
+                # No usable model, or nothing to regenerate from: say why, keep the material.
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             study = stamp_study_cache(study, item.title, item.transcript, output_language,
                                       item.transcript_language, item.metadata)
             library.update(item, {"study": study}, input_key=study_input)

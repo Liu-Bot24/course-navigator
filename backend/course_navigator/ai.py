@@ -59,6 +59,7 @@ class LlmCancelled(Exception):
 
 _CURRENT_CANCEL_CALLBACK: ContextVar[CancelCallback | None] = ContextVar("course_navigator_ai_cancel", default=None)
 STUDY_GENERATION_VERSION = 3
+NO_LEARNING_MODEL_MESSAGE = "未配置可用的学习模型，请先在模型设置里添加模型档案并填写 API Key。"
 
 
 def study_cache_matches(study: StudyMaterial | None, title: str, transcript: list[TranscriptSegment],
@@ -312,8 +313,9 @@ def _generate_study_material_impl(
             metadata,
         )
 
-    _report(progress, "fallback", 70, "未配置模型，使用本地字幕生成学习材料")
-    return _generate_fallback(title, transcript, output_language)
+    # Never stand in for the model: a subtitle dump would replace existing
+    # material and be reported as generated.
+    raise ValueError(NO_LEARNING_MODEL_MESSAGE)
 
 
 def regenerate_study_section(
@@ -383,10 +385,7 @@ def _regenerate_study_section_impl(
     global_provider = _first_provider(provider_set.global_provider, provider_set.learning, provider_set.translation)
     learning_provider = _first_provider(provider_set.learning, global_provider, provider_set.translation)
     if not (global_provider and learning_provider):
-        generated = _generate_fallback(title, transcript, output_language)
-        merged = _merge_study_section(existing_study, generated, section)
-        _report(progress, "complete", 95, f"{_section_label(section)}已重新生成")
-        return merged
+        raise ValueError(NO_LEARNING_MODEL_MESSAGE)
 
     context_summary = existing_study.context_summary
     if context_summary:
@@ -884,123 +883,6 @@ def _align_translated_chunk(
     return aligned
 
 
-def _generate_fallback(
-    title: str,
-    transcript: list[TranscriptSegment],
-    output_language: OutputLanguage,
-) -> StudyMaterial:
-    chunks = _chunk_segments(transcript, target_size=8)
-    chinese = output_language == "zh-CN"
-    japanese = output_language == "ja"
-    time_map = [
-        TimeRange(
-            start=chunk[0].start,
-            end=chunk[-1].end,
-            title=(
-                f"第 {index + 1} 段：{_first_words(chunk[0].text, 7)}"
-                if chinese
-                else f"セクション {index + 1}: {_first_words(chunk[0].text, 7)}"
-                if japanese
-                else f"Block {index + 1}: {_first_words(chunk[0].text, 7)}"
-            ),
-            summary=" ".join(segment.text for segment in chunk[:2]),
-            priority="focus" if index == 0 else "skim",
-        )
-        for index, chunk in enumerate(chunks)
-    ]
-    outline = [
-        OutlineNode(
-            id=f"block-{index + 1}",
-            start=chunk[0].start,
-            end=chunk[-1].end,
-            title=time_map[index].title,
-            summary=time_map[index].summary,
-            children=[
-                OutlineNode(
-                    id=f"block-{index + 1}-seg-{child_index + 1}",
-                    start=segment.start,
-                    end=segment.end,
-                    title=_first_words(segment.text, 10),
-                    summary=segment.text,
-                    children=[],
-                )
-                for child_index, segment in enumerate(chunk)
-            ],
-        )
-        for index, chunk in enumerate(chunks)
-    ]
-    detailed_notes = "\n\n".join(
-        f"{_format_time(block.start)}-{_format_time(block.end)} {block.title}\n{block.summary}"
-        for block in time_map
-    )
-    high_fidelity_lines = "\n".join(
-        f"[{_format_time(segment.start)}-{_format_time(segment.end)}] {segment.text}"
-        for segment in transcript
-    )
-    high_fidelity_text = (
-        (
-            "未配置模型，以下保留原始字幕逐句稿；配置模型后会生成中文详解学习稿。\n"
-            + high_fidelity_lines
-        )
-        if chinese
-        else (
-            "モデルが未設定です。以下は元字幕を保持した逐語稿です。\n" + high_fidelity_lines
-        )
-        if japanese
-        else high_fidelity_lines
-    )
-
-    return StudyMaterial(
-        one_line=(
-            f"{title} 包含 {len(transcript)} 条字幕片段，分成 {len(chunks)} 个学习块。"
-            if chinese
-            else f"{title} は {len(transcript)} 件の字幕セグメントを {len(chunks)} 個の学習ブロックに分けています。"
-            if japanese
-            else f"{title} covers {len(transcript)} transcript segments across {len(chunks)} blocks."
-        ),
-        time_map=time_map,
-        outline=outline,
-        detailed_notes=detailed_notes,
-        high_fidelity_text=high_fidelity_text,
-        prerequisites=[],
-        thought_prompts=(
-            [
-                "快速思考：哪些部分对你来说足够新，值得重点观看？",
-                "哪些想法可以直接迁移到你当前的工作场景？",
-                "深入观看前，哪些术语最好先查清楚？",
-            ]
-            if chinese
-            else [
-                "どの部分が自分にとって新しく、重点的に見る価値がありますか？",
-                "現在の仕事に直接応用できる考え方はどれですか？",
-                "深く見る前に確認しておくべき用語はありますか？",
-            ]
-            if japanese
-            else [
-                "Which parts are new enough to deserve focused watching?",
-                "Which ideas can be transferred directly into current work?",
-                "Which terms should be checked before watching deeply?",
-            ]
-        ),
-        review_suggestions=(
-            [
-                "先扫 Time Map，再只展开你判断需要重点看的片段。",
-                "看完后，回到最难的一段附近阅读详解文本。",
-            ]
-            if chinese
-            else [
-                "まず Time Map をざっと見て、重点的に見るべきブロックだけ開いてください。",
-                "視聴後、最も難しかった箇所の周辺で細粒度テキストを読み直してください。",
-            ]
-            if japanese
-            else [
-                "Skim the time map first, then expand only the blocks marked focus.",
-                "After watching, revisit the high-fidelity text around the hardest segment.",
-            ]
-        ),
-    )
-
-
 def _generate_with_provider(
     title: str,
     transcript: list[TranscriptSegment],
@@ -1053,7 +935,7 @@ def _generate_long_translated_with_provider(
     learning_provider = _first_provider(provider_set.learning, context_provider, translation_provider)
     global_provider = _first_provider(provider_set.global_provider, learning_provider, translation_provider)
     if not (context_provider and translation_provider and learning_provider and global_provider):
-        return _generate_fallback(title, transcript, output_language)
+        raise ValueError(NO_LEARNING_MODEL_MESSAGE)
 
     if existing_context_summary:
         _report(progress, "summary", 8, "已复用课程上下文摘要")
@@ -3058,34 +2940,6 @@ def _block_from_time_range(index: int, time_range: TimeRange) -> dict:
         "detailed_notes": time_range.summary,
         "high_fidelity_text": time_range.summary,
     }
-
-
-def _merge_study_section(
-    existing: StudyMaterial,
-    generated: StudyMaterial,
-    section: StudySection,
-) -> StudyMaterial:
-    next_study = existing.model_copy(deep=True)
-    if generated.context_summary:
-        next_study.context_summary = generated.context_summary
-    if generated.translated_title:
-        next_study.translated_title = generated.translated_title
-    if generated.translated_transcript:
-        next_study.translated_transcript = generated.translated_transcript
-    if section == "guide":
-        next_study.one_line = generated.one_line
-        next_study.prerequisites = generated.prerequisites
-        next_study.thought_prompts = generated.thought_prompts
-        next_study.review_suggestions = generated.review_suggestions
-        next_study.beginner_focus = generated.beginner_focus
-        next_study.experienced_guidance = generated.experienced_guidance
-    elif section == "outline":
-        next_study.outline = generated.outline
-    elif section == "detailed":
-        next_study.detailed_notes = generated.detailed_notes
-    elif section == "high":
-        next_study.high_fidelity_text = generated.high_fidelity_text
-    return next_study
 
 
 def _segment_overlaps_range(segment: TranscriptSegment, start: float, end: float) -> bool:
