@@ -2074,9 +2074,24 @@ mod tests {
         assert!(status.success());
         env::set_var("APPDATA", &support);
         // The case that broke Expand-Archive: a PowerShell 7 module path passed on.
-        let ps7_modules = Path::new(r"C:\Program Files\PowerShell\7\Modules");
-        if ps7_modules.is_dir() {
-            env::set_var("PSModulePath", ps7_modules);
+        // Ask the installed pwsh where it lives instead of guessing its folder.
+        let ps7_modules = Command::new("pwsh")
+            .args(["-NoProfile", "-Command", "$PSHOME"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()).join("Modules")
+            })
+            .filter(|modules| modules.is_dir());
+        match &ps7_modules {
+            Some(modules) => {
+                println!("PSModulePath case: {}", modules.display());
+                env::set_var("PSModulePath", modules);
+            }
+            None => println!(
+                "WARNING: PowerShell 7 not found; the PSModulePath case was NOT exercised"
+            ),
         }
         let url = format!("file:///{}", zip.display().to_string().replace('\\', "/"));
         env::set_var("COURSE_NAVIGATOR_WINDOWS_FFMPEG_URL", &url);
