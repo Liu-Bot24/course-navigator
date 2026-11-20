@@ -120,9 +120,14 @@ fn start_services_from_app(app: &tauri::AppHandle) -> LauncherStatus {
         return busy_status(state, &initial_config);
     };
     emit_launcher_status(app, &status_for(&initial_config, "starting", "正在检查端口..."));
+    runtime::launcher_log("开始启动服务");
 
     let (config, port_messages) = start_config_with_available_ports(app);
+    for message in &port_messages {
+        runtime::launcher_log(message);
+    }
     let report = |message: &str| {
+        runtime::launcher_log(message);
         state.set_operation_message(message);
         emit_launcher_status(app, &status_for(&config, "starting", message));
     };
@@ -132,8 +137,10 @@ fn start_services_from_app(app: &tauri::AppHandle) -> LauncherStatus {
             if config.open_browser_on_start {
                 let _ = open::that(format!("http://{}:{}", config.web_host, config.web_port));
             }
-            let message = if existing_services_ready {
+            let message = if existing_services_ready && config.open_browser_on_start {
                 "检测到现有服务已可用，已复用并打开网页。".to_string()
+            } else if existing_services_ready {
+                "检测到现有服务已可用，已复用。".to_string()
             } else if !port_messages.is_empty() {
                 format!("{}；服务已启动", port_messages.join("；"))
             } else {
@@ -144,6 +151,7 @@ fn start_services_from_app(app: &tauri::AppHandle) -> LauncherStatus {
         Err(error) if error == runtime::START_CANCELLED => status_for(&config, "stopped", error),
         Err(error) => status_for(&config, "failed", error),
     };
+    runtime::launcher_log(&format!("启动结果（{}）：{}", status.state, status.message));
     drop(guard);
     let _ = refresh_tray_menu(app);
     status.with_emit(app)
@@ -183,6 +191,7 @@ fn stop_services_from_app(app: &tauri::AppHandle) -> LauncherStatus {
         Ok(false) => status_for(&config, "stopped", "没有检测到需要停止的服务。"),
         Err(error) => status_for(&config, "failed", error),
     };
+    runtime::launcher_log(&format!("停止结果（{}）：{}", status.state, status.message));
     drop(guard);
     let _ = refresh_tray_menu(app);
     status.with_emit(app)
@@ -287,10 +296,21 @@ fn open_web_page() -> Result<(), String> {
 
 pub fn run() {
     let app = tauri::Builder::default()
+        // Must be the first plugin. Opening the launcher again (closing the
+        // window only hides it) brings back this one instead of starting a
+        // second launcher whose stop or quit would end this one's services.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            runtime::launcher_log("再次打开启动器：切回已在运行的窗口");
+            show_main_window(app);
+        }))
         .manage(runtime::ServiceState::new())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(ActivationPolicy::Regular);
+            runtime::launcher_log(&format!(
+                "启动器已打开（版本 {}）",
+                env!("CARGO_PKG_VERSION")
+            ));
 
             config::prepare_bundled_runtime(app.handle()).map_err(std::io::Error::other)?;
             tauri::async_runtime::spawn_blocking(runtime::remove_legacy_tool_files);
@@ -433,6 +453,7 @@ fn stop_configured_from_app(app: &tauri::AppHandle) {
     if STOPPED_FOR_QUIT.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
+    runtime::launcher_log("退出启动器，停止服务");
     let Some(state) = app.try_state::<runtime::ServiceState>() else {
         return;
     };

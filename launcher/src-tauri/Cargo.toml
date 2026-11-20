@@ -19,6 +19,8 @@ tauri = { version = "2", features = ["image-png", "tray-icon"] }
 thiserror = "2"
 open = "5"
 rfd = "0.15"
+# 2.5 needs tauri 2.12; stay on the line that matches the locked tauri 2.11.
+tauri-plugin-single-instance = "~2.4.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

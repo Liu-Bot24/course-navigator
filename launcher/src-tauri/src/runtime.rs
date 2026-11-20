@@ -10,9 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
-#[cfg(windows)]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -470,12 +468,16 @@ pub fn start_project_services(
         return Err(format!("项目目录不存在: {}", config.project_root));
     }
 
-    if owns_services(state) {
-        return Err("服务已经由 Launcher 启动".to_string());
-    }
-
+    // Starting again, from the window or the tray, reuses services that answer.
     if configured_services_listening(config) {
         return Ok(());
+    }
+    if owns_services(state) {
+        if state.has_live_service() {
+            return Err("服务进程还在运行但没有响应；请先停止服务再启动。".to_string());
+        }
+        // The process this launcher started has exited; clean up and start anew.
+        stop_project_services(state)?;
     }
     if any_configured_service_listening(config) {
         return Err("网页端口已被其他程序占用；请先停止旧服务或换端口。".to_string());
@@ -495,6 +497,7 @@ pub fn start_project_services(
     let app = app_command(config);
 
     progress("正在启动本地服务...");
+    launcher_log(&format!("服务命令：{} {}", app.program, app.args.join(" ")));
     let (stdout, stderr) = service_log_stdio(SERVICE_LOG);
     let mut command = service_command(&app.program);
     apply_service_env(&mut command, config);
@@ -585,9 +588,67 @@ fn open_fresh_log(name: &str) -> Result<File, String> {
     File::create(&path).map_err(|error| format!("无法写入日志 {}: {error}", path.display()))
 }
 
+const LAUNCHER_LOG: &str = "launcher";
+const LAUNCHER_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Appends one timestamped line to `launcher.log`, so a start that hangs or
+/// fails on a user's machine shows which step it reached and when. Logging
+/// never stops the launcher.
+pub fn launcher_log(message: &str) {
+    static LOG_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOG_LOCK.lock();
+    let dir = logs_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = log_path(LAUNCHER_LOG);
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > LAUNCHER_LOG_MAX_BYTES) {
+        let _ = fs::rename(&path, dir.join(format!("{LAUNCHER_LOG}.previous.log")));
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(
+            file,
+            "{} {}",
+            utc_timestamp(SystemTime::now()),
+            message.trim_end().replace('\n', " | ")
+        );
+    }
+}
+
+/// UTC time as `2026-11-20 03:04:05Z`; the launcher carries no time-zone data.
+fn utc_timestamp(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    let rest = seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
+        rest / 3_600,
+        rest % 3_600 / 60,
+        rest % 60
+    )
+}
+
+/// Days since 1970-01-01 to a calendar date (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
+    let month = if month_index < 10 { month_index + 3 } else { month_index - 9 } as u32;
+    (year_of_era + era * 400 + i64::from(month <= 2), month, day)
+}
+
 fn service_log_stdio(name: &str) -> (Stdio, Stdio) {
     // Logging must never prevent the service from starting.
-    match open_fresh_log(name).and_then(|file| {
+    match open_fresh_log(name).and_then(|mut file| {
+        let _ = writeln!(file, "[{}] 启动本地服务", utc_timestamp(SystemTime::now()));
         let stderr = file
             .try_clone()
             .map_err(|error| format!("无法写入日志: {error}"))?;
@@ -1233,7 +1294,14 @@ fn run_setup_command(
     let label = "Python 依赖";
     let log_error = |error: std::io::Error| format!("无法写入安装日志: {error}");
     let mut header = log.try_clone().map_err(log_error)?;
-    let _ = writeln!(header, "\n$ {} {}", command.program, command.args.join(" "));
+    let command_line = format!("{} {}", command.program, command.args.join(" "));
+    let _ = writeln!(
+        header,
+        "\n[{}] $ {command_line}",
+        utc_timestamp(SystemTime::now())
+    );
+    launcher_log(&format!("安装{label}：{command_line}"));
+    let started = Instant::now();
     let mut setup = service_command(&command.program);
     setup
         .args(&command.args)
@@ -1253,6 +1321,16 @@ fn run_setup_command(
             ));
         }
     });
+    let outcome = match &waited {
+        Ok(ChildWait::Exited(status)) => format!("退出（{status}）"),
+        Ok(ChildWait::Cancelled) => "已取消".to_string(),
+        Ok(ChildWait::TimedOut) => "超时被停止".to_string(),
+        Err(error) => format!("状态读取失败：{error}"),
+    };
+    launcher_log(&format!(
+        "安装{label}结束：{outcome}，用时 {} 秒",
+        started.elapsed().as_secs()
+    ));
     match waited {
         Ok(ChildWait::Exited(status)) if status.success() => Ok(()),
         Ok(ChildWait::Exited(status)) => Err(format!(
@@ -1946,6 +2024,14 @@ mod tests {
         assert_eq!(last_lines("", 3), "");
     }
 
+    #[test]
+    fn launcher_log_times_are_utc_calendar_dates() {
+        let at = |seconds: u64| utc_timestamp(UNIX_EPOCH + Duration::from_secs(seconds));
+        assert_eq!(at(0), "1970-01-01 00:00:00Z");
+        assert_eq!(at(951_868_799), "2000-02-29 23:59:59Z");
+        assert_eq!(at(1_795_143_845), "2026-11-20 03:04:05Z");
+    }
+
     /// Real start/stop against a prepared project copy with installed
     /// dependencies. Opt-in: set COURSE_NAVIGATOR_E2E_PROJECT and run with
     /// `cargo test --lib real_start -- --ignored --nocapture`. APPDATA is
@@ -1986,6 +2072,12 @@ mod tests {
         assert!(result.is_ok());
         assert!(configured_services_listening(&config));
         assert!(fs::read_to_string(log_path(SERVICE_LOG)).unwrap().contains("Uvicorn running"));
+        // Starting again while this launcher's services answer reuses them.
+        let again = start_project_services(&state, &config, &progress);
+        println!("second start: {again:?}");
+        assert!(again.is_ok());
+        assert!(owns_services(&state));
+        assert!(fs::read_to_string(log_path(LAUNCHER_LOG)).unwrap().contains("服务命令："));
         // Launcher requests pass the service's host check. A read keeps the
         // project's .env and caches untouched.
         send_service_json(&config, "GET", "/api/settings/asr-cache", None).expect("launcher request");
