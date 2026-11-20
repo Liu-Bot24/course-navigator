@@ -3227,10 +3227,11 @@ def _loads_json_content(content: str) -> object:
         # since string values (notes on code) may hold fences of their own.
         text = stripped.replace("\r\n", "\n").replace("\r", "\n")
         opening = re.search(r"```(?:json)?[ \t]*\n?", text)
-        # A fence whose line holds only a language tag ("```text", "``` text")
+        # A fence with a language tag right after it ("```text", "```c#",
+        # "```python title=...") or alone on its line after a space ("``` text")
         # opens another block; any other fence can close the JSON one, even
         # with a note after it ("``` Done.").
-        closing_fence = r"```(?![ \t]*[\w+-]+[ \t]*(?:\n|$))"
+        closing_fence = r"```(?![\w+#-]|[ \t]*[\w+#-]+[ \t]*(?:\n|$))"
         closings = list(re.finditer(closing_fence, text))
         closing = closings[-1].start() if closings else -1
         if not opening or closing < opening.end():

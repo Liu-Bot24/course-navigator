@@ -38,6 +38,9 @@ def test_model_json_that_is_not_json_still_reports_a_decode_error():
         ai._loads_json_content('```json\n{"a": 1}\n``` text\nnote')
     with pytest.raises(json.JSONDecodeError):
         ai._loads_json_content('{"a": 1}\n``` text\nnote')
+    for opener in ["```c#", '```python title="example.py"']:
+        with pytest.raises(json.JSONDecodeError):
+            ai._loads_json_content(f'```json\n{{"a": 1}}\n{opener}\nprint(1)')
 
 
 @pytest.mark.parametrize("output_language", ["en", "zh-CN"])
