@@ -1571,6 +1571,51 @@ describe("App language defaults", () => {
     await waitFor(() => expect(listItems).toHaveBeenCalledTimes(2));
   });
 
+  it("keeps a course locked while its deletion runs, even after another deletion finishes", async () => {
+    const lesson = (id: string): CourseItem => ({
+      id,
+      source_url: `https://example.com/${id}`,
+      title: id,
+      duration: 2,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "一句话" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    });
+    const first = lesson("first-course");
+    const second = lesson("second-course");
+    vi.mocked(listItems).mockResolvedValueOnce([first, second]);
+    let finishFirst: () => void = () => undefined;
+    let finishSecond: () => void = () => undefined;
+    vi.mocked(deleteCourse)
+      .mockImplementationOnce(() => new Promise((resolve) => { finishFirst = () => resolve(undefined as never); }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishSecond = () => resolve(undefined as never); }));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const asrDisabled = () => (screen.getByRole("button", { name: "ASR 校正" }) as HTMLButtonElement).disabled;
+
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByText("second-course").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getAllByText("first-course")[0]);
+    await waitFor(() => expect(asrDisabled()).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "删除课程 first-course" }));
+    await waitFor(() => expect(deleteCourse).toHaveBeenCalledWith("first-course"));
+    fireEvent.click(screen.getByRole("button", { name: "删除课程 second-course" }));
+    await waitFor(() => expect(deleteCourse).toHaveBeenCalledWith("second-course"));
+    expect(asrDisabled()).toBe(true);
+
+    // The second deletion ends first; the open course is still being deleted.
+    vi.mocked(listItems).mockResolvedValueOnce([first]);
+    finishSecond();
+    await waitFor(() => expect(listItems).toHaveBeenCalledTimes(2));
+    expect(asrDisabled()).toBe(true);
+
+    vi.mocked(listItems).mockResolvedValueOnce([]);
+    finishFirst();
+    await waitFor(() => expect(listItems).toHaveBeenCalledTimes(3));
+    confirmSpy.mockRestore();
+  });
+
   it("keeps the course open in the ASR workbench when a package import finishes", async () => {
     const lesson = (id: string, text: string): CourseItem => ({
       id,

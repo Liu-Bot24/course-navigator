@@ -1119,7 +1119,7 @@ export function App() {
   const [items, setItems] = useState<CourseItem[]>([]);
   const [selected, setSelected] = useState<CourseItem | null>(null);
   const [view, setView] = useState<"workspace" | "asr">("workspace");
-  const [deletingCourseId, setDeletingCourseId] = useState<string | null>(null);
+  const [deletingCourseIds, setDeletingCourseIds] = useState<ReadonlySet<string>>(new Set());
   const viewRef = useRef(view);
   viewRef.current = view;
   const [forcedBilibiliEmbedIds, setForcedBilibiliEmbedIds] = useState<string[]>([]);
@@ -2172,7 +2172,8 @@ export function App() {
   async function handleDeleteCourse(item: CourseItem) {
     if (!window.confirm(copy.deleteCourseConfirm)) return;
     setError(null);
-    setDeletingCourseId(item.id);
+    // Several deletions can overlap; each course stays locked until its own one ends.
+    setDeletingCourseIds((current) => new Set(current).add(item.id));
     try {
       await deleteCourse(item.id);
       const loaded = await listItems();
@@ -2183,7 +2184,11 @@ export function App() {
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
     } finally {
-      setDeletingCourseId(null);
+      setDeletingCourseIds((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
     }
   }
 
@@ -4004,7 +4009,7 @@ export function App() {
                   title={copy.openAsrCorrection}
                   onClick={() => setView("asr")}
                   // A course being deleted can't take edits, and the workbench would keep it.
-                  disabled={!selected?.transcript.length || selected.id === deletingCourseId}
+                  disabled={!selected?.transcript.length || deletingCourseIds.has(selected.id)}
                 >
                   <GitCompare size={17} />
                   {copy.asrCorrection}
