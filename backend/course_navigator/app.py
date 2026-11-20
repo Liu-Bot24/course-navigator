@@ -856,13 +856,17 @@ def create_app(
         if not item:
             raise HTTPException(status_code=404, detail="Course item not found")
         transcript = _validated_transcript(request.transcript)
-        updates: dict[str, object] = {"transcript": transcript}
+        unchanged = bool(item.transcript) and _same_transcript_as_edited(transcript, item.transcript)
+        # An unchanged save keeps the stored lines exactly: the editor rounds
+        # times to milliseconds, and the material's fingerprint uses the originals.
+        updates: dict[str, object] = {"transcript": item.transcript if unchanged else transcript}
         # Edits keep the known track language; only an explicit value (including
-        # null for a replacement of unknown language) changes it.
-        if "language" in request.model_fields_set:
+        # null for a replacement of unknown language) changes it. The same lines
+        # uploaded again without a language keep the known one.
+        if "language" in request.model_fields_set and not (unchanged and request.language is None):
             updates["transcript_language"] = request.language
         # The translation is aligned line by line, so only a changed text drops it.
-        if item.study and not _same_transcript_as_edited(transcript, item.transcript):
+        if item.study and not unchanged:
             updates["study"] = item.study.model_copy(
                 update={
                     "translated_transcript": [],

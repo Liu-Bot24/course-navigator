@@ -2466,6 +2466,37 @@ def test_saving_an_unchanged_transcript_keeps_the_translation(tmp_path):
     assert payload["study"]["context_summary"] == "Context"
 
 
+def test_an_unchanged_save_keeps_stored_times_so_verified_material_stays_valid(tmp_path):
+    from course_navigator.ai import stamp_study_cache, study_cache_matches
+
+    client = make_client(tmp_path)
+    client.post("/api/extract", json={"url": "https://www.youtube.com/watch?v=abc123"})
+    library = CourseLibrary(tmp_path)
+    item = library.get("abc123")
+    item.transcript = [TranscriptSegment(start=1.1234, end=2.5678, text="Same language line that is long")]
+    item.transcript_language = "en"
+    # A same-language course: the verified "translation" repeats the source.
+    item.study = stamp_study_cache(
+        StudyMaterial(one_line="Lesson", time_map=[], outline=[], detailed_notes="Notes", high_fidelity_text="",
+                      translated_transcript=list(item.transcript), translation_complete=True),
+        item.title, item.transcript, "en", item.transcript_language, item.metadata,
+    )
+    library.save(item)
+
+    payload = client.put(
+        "/api/items/abc123/transcript",
+        json={"transcript": [{"start": 1.123, "end": 2.568, "text": "Same language line that is long"}],
+              "language": None},
+    ).json()
+
+    assert payload["transcript"][0]["start"] == 1.1234
+    assert payload["transcript_language"] == "en"
+    assert len(payload["study"]["translated_transcript"]) == 1
+    saved = library.get("abc123")
+    assert study_cache_matches(saved.study, saved.title, saved.transcript, "en", saved.transcript_language,
+                               saved.metadata)
+
+
 def test_study_generation_uses_saved_corrected_transcript(tmp_path, monkeypatch):
     captured = {}
 
