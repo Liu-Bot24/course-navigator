@@ -3223,7 +3223,8 @@ def _loads_json_content(content: str) -> object:
             # A complete JSON block followed by a separate fenced block.
             value, end = json.JSONDecoder().raw_decode(stripped[opening.end():].lstrip())
             rest = stripped[opening.end():].lstrip()[end:].lstrip()
-            if not rest.startswith("```"):
+            # Only a closing fence may follow, not the opener of another block.
+            if not re.match(r"```[ \t]*(?:\r?\n|$)", rest):
                 raise
             return value
 
