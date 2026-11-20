@@ -1370,6 +1370,33 @@ def test_regenerate_outline_preserves_other_sections(monkeypatch):
     assert study.high_fidelity_text == "旧详解"
 
 
+def test_regenerate_section_accepts_material_saved_before_provenance_existed(monkeypatch):
+    transcript = [TranscriptSegment(start=0, end=10, text="Opening idea.")]
+    legacy = StudyMaterial(
+        one_line="旧导览",
+        context_summary="已有上下文摘要",
+        time_map=[TimeRange(start=0, end=10, title="旧时间块", summary="旧摘要", priority="focus")],
+        outline=[OutlineNode(id="block-1", start=0, end=10, title="旧大纲", summary="旧摘要", children=[])],
+        detailed_notes="旧解读",
+        high_fidelity_text="旧详解",
+    )
+    new_outline = [OutlineNode(id="block-1-new", start=0, end=10, title="新大纲", summary="新摘要", children=[])]
+    monkeypatch.setattr(ai, "_generate_outline_with_provider", lambda *args, **kwargs: new_outline)
+    provider = LlmProvider(base_url="https://example.test/v1", api_key="sk-test", model="test-model")
+
+    study = ai.regenerate_study_section(title="Lesson", transcript=transcript, existing_study=legacy,
+                                        provider=provider, output_language="zh-CN", section="outline")
+
+    assert study.outline == new_outline
+    assert study.detailed_notes == "旧解读"
+
+    stamped = ai.stamp_study_cache(legacy, "Lesson", transcript, "zh-CN")
+    changed = [TranscriptSegment(start=0, end=10, text="Edited opening idea.")]
+    with pytest.raises(ValueError, match="请先全部重新生成"):
+        ai.regenerate_study_section(title="Lesson", transcript=changed, existing_study=stamped,
+                                    provider=provider, output_language="zh-CN", section="outline")
+
+
 def test_regenerate_high_reuses_existing_structure_and_interpretation(monkeypatch):
     transcript = [
         TranscriptSegment(start=0, end=5, text="Opening idea."),

@@ -69,6 +69,26 @@ def study_cache_matches(study: StudyMaterial | None, title: str, transcript: lis
                 and study.input_fingerprint == study_input_fingerprint(title, transcript, source_language, metadata))
 
 
+def study_has_no_provenance(study: StudyMaterial) -> bool:
+    """Material saved before generation provenance existed (0.1.6 and earlier).
+
+    Nothing is known to have changed for such material, so single sections can
+    still be regenerated on top of it; it is never reused as a generation cache.
+    """
+    return study.input_fingerprint is None and study.generation_version is None
+
+
+def study_learning_usable(study: StudyMaterial | None, title: str, transcript: list[TranscriptSegment],
+                          output_language: OutputLanguage, source_language: str | None = None,
+                          metadata: VideoMetadata | None = None) -> bool:
+    if not study:
+        return False
+    if study_has_no_provenance(study):
+        return bool(study.one_line.strip())
+    return study.learning_complete and study_cache_matches(study, title, transcript, output_language,
+                                                           source_language, metadata)
+
+
 def stamp_study_cache(study: StudyMaterial, title: str, transcript: list[TranscriptSegment],
                       output_language: OutputLanguage, source_language: str | None = None,
                       metadata: VideoMetadata | None = None, *, learning_complete: bool = True) -> StudyMaterial:
@@ -309,8 +329,8 @@ def regenerate_study_section(
     metadata: VideoMetadata | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> StudyMaterial:
-    if existing_study and section != "all" and (not existing_study.learning_complete or not study_cache_matches(
-            existing_study, title, transcript, output_language, source_language, metadata)):
+    if existing_study and section != "all" and not study_learning_usable(
+            existing_study, title, transcript, output_language, source_language, metadata):
         raise ValueError("输出语言、课程内容或缓存版本已变化，请先全部重新生成学习材料。")
     with _cancellation_scope(should_cancel):
         return _regenerate_study_section_impl(

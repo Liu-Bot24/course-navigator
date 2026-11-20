@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .ai import stamp_study_cache, study_cache_matches, LlmCancelled, _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
+from .ai import stamp_study_cache, study_cache_matches, study_learning_usable, LlmCancelled, _anthropic_endpoint_url, generate_study_material, regenerate_study_section, translate_transcript_material
 from . import artifacts
 from .asr import search_endpoint, suggest_asr_corrections
 from .config import (
@@ -1631,8 +1631,8 @@ def create_app(
                 raise ValueError("字幕翻译结果不完整，请重试。")
             study.translation_complete = True
             source_language = item.transcript_language
-            learning_complete = bool(item.study and item.study.learning_complete and study_cache_matches(
-                item.study, item.title, item.transcript, output_language, source_language, item.metadata))
+            learning_complete = study_learning_usable(
+                item.study, item.title, item.transcript, output_language, source_language, item.metadata)
             study = stamp_study_cache(study, item.title, item.transcript, output_language,
                                       source_language, item.metadata, learning_complete=learning_complete)
             _commit_job_result(job_id, item, {"study": study}, "字幕译文已生成")
