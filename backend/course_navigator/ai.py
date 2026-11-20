@@ -60,6 +60,7 @@ class LlmCancelled(Exception):
 _CURRENT_CANCEL_CALLBACK: ContextVar[CancelCallback | None] = ContextVar("course_navigator_ai_cancel", default=None)
 STUDY_GENERATION_VERSION = 3
 NO_LEARNING_MODEL_MESSAGE = "未配置可用的学习模型，请先在模型设置里添加模型档案并填写 API Key。"
+NO_TRANSCRIPT_MESSAGE = "这门课还没有字幕，请先获取字幕再生成学习材料。"
 
 
 def study_cache_matches(study: StudyMaterial | None, title: str, transcript: list[TranscriptSegment],
@@ -85,7 +86,10 @@ def study_learning_usable(study: StudyMaterial | None, title: str, transcript: l
     if not study:
         return False
     if study_has_no_provenance(study):
-        return bool(study.one_line.strip())
+        # A record made only to hold a hand-typed title translation has a
+        # one-line summary but no learning content; it was never generated.
+        return bool(study.time_map or study.outline or study.detailed_notes.strip()
+                    or study.high_fidelity_text.strip())
     return study.learning_complete and study_cache_matches(study, title, transcript, output_language,
                                                            source_language, metadata)
 
@@ -277,23 +281,8 @@ def _generate_study_material_impl(
 ) -> StudyMaterial:
     _report(progress, "preparing", 1, "正在准备字幕与课程信息")
     if not transcript:
-        if output_language == "zh-CN":
-            return StudyMaterial(
-                one_line=f"{title} 暂时没有可用字幕。",
-                translated_title=None,
-                time_map=[],
-                outline=[],
-                detailed_notes="",
-                high_fidelity_text="",
-            )
-        return StudyMaterial(
-            one_line=f"No transcript is available for {title} yet.",
-            translated_title=None,
-            time_map=[],
-            outline=[],
-            detailed_notes="",
-            high_fidelity_text="",
-        )
+        # A placeholder would replace the material the course already has.
+        raise ValueError(NO_TRANSCRIPT_MESSAGE)
 
     provider_set = _coerce_provider_set(provider)
     if _first_provider(provider_set.learning, provider_set.global_provider, provider_set.translation):
@@ -379,7 +368,7 @@ def _regenerate_study_section_impl(
 
     _report(progress, "preparing", 1, f"正在准备重新生成{_section_label(section)}")
     if not transcript:
-        return existing_study
+        raise ValueError(NO_TRANSCRIPT_MESSAGE)
 
     provider_set = _coerce_provider_set(provider)
     global_provider = _first_provider(provider_set.global_provider, provider_set.learning, provider_set.translation)

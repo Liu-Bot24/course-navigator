@@ -83,12 +83,24 @@ def test_chinese_one_line_does_not_reuse_english_context_summary():
     assert one_line == "这门课程围绕「Weekly AI News」展开。"
 
 
-def test_generate_study_material_handles_empty_transcript():
-    study = generate_study_material(title="Empty", transcript=[], provider=None)
+def test_generate_study_material_without_subtitles_refuses_instead_of_a_placeholder():
+    with pytest.raises(ValueError, match="还没有字幕"):
+        generate_study_material(title="Empty", transcript=[], provider=None)
 
-    assert study.one_line == "No transcript is available for Empty yet."
-    assert study.time_map == []
-    assert study.outline == []
+    existing = StudyMaterial(one_line="Lesson", time_map=[], outline=[], detailed_notes="Notes",
+                             high_fidelity_text="")
+    with pytest.raises(ValueError, match="还没有字幕"):
+        ai.regenerate_study_section("Empty", [], existing, None, "zh-CN", "outline")
+
+
+def test_a_record_holding_only_a_title_translation_is_not_usable_material():
+    transcript = [TranscriptSegment(start=0, end=1, text="Hello")]
+    title_only = StudyMaterial(one_line="Lesson 已更新标题译文。", translated_title="课",
+                               time_map=[], outline=[], detailed_notes="", high_fidelity_text="")
+    legacy = title_only.model_copy(update={"outline": [OutlineNode(id="o1", start=0, end=1, title="Intro", summary="")]})
+
+    assert not ai.study_learning_usable(title_only, "Lesson", transcript, "zh-CN")
+    assert ai.study_learning_usable(legacy, "Lesson", transcript, "zh-CN")
 
 
 def test_long_transcript_provider_path_builds_layered_study_material(monkeypatch):
