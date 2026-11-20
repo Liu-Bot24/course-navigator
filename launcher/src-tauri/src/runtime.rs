@@ -337,7 +337,10 @@ fn media_tools_are_available(command_available: impl Fn(&str) -> bool) -> bool {
 fn prepare_preferred_windows_tools(state: &ServiceState) {
     #[cfg(windows)]
     {
-        let _ = prepare_latest_windows_tools(state);
+        // Not fatal: the service starts without them; the log says why they are missing.
+        if let Err(error) = prepare_latest_windows_tools(state) {
+            launcher_log(&error);
+        }
     }
     #[cfg(not(windows))]
     let _ = state;
@@ -372,6 +375,8 @@ fn download_latest_media_tools(state: &ServiceState) -> Result<(), String> {
 
     let url = env::var("COURSE_NAVIGATOR_WINDOWS_FFMPEG_URL")
         .unwrap_or_else(|_| FFMPEG_DOWNLOAD_URL.to_string());
+    // One tools.log per download run; each step appends to it.
+    drop(open_fresh_log(TOOLS_LOG)?);
     let result = download_file_with_powershell(&url, &zip_path, state)
         .and_then(|()| expand_archive_with_powershell(&zip_path, &extract_dir, state))
         .and_then(|()| copy_media_tools_from_archive(&extract_dir, &target_dir, state));
@@ -412,7 +417,15 @@ fn copy_media_tools_from_archive(source: &Path, target: &Path, state: &ServiceSt
 /// Runs a tool-install script with output in tools.log, honoring cancel and a timeout.
 #[cfg(windows)]
 fn run_powershell_script(script: &str, context: &str, state: &ServiceState) -> Result<(), String> {
-    let log = open_fresh_log(TOOLS_LOG)?;
+    let step = context.trim_end_matches("失败");
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path(TOOLS_LOG))
+        .map_err(|error| format!("{context}: 无法写入日志: {error}"))?;
+    let _ = writeln!(log, "\n[{}] {step}", utc_timestamp(SystemTime::now()));
+    launcher_log(&format!("{step}：开始"));
+    let started = Instant::now();
     let stderr = log
         .try_clone()
         .map_err(|error| format!("{context}: 无法写入日志: {error}"))?;
@@ -420,13 +433,24 @@ fn run_powershell_script(script: &str, context: &str, state: &ServiceState) -> R
     // Expand-Archive down several times over, and nobody sees it here.
     let script = format!("$ProgressPreference = 'SilentlyContinue'; {script}");
     let mut command = hidden_command("powershell");
+    // Started from PowerShell 7, the launcher passes on a module path that
+    // makes Windows PowerShell load 7's Expand-Archive, which fails there.
+    command.env_remove("PSModulePath");
     command
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(stderr);
     let mut child = spawn_managed(&mut command).map_err(|error| format!("{context}: {error}"))?;
-    match wait_managed_child(&mut child, state, TOOL_SCRIPT_TIMEOUT, |_| {}) {
+    let waited = wait_managed_child(&mut child, state, TOOL_SCRIPT_TIMEOUT, |_| {});
+    let outcome = match &waited {
+        Ok(ChildWait::Exited(status)) => format!("退出（{status}）"),
+        Ok(ChildWait::Cancelled) => "已取消".to_string(),
+        Ok(ChildWait::TimedOut) => "超时被停止".to_string(),
+        Err(error) => format!("状态读取失败：{error}"),
+    };
+    launcher_log(&format!("{step}结束：{outcome}，用时 {} 秒", started.elapsed().as_secs()));
+    match waited {
         Ok(ChildWait::Exited(status)) if status.success() => Ok(()),
         Ok(ChildWait::Exited(_)) => Err(format!("{context}: {}", log_excerpt(TOOLS_LOG))),
         Ok(ChildWait::Cancelled) => Err(START_CANCELLED.to_string()),
@@ -2022,6 +2046,50 @@ mod tests {
         assert_eq!(last_lines(text, 3), "two\nthree\nfour");
         assert_eq!(last_lines(text, 10), "one\ntwo\nthree\nfour");
         assert_eq!(last_lines("", 3), "");
+    }
+
+    /// Offline run of the media-tools install against a local zip. Opt-in
+    /// (it redirects APPDATA for the process): `cargo test --lib
+    /// media_tools_install_logs -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn media_tools_install_logs_each_step_and_keeps_one_tools_log() {
+        let root = env::temp_dir().join(unique_temp_name("cn-media-tools"));
+        let support = root.join("appdata");
+        let package = root.join("package").join("ffmpeg-build").join("bin");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("ffmpeg.exe"), b"fake").unwrap();
+        fs::write(package.join("ffprobe.exe"), b"fake").unwrap();
+        let zip = root.join("ffmpeg.zip");
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-Command"])
+            .arg(format!(
+                "Compress-Archive -Path {} -DestinationPath {}",
+                powershell_quote_path(&root.join("package").join("*")),
+                powershell_quote_path(&zip)
+            ))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        env::set_var("APPDATA", &support);
+        let url = format!("file:///{}", zip.display().to_string().replace('\\', "/"));
+        env::set_var("COURSE_NAVIGATOR_WINDOWS_FFMPEG_URL", &url);
+
+        let state = ServiceState::new();
+        let result = download_latest_media_tools(&state);
+
+        let launcher = fs::read_to_string(log_path(LAUNCHER_LOG)).unwrap_or_default();
+        let tools = fs::read_to_string(log_path(TOOLS_LOG)).unwrap_or_default();
+        println!("result: {result:?}\nlauncher.log:\n{launcher}\ntools.log:\n{tools}");
+        assert!(result.is_ok());
+        assert!(installed_tools_root().join("ffmpeg").join("ffprobe.exe").is_file());
+        for step in ["下载运行工具", "解压运行工具", "安装媒体工具"] {
+            assert!(launcher.contains(&format!("{step}：开始")));
+            assert!(launcher.contains(&format!("{step}结束：退出（exit code: 0）")));
+            assert!(tools.contains(step), "tools.log keeps every step");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

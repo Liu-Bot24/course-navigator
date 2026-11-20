@@ -122,7 +122,13 @@ fn start_services_from_app(app: &tauri::AppHandle) -> LauncherStatus {
     emit_launcher_status(app, &status_for(&initial_config, "starting", "正在检查端口..."));
     runtime::launcher_log("开始启动服务");
 
-    let (config, port_messages) = start_config_with_available_ports(app);
+    // A port held by this launcher's own live service is not taken by another
+    // program; moving the saved port would point the launcher away from it.
+    let (config, port_messages) = if state.has_live_service() {
+        (initial_config.clone(), Vec::new())
+    } else {
+        start_config_with_available_ports(app)
+    };
     for message in &port_messages {
         runtime::launcher_log(message);
     }
