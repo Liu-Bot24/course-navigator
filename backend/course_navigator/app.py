@@ -243,7 +243,7 @@ def create_app(
                 if pending:
                     logger.warning("Shutdown requested cancellation; %d operations are still closing", len(pending))
 
-    app = FastAPI(title="Course Navigator", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Course Navigator", version="0.1.8", lifespan=lifespan)
 
     @app.exception_handler(CourseConflict)
     async def course_conflict_handler(_, exc: CourseConflict):
