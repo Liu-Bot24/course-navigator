@@ -1119,6 +1119,7 @@ export function App() {
   const [items, setItems] = useState<CourseItem[]>([]);
   const [selected, setSelected] = useState<CourseItem | null>(null);
   const [view, setView] = useState<"workspace" | "asr">("workspace");
+  const [deletingCourseId, setDeletingCourseId] = useState<string | null>(null);
   const viewRef = useRef(view);
   viewRef.current = view;
   const [forcedBilibiliEmbedIds, setForcedBilibiliEmbedIds] = useState<string[]>([]);
@@ -2171,6 +2172,7 @@ export function App() {
   async function handleDeleteCourse(item: CourseItem) {
     if (!window.confirm(copy.deleteCourseConfirm)) return;
     setError(null);
+    setDeletingCourseId(item.id);
     try {
       await deleteCourse(item.id);
       const loaded = await listItems();
@@ -2180,6 +2182,8 @@ export function App() {
       }
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
+    } finally {
+      setDeletingCourseId(null);
     }
   }
 
@@ -3999,7 +4003,8 @@ export function App() {
                   type="button"
                   title={copy.openAsrCorrection}
                   onClick={() => setView("asr")}
-                  disabled={!selected?.transcript.length}
+                  // A course being deleted can't take edits, and the workbench would keep it.
+                  disabled={!selected?.transcript.length || selected.id === deletingCourseId}
                 >
                   <GitCompare size={17} />
                   {copy.asrCorrection}
@@ -4818,8 +4823,10 @@ function AsrWorkbench({
   const [userContext, setUserContext] = useState("");
   // Text typed into the after preview that does not parse yet; never written to the source.
   const [previewDraft, setPreviewDraft] = useState<string | null>(null);
-  // From pressing Run until the job exists: no job id to cancel yet.
-  const [correctionStarting, setCorrectionStarting] = useState(false);
+  // From pressing Run until the suggestions are shown, including the moments
+  // with no job id yet and after the job succeeded while its result loads.
+  const [correctionInFlight, setCorrectionInFlight] = useState(false);
+  const acceptSuggestionRef = useRef<(suggestionId: string) => Promise<void>>(async () => undefined);
   const [searchSettings, setSearchSettings] = useState<AsrSearchSettings | null>(null);
   const [searchDraft, setSearchDraft] = useState<AsrSearchDraft>({
     enabled: false,
@@ -4946,7 +4953,7 @@ function AsrWorkbench({
   // Everything here lives only in this view: edits, accepted or unreviewed
   // suggestions, and a running correction whose result would be lost.
   const hasUnsavedWork = editorText !== savedEditorText || previewDraft !== null
-    || pendingSuggestions.length > 0 || canCancelCorrectionJob || correctionStarting;
+    || pendingSuggestions.length > 0 || canCancelCorrectionJob || correctionInFlight;
 
   useEffect(() => {
     if (!hasUnsavedWork) return;
@@ -4985,6 +4992,8 @@ function AsrWorkbench({
     setHoverCard(null);
   }, [hoverSuggestion]);
 
+  acceptSuggestionRef.current = acceptSuggestion;
+
   useEffect(() => {
     if (!hasCorrectionSuggestions) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -5002,7 +5011,9 @@ function AsrWorkbench({
       }
       if (event.key === "Enter" && activeSuggestion) {
         event.preventDefault();
-        void acceptSuggestion(activeSuggestion.id);
+        // Through the ref: this listener outlives renders, and an old
+        // acceptSuggestion would see old text, an old draft and old settings.
+        void acceptSuggestionRef.current(activeSuggestion.id);
       }
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -5010,7 +5021,8 @@ function AsrWorkbench({
   }, [activeSuggestion, hasCorrectionSuggestions, navigationSuggestions]);
 
   async function runCorrection() {
-    if (!item) return;
+    // New suggestions would replace the ones the unreadable draft was typed over.
+    if (!item || suggestionsFrozenByDraft()) return;
     setError(null);
     setMessage(null);
     setSuggestions([]);
@@ -5019,7 +5031,7 @@ function AsrWorkbench({
     try {
       const transcript = editorTextToTranscript(editorText);
       setBusy(`${copy.runAsrCorrection} 0%`);
-      setCorrectionStarting(true);
+      setCorrectionInFlight(true);
       const searchConfig = searchDraftToConfig(searchDraft);
       const nextSearchSettings = await saveAsrSearchSettings(searchDraftToSettingsInput(searchDraft));
       // Left while the settings were saving: never start a job nobody follows.
@@ -5037,7 +5049,6 @@ function AsrWorkbench({
         void cancelJob(firstStatus.job_id).catch(() => undefined);
         return;
       }
-      setCorrectionStarting(false);
       setJobStatus(firstStatus);
       let current = firstStatus;
       while (current.status === "queued" || current.status === "running" || current.status === "cancelling") {
@@ -5062,7 +5073,7 @@ function AsrWorkbench({
     } catch (err) {
       setError(asrCorrectionErrorMessage(err, copy));
     } finally {
-      if (mountedRef.current) setCorrectionStarting(false);
+      if (mountedRef.current) setCorrectionInFlight(false);
       setBusy(null);
     }
   }
@@ -5158,6 +5169,12 @@ function AsrWorkbench({
   function discardPreviewDraft() {
     setPreviewDraft(null);
     setError(null);
+  }
+
+  // A source edit while the draft exists would be overwritten when the draft reads again.
+  function changeSourceText(nextEditorText: string) {
+    if (suggestionsFrozenByDraft()) return;
+    setEditorText(nextEditorText);
   }
 
   function rejectSuggestion(suggestionId: string) {
@@ -5494,7 +5511,7 @@ function AsrWorkbench({
                     activeSuggestionId={activeSuggestion?.id}
                     suggestionById={suggestionById}
                     copy={copy}
-                    onChange={setEditorText}
+                    onChange={changeSourceText}
                     onScroll={(scroll) => syncTranscriptScroll("editor", scroll)}
                     onMarkerEnter={showSuggestionHover}
                     onMarkerLeave={scheduleHoverClose}
@@ -5553,7 +5570,7 @@ function AsrWorkbench({
                   highlights={editorHighlights}
                   suggestionById={suggestionById}
                   copy={copy}
-                  onChange={setEditorText}
+                  onChange={changeSourceText}
                 />
               </div>
             )}

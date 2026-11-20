@@ -7,6 +7,7 @@ import {
   bindVideoSourceFromPicker,
   cancelJob,
   cancelStudyJob,
+  deleteCourse,
   deleteLocalVideo,
   extractCourse,
   getAsrCacheSettings,
@@ -1271,6 +1272,14 @@ describe("App language defaults", () => {
     expect(saveTranscript).not.toHaveBeenCalled();
     expect(source().value).toBe(sourceBefore);
     expect(screen.getByText("1/2")).toBeTruthy();
+    // Nor does the Enter shortcut, a source edit, or asking for new suggestions.
+    fireEvent.keyDown(preview, { key: "Enter" });
+    fireEvent.change(source(), { target: { value: `${sourceBefore}改动` } });
+    fireEvent.click(screen.getByRole("button", { name: /生成校正建议/ }));
+    expect(saveTranscript).not.toHaveBeenCalled();
+    expect(source().value).toBe(sourceBefore);
+    expect(startAsrCorrectionJob).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("1/2")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "放弃预览里的改动" }));
     expect(screen.queryByRole("button", { name: "放弃预览里的改动" })).toBeNull();
@@ -1487,6 +1496,79 @@ describe("App language defaults", () => {
     createJob({ job_id: "late-job", item_id: item.id, status: "running", progress: 1, phase: "model",
       message: "正在生成", error: null });
     await waitFor(() => expect(cancelJob).toHaveBeenCalledWith("late-job"));
+  });
+
+  it("asks before leaving while finished suggestions are still loading", async () => {
+    const item: CourseItem = {
+      id: "asr-loading-lesson",
+      source_url: "https://example.com/asr-loading-lesson",
+      title: "ASR Loading Lesson",
+      duration: 2,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "我是林毅" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveAsrSearchSettings).mockResolvedValue({
+      enabled: false,
+      provider: "tavily",
+      result_limit: 5,
+      min_confidence: 80,
+      tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
+      firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
+    });
+    vi.mocked(startAsrCorrectionJob).mockResolvedValueOnce({
+      job_id: "loading-job", item_id: item.id, status: "succeeded", progress: 100, phase: "complete",
+      message: "完成", error: null,
+    });
+    vi.mocked(getAsrCorrectionResult).mockImplementationOnce(() => new Promise(() => undefined));
+
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByText("ASR Loading Lesson").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "ASR 校正" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成校正建议" }));
+    await waitFor(() => expect(getAsrCorrectionResult).toHaveBeenCalledWith("loading-job"));
+
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
+    fireEvent.click(screen.getByRole("button", { name: "返回主工作台" }));
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "返回主工作台" })).toBeTruthy();
+    confirmSpy.mockRestore();
+  });
+
+  it("does not open the ASR workbench on a course that is being deleted", async () => {
+    const item: CourseItem = {
+      id: "deleting-course",
+      source_url: "https://example.com/deleting-course",
+      title: "Deleting Course",
+      duration: 2,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "一句话" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    let finishDelete: () => void = () => undefined;
+    vi.mocked(deleteCourse).mockImplementationOnce(
+      () => new Promise((resolve) => { finishDelete = () => resolve(undefined as never); }),
+    );
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByText("Deleting Course").length).toBeGreaterThan(0));
+    const asrButton = screen.getByRole("button", { name: "ASR 校正" }) as HTMLButtonElement;
+    expect(asrButton.disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "删除课程 Deleting Course" }));
+    await waitFor(() => expect(deleteCourse).toHaveBeenCalledWith("deleting-course"));
+
+    expect((screen.getByRole("button", { name: "ASR 校正" }) as HTMLButtonElement).disabled).toBe(true);
+    confirmSpy.mockRestore();
+    vi.mocked(listItems).mockResolvedValueOnce([]);
+    finishDelete();
+    await waitFor(() => expect(listItems).toHaveBeenCalledTimes(2));
   });
 
   it("keeps the course open in the ASR workbench when a package import finishes", async () => {
