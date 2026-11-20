@@ -13,14 +13,15 @@ export function formatTime(seconds: number): string {
 export function getYouTubeVideoId(url: string): string | null {
   try {
     const parsed = new URL(url);
-    if (parsed.hostname.includes("youtube.com")) {
-      const v = parsed.searchParams.get("v");
-      if (v) return v;
-      // Shorts, live and embed addresses name the same videos (as the backend reads them).
+    // The paths the backend reads as YouTube videos, on YouTube's own hosts only.
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.port) return null;
+    const host = parsed.hostname.toLowerCase();
+    if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+      if (parsed.pathname === "/watch") return parsed.searchParams.get("v");
       const [kind, id, ...rest] = parsed.pathname.split("/").filter(Boolean);
       return ["shorts", "live", "embed"].includes(kind ?? "") && id && !rest.length ? id : null;
     }
-    if (parsed.hostname === "youtu.be") {
+    if (host === "youtu.be") {
       return parsed.pathname.split("/").filter(Boolean)[0] ?? null;
     }
   } catch {

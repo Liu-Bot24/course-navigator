@@ -48,6 +48,9 @@ describe("getYouTubeVideoId", () => {
     }
     expect(getYouTubeVideoId("https://www.youtube.com/channel/UC123")).toBeNull();
     expect(getYouTubeVideoId("https://www.youtube.com/shorts/JPcx9qHzzgk/extra")).toBeNull();
+    expect(getYouTubeVideoId("https://www.youtube.com/shorts/JPcx9qHzzgk?v=other")).toBe("JPcx9qHzzgk");
+    expect(getYouTubeVideoId("https://notyoutube.com/shorts/JPcx9qHzzgk")).toBeNull();
+    expect(getYouTubeVideoId("https://notyoutube.com/watch?v=JPcx9qHzzgk")).toBeNull();
   });
 });
 
