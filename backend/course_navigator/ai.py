@@ -3225,20 +3225,23 @@ def _loads_json_content(content: str) -> object:
     except json.JSONDecodeError:
         # Fenced output: the payload runs from the first fence to the last one,
         # since string values (notes on code) may hold fences of their own.
-        opening = re.search(r"```(?:json)?[ \t]*\r?\n?", stripped)
-        # A closing fence ends its line; "```text" opens another block.
-        closings = list(re.finditer(r"```[ \t]*(?=\r?\n|$)", stripped))
+        text = stripped.replace("\r\n", "\n").replace("\r", "\n")
+        opening = re.search(r"```(?:json)?[ \t]*\n?", text)
+        # A fence followed by a language tag ("```text") opens another block;
+        # any other fence can close the JSON one.
+        closing_fence = r"```(?![\w+-])"
+        closings = list(re.finditer(closing_fence, text))
         closing = closings[-1].start() if closings else -1
         if not opening or closing < opening.end():
             raise
         try:
-            return json.loads(stripped[opening.end():closing].strip())
+            return json.loads(text[opening.end():closing].strip())
         except json.JSONDecodeError:
             # A complete JSON block followed by a separate fenced block.
-            value, end = json.JSONDecoder().raw_decode(stripped[opening.end():].lstrip())
-            rest = stripped[opening.end():].lstrip()[end:].lstrip()
+            value, end = json.JSONDecoder().raw_decode(text[opening.end():].lstrip())
+            rest = text[opening.end():].lstrip()[end:].lstrip()
             # Only a closing fence may follow, not the opener of another block.
-            if not re.match(r"```[ \t]*(?:\r?\n|$)", rest):
+            if not re.match(closing_fence, rest):
                 raise
             return value
 
