@@ -1123,6 +1123,8 @@ export function App() {
   const [activeTab, setActiveTab] = useState<AiTab>("guide");
   const [sourceMode, setSourceMode] = useState<SourceMode>("embed");
   const [seekTime, setSeekTime] = useState(0);
+  // Counts seek requests, so asking for the same time again still moves the player.
+  const [seekRequestId, setSeekRequestId] = useState(0);
   const [playheadTime, setPlayheadTime] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -2588,12 +2590,14 @@ export function App() {
   function seek(seconds: number) {
     const nextTime = Math.max(0, seconds);
     setSeekTime(nextTime);
+    setSeekRequestId((current) => current + 1);
     setPlayheadTime(nextTime);
   }
 
   function switchSource(nextMode: SourceMode) {
     setSourceMode(nextMode);
     setSeekTime(Math.max(0, playheadTime));
+    setSeekRequestId((current) => current + 1);
   }
 
   function forceBilibiliStreaming(itemId: string) {
@@ -3936,6 +3940,7 @@ export function App() {
             <Player
               item={selected}
               seekTime={seekTime}
+              seekRequestId={seekRequestId}
               sourceMode={sourceMode}
               onProgress={setPlayheadTime}
               copy={copy}
@@ -6607,6 +6612,7 @@ function SettingsModal({
 function Player({
   item,
   seekTime,
+  seekRequestId,
   sourceMode,
   onProgress,
   copy,
@@ -6619,6 +6625,7 @@ function Player({
 }: {
   item: CourseItem | null;
   seekTime: number;
+  seekRequestId: number;
   sourceMode: SourceMode;
   onProgress: (seconds: number) => void;
   copy: (typeof COPY)[UiLanguage];
@@ -6723,7 +6730,7 @@ function Player({
         void videoRef.current.play().catch(() => undefined);
       }
     }
-  }, [nativeVideoSrc, seekTime]);
+  }, [nativeVideoSrc, seekTime, seekRequestId]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -6777,7 +6784,7 @@ function Player({
         player.playVideo?.();
       }
     }
-  }, [bilibiliEmbedSrc, seekTime, sourceMode, youtubeEmbedSrc]);
+  }, [bilibiliEmbedSrc, seekTime, seekRequestId, sourceMode, youtubeEmbedSrc]);
 
   useEffect(() => {
     if (sourceMode !== "embed" || !youtubeEmbedSrc || !iframeRef.current) return;
@@ -6938,6 +6945,8 @@ function Player({
     return (
       <div className="player-shell" ref={shellRef}>
         <iframe
+          // Bilibili seeks by reloading at a start time, so the same time again needs a fresh frame.
+          key={youtubeEmbedSrc ? "youtube" : `bilibili-${seekRequestId}`}
           ref={iframeRef}
           className="player-frame"
           src={iframeSrc}

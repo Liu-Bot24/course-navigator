@@ -1572,6 +1572,44 @@ describe("App language defaults", () => {
     });
   });
 
+  it("jumps back each time the same timestamp is clicked", async () => {
+    vi.mocked(listItems).mockResolvedValueOnce([
+      {
+        id: "cached-seek",
+        source_url: "https://example.com/cached-seek",
+        title: "Cached seek lesson",
+        duration: 120,
+        created_at: new Date().toISOString(),
+        transcript: [
+          { start: 0, end: 2, text: "Opening line" },
+          { start: 30, end: 34, text: "Second line" },
+        ],
+        metadata: null,
+        study: null,
+        local_video_path: "/tmp/cached-seek.mp4",
+      },
+    ]);
+
+    const { container } = render(<App />);
+    await waitFor(() => expect(container.querySelector("video")).toBeTruthy());
+    const video = container.querySelector("video") as HTMLVideoElement;
+    const seeks: number[] = [];
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      get: () => seeks.at(-1) ?? 0,
+      set: (value: number) => seeks.push(value),
+    });
+    vi.spyOn(video, "play").mockResolvedValue(undefined);
+
+    const row = (await screen.findAllByText("Second line"))
+      .map((element) => element.closest("button.transcript-row"))
+      .find(Boolean) as HTMLButtonElement;
+    fireEvent.click(row);
+    fireEvent.click(row);
+
+    await waitFor(() => expect(seeks.filter((time) => time === 30)).toHaveLength(2));
+  });
+
   it("exports course packages without local workspace video paths", async () => {
     let exportedBlob: Blob | null = null;
     const createObjectUrl = vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
