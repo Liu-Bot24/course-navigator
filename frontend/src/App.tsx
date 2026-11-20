@@ -1120,6 +1120,10 @@ export function App() {
   const [selected, setSelected] = useState<CourseItem | null>(null);
   const [view, setView] = useState<"workspace" | "asr">("workspace");
   const [deletingCourseIds, setDeletingCourseIds] = useState<ReadonlySet<string>>(new Set());
+  // Read by deletions that finish later, after the selection may have moved.
+  const deletingCourseIdsRef = useRef(new Set<string>());
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
   const viewRef = useRef(view);
   viewRef.current = view;
   const [forcedBilibiliEmbedIds, setForcedBilibiliEmbedIds] = useState<string[]>([]);
@@ -2170,25 +2174,26 @@ export function App() {
   }
 
   async function handleDeleteCourse(item: CourseItem) {
+    // Several deletions can overlap; each course stays locked until its own one
+    // ends, and a course already being deleted is not sent again.
+    if (deletingCourseIdsRef.current.has(item.id)) return;
     if (!window.confirm(copy.deleteCourseConfirm)) return;
     setError(null);
-    // Several deletions can overlap; each course stays locked until its own one ends.
-    setDeletingCourseIds((current) => new Set(current).add(item.id));
+    deletingCourseIdsRef.current.add(item.id);
+    setDeletingCourseIds(new Set(deletingCourseIdsRef.current));
     try {
       await deleteCourse(item.id);
       const loaded = await listItems();
       setItems(loaded);
-      if (selected?.id === item.id) {
+      // The course may have been selected while the deletion ran.
+      if (selectedRef.current?.id === item.id) {
         selectCourse(initialSelectedCourse(loaded));
       }
     } catch (err) {
       setError(errorMessage(err, copy.unknownError));
     } finally {
-      setDeletingCourseIds((current) => {
-        const next = new Set(current);
-        next.delete(item.id);
-        return next;
-      });
+      deletingCourseIdsRef.current.delete(item.id);
+      setDeletingCourseIds(new Set(deletingCourseIdsRef.current));
     }
   }
 
@@ -3212,6 +3217,7 @@ export function App() {
                     className="library-delete"
                     aria-label={`${copy.deleteCourse} ${item.title}`}
                     title={copy.deleteCourse}
+                    disabled={deletingCourseIds.has(item.id)}
                     onClick={() => handleDeleteCourse(item)}
                   >
                     <Trash2 size={14} />

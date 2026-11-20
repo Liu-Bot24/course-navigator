@@ -1616,6 +1616,53 @@ describe("App language defaults", () => {
     confirmSpy.mockRestore();
   });
 
+  it("moves off a course selected while it was being deleted, and sends its deletion once", async () => {
+    const lesson = (id: string): CourseItem => ({
+      id,
+      source_url: `https://example.com/${id}`,
+      title: id,
+      duration: 2,
+      created_at: new Date().toISOString(),
+      transcript: [{ start: 0, end: 2, text: "一句话" }],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    });
+    const kept = lesson("kept-course");
+    const doomed = lesson("doomed-course");
+    vi.mocked(listItems).mockResolvedValueOnce([kept, doomed]);
+    let finishDelete: () => void = () => undefined;
+    vi.mocked(deleteCourse).mockImplementationOnce(
+      () => new Promise((resolve) => { finishDelete = () => resolve(undefined as never); }),
+    );
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const pick = (title: string) =>
+      fireEvent.click(screen.getAllByText(title).find((element) => element.closest(".library-item"))!);
+    const activeTitle = () => document.querySelector(".library-entry.active .library-title-line > span")?.textContent;
+    const asrDisabled = () => (screen.getByRole("button", { name: "ASR 校正" }) as HTMLButtonElement).disabled;
+
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByText("doomed-course").length).toBeGreaterThan(0));
+    pick("kept-course");
+    await waitFor(() => expect(activeTitle()).toBe("kept-course"));
+    const deleteButton = screen.getByRole("button", { name: "删除课程 doomed-course" }) as HTMLButtonElement;
+    fireEvent.click(deleteButton);
+    await waitFor(() => expect(deleteCourse).toHaveBeenCalledWith("doomed-course"));
+    expect(deleteButton.disabled).toBe(true);
+    fireEvent.click(deleteButton);
+
+    pick("doomed-course");
+    await waitFor(() => expect(activeTitle()).toBe("doomed-course"));
+    expect(asrDisabled()).toBe(true);
+
+    vi.mocked(listItems).mockResolvedValueOnce([kept]);
+    finishDelete();
+    await waitFor(() => expect(activeTitle()).toBe("kept-course"));
+    expect(asrDisabled()).toBe(false);
+    expect(deleteCourse).toHaveBeenCalledTimes(1);
+    confirmSpy.mockRestore();
+  });
+
   it("keeps the course open in the ASR workbench when a package import finishes", async () => {
     const lesson = (id: string, text: string): CourseItem => ({
       id,
