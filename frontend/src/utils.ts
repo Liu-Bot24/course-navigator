@@ -14,7 +14,11 @@ export function getYouTubeVideoId(url: string): string | null {
   try {
     const parsed = new URL(url);
     if (parsed.hostname.includes("youtube.com")) {
-      return parsed.searchParams.get("v");
+      const v = parsed.searchParams.get("v");
+      if (v) return v;
+      // Shorts, live and embed addresses name the same videos (as the backend reads them).
+      const [kind, id, ...rest] = parsed.pathname.split("/").filter(Boolean);
+      return ["shorts", "live", "embed"].includes(kind ?? "") && id && !rest.length ? id : null;
     }
     if (parsed.hostname === "youtu.be") {
       return parsed.pathname.split("/").filter(Boolean)[0] ?? null;

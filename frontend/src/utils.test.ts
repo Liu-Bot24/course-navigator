@@ -41,6 +41,14 @@ describe("getYouTubeVideoId", () => {
   it("extracts id from short url", () => {
     expect(getYouTubeVideoId("https://youtu.be/JPcx9qHzzgk")).toBe("JPcx9qHzzgk");
   });
+
+  it("extracts id from shorts, live and embed urls like the backend", () => {
+    for (const kind of ["shorts", "live", "embed"]) {
+      expect(getYouTubeVideoId(`https://www.youtube.com/${kind}/JPcx9qHzzgk`)).toBe("JPcx9qHzzgk");
+    }
+    expect(getYouTubeVideoId("https://www.youtube.com/channel/UC123")).toBeNull();
+    expect(getYouTubeVideoId("https://www.youtube.com/shorts/JPcx9qHzzgk/extra")).toBeNull();
+  });
 });
 
 describe("getBilibiliVideoId", () => {

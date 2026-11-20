@@ -1815,6 +1815,17 @@ describe("App language defaults", () => {
     expect(youtube.items[0].metadata.stream_url).toBeNull();
     expect(youtube.items[0].metadata.hls_manifest_url).toBeNull();
 
+    const shorts = await exportOnly(course("shorts-course", "https://www.youtube.com/shorts/abc123",
+      "https://rr1.googlevideo.com/videoplayback?ip=203.0.113.8&sig=x"));
+    expect(JSON.stringify(shorts)).not.toContain("203.0.113.8");
+
+    // A Bilibili short link: the player embeds it from the extractor's BV id.
+    const bilibiliShort = course("BV1xx411c7mD", "https://b23.tv/abcdef",
+      "https://upos-sz.bilivideo.com/video.m4s?ip=203.0.113.9");
+    bilibiliShort.metadata = { ...bilibiliShort.metadata!, extractor: "BiliBili", webpage_url: "https://b23.tv/abcdef" };
+    const bilibili = await exportOnly(bilibiliShort);
+    expect(JSON.stringify(bilibili)).not.toContain("203.0.113.9");
+
     const hls = await exportOnly(course("hls-course", "https://learn.deeplearning.ai/courses/example",
       "https://video.deeplearning.ai/example/master.m3u8"));
     expect(hls.items[0].metadata.stream_url).toBe("https://video.deeplearning.ai/example/master.m3u8");

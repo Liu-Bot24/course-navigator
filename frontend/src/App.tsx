@@ -6698,13 +6698,7 @@ function Player({
   const [nativeCaptionTrackUrl, setNativeCaptionTrackUrl] = useState<string | null>(null);
   const lastFullscreenRequestRef = useRef(fullscreenRequestId);
   const youtubeId = item ? getYouTubeVideoId(item.source_url) : null;
-  const bilibiliId = useMemo(() => {
-    if (!item) return null;
-    const directId = getBilibiliVideoId(item.source_url) ?? getBilibiliVideoId(item.metadata?.webpage_url ?? "");
-    if (directId) return directId;
-    const extractor = item.metadata?.extractor?.toLowerCase() ?? "";
-    return extractor.includes("bilibili") && item.metadata?.id?.startsWith("BV") ? item.metadata.id : null;
-  }, [item]);
+  const bilibiliId = useMemo(() => (item ? itemBilibiliVideoId(item) : null), [item]);
   const streamUrl = item?.metadata?.stream_url ?? null;
   const nativeVideoSrc =
     sourceMode === "local" && item?.local_video_path
@@ -8189,9 +8183,16 @@ function downloadJsonFile(payload: unknown, fileName: string) {
 function sharedCourseMetadata(item: CourseItem): VideoMetadata | null {
   const metadata = item.metadata ?? null;
   if (!metadata) return null;
-  const playsThroughEmbed = Boolean(getYouTubeVideoId(item.source_url) || getBilibiliVideoId(item.source_url)
-    || getBilibiliVideoId(metadata.webpage_url ?? ""));
+  // The same checks the player uses to pick the site's embed.
+  const playsThroughEmbed = Boolean(getYouTubeVideoId(item.source_url) || itemBilibiliVideoId(item));
   return playsThroughEmbed ? { ...metadata, stream_url: null, hls_manifest_url: null } : metadata;
+}
+
+function itemBilibiliVideoId(item: CourseItem): string | null {
+  const directId = getBilibiliVideoId(item.source_url) ?? getBilibiliVideoId(item.metadata?.webpage_url ?? "");
+  if (directId) return directId;
+  const extractor = item.metadata?.extractor?.toLowerCase() ?? "";
+  return extractor.includes("bilibili") && item.metadata?.id?.startsWith("BV") ? item.metadata.id : null;
 }
 
 function coursePackageFileName(items: CourseSharePackage["items"]): string {
