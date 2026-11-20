@@ -88,8 +88,10 @@ def study_learning_usable(study: StudyMaterial | None, title: str, transcript: l
     if study_has_no_provenance(study):
         # A record made only to hold a hand-typed title translation has a
         # one-line summary but no learning content; it was never generated.
+        # 0.1.6 could also generate the guide alone, so guide fields count too.
         return bool(study.time_map or study.outline or study.detailed_notes.strip()
-                    or study.high_fidelity_text.strip())
+                    or study.high_fidelity_text.strip() or study.prerequisites or study.thought_prompts
+                    or study.review_suggestions or study.beginner_focus or study.experienced_guidance)
     return study.learning_complete and study_cache_matches(study, title, transcript, output_language,
                                                            source_language, metadata)
 
