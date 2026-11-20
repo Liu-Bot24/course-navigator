@@ -63,6 +63,13 @@ NO_LEARNING_MODEL_MESSAGE = "未配置可用的学习模型，请先在模型设
 NO_TRANSCRIPT_MESSAGE = "这门课还没有字幕，请先获取字幕再生成学习材料。"
 # The summary the app writes into a record that only holds a title translation.
 TITLE_TRANSLATION_PLACEHOLDER_SUFFIX = "已更新标题译文。"
+# Every "<title> ..." summary the app (0.1.6 on) writes into a record that holds
+# no generated guide: a title translation, a subtitle translation, or no subtitles.
+_PLACEHOLDER_ONE_LINE = re.compile(
+    r".+ (?:已更新标题译文。|正在翻译字幕\.\.\.|已生成字幕译文。|暂时没有可用字幕。)"
+    r"|No transcript is available for .+ yet\.",
+    re.DOTALL,
+)
 
 
 def study_cache_matches(study: StudyMaterial | None, title: str, transcript: list[TranscriptSegment],
@@ -89,14 +96,14 @@ def study_learning_usable(study: StudyMaterial | None, title: str, transcript: l
         return False
     if study_has_no_provenance(study):
         # 0.1.6 could generate the guide alone, even just its one-line summary,
-        # so any learning content or a generated summary counts. A record made
-        # only to hold a hand-typed title translation carries a fixed summary
-        # and was never generated.
+        # so any learning content or a generated summary counts. Records made
+        # only for a title or subtitle translation, or without subtitles, carry
+        # a fixed summary and were never generated.
         one_line = study.one_line.strip()
         return bool(study.time_map or study.outline or study.detailed_notes.strip()
                     or study.high_fidelity_text.strip() or study.prerequisites or study.thought_prompts
                     or study.review_suggestions or study.beginner_focus or study.experienced_guidance
-                    or (one_line and not one_line.endswith(TITLE_TRANSLATION_PLACEHOLDER_SUFFIX)))
+                    or (one_line and not _PLACEHOLDER_ONE_LINE.fullmatch(one_line)))
     return study.learning_complete and study_cache_matches(study, title, transcript, output_language,
                                                            source_language, metadata)
 

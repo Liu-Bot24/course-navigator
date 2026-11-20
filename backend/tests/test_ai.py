@@ -116,6 +116,16 @@ def test_a_record_holding_only_a_title_translation_is_not_usable_material():
     assert ai.study_learning_usable(guide_only, "Lesson", transcript, "zh-CN")
     assert ai.study_learning_usable(summary_only, "Lesson", transcript, "zh-CN")
 
+    # Every summary 0.1.6 wrote into a record without a generated guide,
+    # including ones made before the course was renamed.
+    for placeholder in ["Old Name 已更新标题译文。", "Lesson 正在翻译字幕...", "Lesson 已生成字幕译文。",
+                        "Lesson 暂时没有可用字幕。", "No transcript is available for Lesson yet."]:
+        record = title_only.model_copy(update={"one_line": placeholder, "translated_title": None})
+        assert not ai.study_learning_usable(record, "Lesson", transcript, "zh-CN"), placeholder
+    # A real summary that happens to end with the same words is still material.
+    real = title_only.model_copy(update={"one_line": "本课程演示如何确认系统已更新标题译文。"})
+    assert ai.study_learning_usable(real, "Lesson", transcript, "zh-CN")
+
 
 def test_long_transcript_provider_path_builds_layered_study_material(monkeypatch):
     transcript = [
