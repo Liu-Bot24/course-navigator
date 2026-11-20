@@ -34,6 +34,10 @@ def test_model_json_that_is_not_json_still_reports_a_decode_error():
     # Output cut off inside the following note: no closing fence at all.
     with pytest.raises(json.JSONDecodeError):
         ai._loads_json_content('```json\n{"a": 1}\n```text\nnote')
+    with pytest.raises(json.JSONDecodeError):
+        ai._loads_json_content('```json\n{"a": 1}\n``` text\nnote')
+    with pytest.raises(json.JSONDecodeError):
+        ai._loads_json_content('{"a": 1}\n``` text\nnote')
 
 
 @pytest.mark.parametrize("output_language", ["en", "zh-CN"])
