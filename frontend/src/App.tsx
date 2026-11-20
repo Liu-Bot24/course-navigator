@@ -454,6 +454,8 @@ const COPY = {
     transcriptSaved: "字幕已保存",
     transcriptSaveClearsTranslationConfirm: "这门课已有字幕译文。保存改动后的字幕会清空整份译文和翻译用的上下文摘要，需要时再重新翻译。确定保存吗？",
     localSubtitleReplaceConfirm: "当前课程已经有字幕。上传的字幕会替换现有字幕，已有的字幕译文也会被清空。确定继续吗？",
+    asrPreviewInvalid: "修改后预览里有一行无法识别，原字幕没有改动",
+    asrLeaveConfirm: "工作台里有未保存的字幕修改或还没处理的校正建议，离开后会丢失；正在进行的校正也会停止。确定返回主工作台吗？",
     runAsrCorrection: "生成校正建议",
     asrModel: "ASR 校正模型",
     asrModelHelp: "选择用于校正字幕的模型档案。",
@@ -830,6 +832,8 @@ const COPY = {
     transcriptSaved: "Transcript saved",
     transcriptSaveClearsTranslationConfirm: "This course has a subtitle translation. Saving the changed transcript clears the whole translation and its context summary; translate again when needed. Save anyway?",
     localSubtitleReplaceConfirm: "This course already has subtitles. The uploaded file replaces them and clears the existing subtitle translation. Continue?",
+    asrPreviewInvalid: "A line in the after preview can't be read; the source transcript is unchanged",
+    asrLeaveConfirm: "The workbench has unsaved transcript edits or unreviewed suggestions that will be lost, and a running correction will be stopped. Go back to the main workspace?",
     runAsrCorrection: "Generate suggestions",
     asrModel: "ASR correction model",
     asrModelHelp: "Choose the model profile used for subtitle correction.",
@@ -1112,6 +1116,8 @@ export function App() {
   const [items, setItems] = useState<CourseItem[]>([]);
   const [selected, setSelected] = useState<CourseItem | null>(null);
   const [view, setView] = useState<"workspace" | "asr">("workspace");
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const [forcedBilibiliEmbedIds, setForcedBilibiliEmbedIds] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<AiTab>("guide");
   const [sourceMode, setSourceMode] = useState<SourceMode>("embed");
@@ -1436,9 +1442,13 @@ export function App() {
   async function refreshItems(nextSelectedId?: string) {
     const loaded = await listItems();
     setItems(loaded);
-    if (nextSelectedId) {
-      selectCourse(loaded.find((item) => item.id === nextSelectedId) ?? loaded[0] ?? null);
+    if (!nextSelectedId) return;
+    if (viewRef.current === "asr") {
+      // The ASR workbench keeps its course; a background job finishing must not swap it out.
+      setSelected((current) => (current ? loaded.find((item) => item.id === current.id) ?? current : current));
+      return;
     }
+    selectCourse(loaded.find((item) => item.id === nextSelectedId) ?? loaded[0] ?? null);
   }
 
   async function refreshItemInList(itemId: string) {
@@ -4786,6 +4796,8 @@ function AsrWorkbench({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [userContext, setUserContext] = useState("");
+  // Text typed into the after preview that does not parse yet; never written to the source.
+  const [previewDraft, setPreviewDraft] = useState<string | null>(null);
   const [searchSettings, setSearchSettings] = useState<AsrSearchSettings | null>(null);
   const [searchDraft, setSearchDraft] = useState<AsrSearchDraft>({
     enabled: false,
@@ -4808,6 +4820,7 @@ function AsrWorkbench({
   useEffect(() => {
     setEditorText(transcriptToEditorText(item?.transcript ?? []));
     setSuggestions([]);
+    setPreviewDraft(null);
     setMessage(null);
     setError(null);
     setJobStatus(null);
@@ -4907,6 +4920,30 @@ function AsrWorkbench({
     () => asrEditorHighlightRanges(previewText, suggestions, "corrected"),
     [previewText, suggestions],
   );
+  const savedEditorText = useMemo(() => transcriptToEditorText(item?.transcript ?? []), [item?.transcript]);
+  // Everything here lives only in this view: edits, accepted or unreviewed
+  // suggestions, and a running correction whose result would be lost.
+  const hasUnsavedWork = editorText !== savedEditorText || previewDraft !== null
+    || pendingSuggestions.length > 0 || canCancelCorrectionJob;
+
+  useEffect(() => {
+    if (!hasUnsavedWork) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [hasUnsavedWork]);
+
+  function leaveWorkbench() {
+    if (hasUnsavedWork && !window.confirm(copy.asrLeaveConfirm)) return;
+    if (jobStatus && canCancelCorrectionJob && !correctionJobCancelling) {
+      // Nobody can collect the result after leaving, so stop the model calls.
+      void cancelJob(jobStatus.job_id).catch(() => undefined);
+    }
+    onBack();
+  }
 
   useEffect(() => {
     if (pendingSuggestions.length) return;
@@ -5035,6 +5072,10 @@ function AsrWorkbench({
     if (!item) return;
     setError(null);
     setMessage(null);
+    if (previewDraft !== null) {
+      setError(copy.asrPreviewInvalid);
+      return;
+    }
     try {
       await saveTranscriptText(editorText);
     } catch (err) {
@@ -5109,12 +5150,24 @@ function AsrWorkbench({
   }
 
   function changePreviewText(nextPreviewText: string) {
+    let nextEditorText: string;
+    let nextSuggestions: AsrCorrectionSuggestion[];
     try {
-      setEditorText(previewTextToEditorText(nextPreviewText, suggestions, editorText));
-      setSuggestions((current) => reconcilePreviewEditedSuggestions(nextPreviewText, current, editorText));
-    } catch {
-      setEditorText(nextPreviewText);
+      nextEditorText = previewTextToEditorText(nextPreviewText, suggestions, editorText);
+      nextSuggestions = reconcilePreviewEditedSuggestions(nextPreviewText, suggestions, editorText);
+    } catch (err) {
+      // The preview has every pending suggestion applied, so it must never
+      // become the source text; keep the typed text aside until it parses.
+      setPreviewDraft(nextPreviewText);
+      setError(`${copy.asrPreviewInvalid}: ${errorMessage(err, copy.unknownError)}`);
+      return;
     }
+    if (previewDraft !== null) {
+      setPreviewDraft(null);
+      setError(null);
+    }
+    setEditorText(nextEditorText);
+    setSuggestions(nextSuggestions);
   }
 
   function focusSuggestionInPreview(suggestion: AsrCorrectionSuggestion) {
@@ -5307,7 +5360,7 @@ function AsrWorkbench({
   return (
     <section className="asr-workbench">
       <header className="asr-topbar">
-        <button className="asr-back-button" type="button" onClick={onBack}>
+        <button className="asr-back-button" type="button" onClick={leaveWorkbench}>
           <ArrowLeft size={16} />
           {copy.backToWorkspace}
         </button>
@@ -5362,7 +5415,7 @@ function AsrWorkbench({
         <div className="asr-empty-state">
           <FileText size={28} />
           <p>{copy.noAsrTranscript}</p>
-          <button type="button" onClick={onBack}>{copy.backToWorkspace}</button>
+          <button type="button" onClick={leaveWorkbench}>{copy.backToWorkspace}</button>
         </div>
       ) : (
         <div
@@ -5425,7 +5478,7 @@ function AsrWorkbench({
                   </div>
                   <AsrSourceEditor
                     refObject={previewRef}
-                    value={previewText}
+                    value={previewDraft ?? previewText}
                     highlights={previewHighlights}
                     activeSuggestionId={activeSuggestion?.id}
                     suggestionById={suggestionById}

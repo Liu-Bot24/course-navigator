@@ -1191,6 +1191,78 @@ describe("App language defaults", () => {
     expect(screen.getByText("1/1")).toBeTruthy();
   });
 
+  it("never writes an unreadable after-preview edit into the source and asks before leaving", async () => {
+    const item: CourseItem = {
+      id: "asr-preview-lesson",
+      source_url: "https://example.com/asr-preview-lesson",
+      title: "ASR Preview Lesson",
+      duration: 4,
+      created_at: new Date().toISOString(),
+      transcript: [
+        { start: 0, end: 2, text: "我是林毅" },
+        { start: 2, end: 4, text: "Deep Seek V4 很强" },
+      ],
+      metadata: null,
+      study: null,
+      local_video_path: null,
+    };
+    vi.mocked(listItems).mockResolvedValueOnce([item]);
+    vi.mocked(saveAsrSearchSettings).mockResolvedValue({
+      enabled: false,
+      provider: "tavily",
+      result_limit: 5,
+      min_confidence: 80,
+      tavily: { base_url: "https://api.tavily.com", has_api_key: false, api_key_preview: null },
+      firecrawl: { base_url: null, has_api_key: false, api_key_preview: null },
+    });
+    vi.mocked(startAsrCorrectionJob).mockResolvedValueOnce({
+      job_id: "asr-preview-job",
+      item_id: item.id,
+      status: "succeeded",
+      progress: 100,
+      phase: "complete",
+      message: "完成",
+      error: null,
+    });
+    const suggestion = (id: string, segment_index: number, original_text: string, corrected_text: string) => ({
+      id, segment_index, start: segment_index * 2, end: segment_index * 2 + 2, original_text, corrected_text,
+      confidence: 0.95, reason: "校正", evidence: null, status: "pending" as const, source: "model" as const,
+    });
+    vi.mocked(getAsrCorrectionResult).mockResolvedValueOnce({
+      job_id: "asr-preview-job",
+      item_id: item.id,
+      generated_at: new Date().toISOString(),
+      search_enabled: false,
+      search_provider: null,
+      suggestions: [suggestion("name-fix", 0, "林毅", "林亦"), suggestion("term-fix", 1, "Deep Seek", "DeepSeek")],
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getAllByText("ASR Preview Lesson").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "ASR 校正" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成校正建议" }));
+    await screen.findByText("1/2");
+
+    const source = () => document.querySelector(".asr-transcript-pane.source textarea") as HTMLTextAreaElement;
+    const preview = document.querySelector(".asr-transcript-pane.preview textarea") as HTMLTextAreaElement;
+    const sourceBefore = source().value;
+    // Emptying a line's text leaves a line the editor cannot read.
+    const brokenPreview = preview.value.replace("我是林亦", "");
+    expect(brokenPreview).not.toBe(preview.value);
+    fireEvent.change(preview, { target: { value: brokenPreview } });
+
+    expect(source().value).toBe(sourceBefore);
+    expect(source().value).toContain("Deep Seek V4");
+    expect(await screen.findByText(/修改后预览里有一行无法识别/)).toBeTruthy();
+    expect(preview.value).toBe(brokenPreview);
+
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
+    fireEvent.click(screen.getByRole("button", { name: "返回主工作台" }));
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "返回主工作台" })).toBeTruthy();
+    confirmSpy.mockRestore();
+  });
+
   it("asks before a transcript save clears an existing translation", async () => {
     const item: CourseItem = {
       id: "translated-edit-course",
